@@ -170,5 +170,8 @@ namespace AssetStudio.Avalonia.Services
 
         Task<ViewModels.DecryptionKeyDialogResult?> ShowDecryptionKeyDialogAsync(ViewModels.DecryptionDialogContext context)
             => Task.FromResult<ViewModels.DecryptionKeyDialogResult?>(null);
+
+        Task<ViewModels.SceneExportDialogResult?> ShowSceneExportDialogAsync(ViewModels.SceneExportDialogRequest request)
+            => Task.FromResult<ViewModels.SceneExportDialogResult?>(null);
     }
 }

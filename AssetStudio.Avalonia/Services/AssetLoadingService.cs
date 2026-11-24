@@ -341,6 +341,7 @@ namespace AssetStudio.Avalonia.Services
             // live file mutations during progressive indexing.
             var baselineStatsByPath = BuildBaselineFileStats(currentScanResult);
             var inFlightMutatedPaths = new ConcurrentDictionary<string, byte>(PathKeyComparer);
+            var sceneMetadataCollector = ProjectLoadingService.ResetSceneMetadataCollector(assetsManager);
 
             _indexingTask = Task.Run(async () =>
             {
@@ -552,6 +553,11 @@ namespace AssetStudio.Avalonia.Services
                                 }
 
                                 await assetsManager.IndexSingleFileInWorkerAsync(file);
+                                ProjectLoadingService.TryCollectHeaderExternalsAndScenesFromFile(
+                                    file,
+                                    assetsManager.DecompressionCache,
+                                    assetsManager.SpecifyUnityVersion,
+                                    sceneMetadataCollector);
 
                                 var postStats = CaptureLiveFileStat(file);
                                 if (preStats != postStats || IsLiveStatMutatedAgainstBaseline(file, postStats, baselineStatsByPath))
@@ -837,6 +843,12 @@ namespace AssetStudio.Avalonia.Services
 
                 if (filesToReindex.Count > 0)
                 {
+                    var collector = ProjectLoadingService.GetOrCreateSceneMetadataCollector(assetsManager);
+                    foreach (var dropPath in dropPaths)
+                    {
+                        collector.RemoveByOriginalPath(dropPath);
+                    }
+
                     var scratchManager = new AssetsManager
                     {
                         LazyLoading = true,
@@ -855,6 +867,11 @@ namespace AssetStudio.Avalonia.Services
                             try
                             {
                                 await scratchManager.IndexSingleFileInWorkerAsync(changedFile);
+                                ProjectLoadingService.TryCollectHeaderExternalsAndScenesFromFile(
+                                    changedFile,
+                                    assetsManager.DecompressionCache,
+                                    assetsManager.SpecifyUnityVersion,
+                                    collector);
                             }
                             catch (Exception ex)
                             {

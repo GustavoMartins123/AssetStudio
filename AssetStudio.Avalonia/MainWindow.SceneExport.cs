@@ -14,35 +14,7 @@ namespace AssetStudio.Avalonia;
 public partial class MainWindow
 {
     private readonly SceneGlbExportService _sceneGlbExportService = new();
-
-    private static readonly HashSet<ClassIDType> SceneExportBaseObjectTypes = new()
-    {
-        ClassIDType.GameObject,
-        ClassIDType.Transform,
-        ClassIDType.RectTransform,
-        ClassIDType.MeshFilter,
-        ClassIDType.MeshRenderer,
-        ClassIDType.SkinnedMeshRenderer,
-        ClassIDType.Mesh,
-        ClassIDType.Material,
-        ClassIDType.Animator,
-        ClassIDType.Avatar,
-        ClassIDType.Animation
-    };
-
-    private static readonly HashSet<ClassIDType> SceneExportAnimatedObjectTypes = new(SceneExportBaseObjectTypes)
-    {
-        ClassIDType.AnimationClip,
-        ClassIDType.AnimatorController,
-        ClassIDType.AnimatorOverrideController
-    };
-
-    private sealed record LazySceneExportTarget(
-        string? SourcePath,
-        string? SerializedFileName,
-        string SceneName,
-        SerializedFile? LoadedSerializedFile,
-        AssetItem? SelectedItem);
+    private SceneExportOptions _lastSceneExportOptions = new();
 
     private sealed class SceneExportResolverContext
     {
@@ -52,6 +24,14 @@ public partial class MainWindow
         public Dictionary<Renderer, List<Material?>> RendererMaterialsCache { get; } = new();
     }
 
+    private sealed class SceneCandidateBinding
+    {
+        public required SceneExportCandidate Candidate { get; init; }
+        public GameObjectNode? LoadedSceneRootNode { get; init; }
+        public SerializedFile? LoadedSerializedFile { get; init; }
+        public AssetItem? SelectedItem { get; init; }
+    }
+
     private async Task ExportSceneGlbCommandHandlerAsync()
     {
         if (IsWindowClosingOrClosed)
@@ -59,92 +39,49 @@ public partial class MainWindow
             return;
         }
 
-        // Path 1: Scene Hierarchy already loaded (Eager mode or loaded scene files)
-        if (sceneTreeNodes.Count > 0)
-        {
-            GameObjectNode? targetSceneRoot = null;
-            if (SceneTreeView?.SelectedItem is GameObjectNode selectedNode)
-            {
-                targetSceneRoot = SceneGlbExportService.FindSceneRootNode(selectedNode);
-            }
-            else
-            {
-                var checkedNodes = GetSelectedParentNodes();
-                if (checkedNodes.Count > 0)
-                {
-                    targetSceneRoot = SceneGlbExportService.FindSceneRootNode(checkedNodes[0]);
-                }
-            }
-
-            List<GameObject> rootGameObjects;
-            string sceneName;
-
-            if (targetSceneRoot != null)
-            {
-                sceneName = string.IsNullOrWhiteSpace(targetSceneRoot.Name) ? "Scene" : targetSceneRoot.Name;
-                rootGameObjects = SceneGlbExportService.CollectRootGameObjectsFromSceneNode(targetSceneRoot);
-            }
-            else if (sceneTreeNodes.Count == 1)
-            {
-                sceneName = string.IsNullOrWhiteSpace(sceneTreeNodes[0].Name) ? "Scene" : sceneTreeNodes[0].Name;
-                rootGameObjects = SceneGlbExportService.CollectRootGameObjectsFromSceneNode(sceneTreeNodes[0]);
-            }
-            else
-            {
-                var exportAllScenes = await ViewModel.DialogService.ConfirmAsync(
-                    "Export Scene to .glb",
-                    $"Multiple scenes are loaded ({sceneTreeNodes.Count} scene roots).\n\n" +
-                    $"Click Yes to export ALL loaded scenes into one instanced .glb.\n" +
-                    $"Click No to export only the first scene ({sceneTreeNodes[0].Name}).\n\n" +
-                    $"Tip: Select or right-click a specific scene in Scene Hierarchy to export just that scene.");
-
-                if (exportAllScenes)
-                {
-                    sceneName = "AllScenes";
-                    rootGameObjects = new List<GameObject>();
-                    var seen = new HashSet<GameObject>();
-                    foreach (var sceneRoot in sceneTreeNodes)
-                    {
-                        foreach (var go in SceneGlbExportService.CollectRootGameObjectsFromSceneNode(sceneRoot))
-                        {
-                            if (seen.Add(go))
-                            {
-                                rootGameObjects.Add(go);
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    sceneName = string.IsNullOrWhiteSpace(sceneTreeNodes[0].Name) ? "Scene" : sceneTreeNodes[0].Name;
-                    rootGameObjects = SceneGlbExportService.CollectRootGameObjectsFromSceneNode(sceneTreeNodes[0]);
-                }
-            }
-
-            if (rootGameObjects.Count == 0)
-            {
-                StatusStripUpdate("No GameObjects found in the selected scene.");
-                return;
-            }
-
-            await RunSceneGlbExportAsync(sceneName, rootGameObjects);
-            return;
-        }
-
-        // Path 2: Lazy Mode (no Scene Hierarchy built yet) -> resolve and materialize directly inside the main assetsManager
-        // so cross-bundle Addressables, ProjectIndex, SQLite v15 material/texture caches, and Material Variants all work identically to Export Model.
-        var target = ResolveLazySceneExportTarget();
-        if (target == null)
+        var (candidates, bindingMap) = GatherAvailableSceneExportCandidates();
+        if (candidates.Count == 0)
         {
             await ViewModel.DialogService.ShowMessageAsync(
                 "Export Scene to .glb",
-                "No loaded Scene Hierarchy or scene file (levelN / scene bundle) was detected.\n\n" +
-                "Load a scene file (such as level0 or a scene bundle) with 'Load file' or 'Load folder (Full / Scene Hierarchy)', or select an asset from a scene bundle in the Asset List first.");
+                "No loaded Scene Hierarchy, BuildSettings scene, .unity scene bundle, or Addressables SceneProvider entry was detected.\n\n" +
+                "Load a Unity game folder or scene file (such as level0 or a scene bundle) first, or select an asset from a scene/prefab bundle in the Asset List.");
             return;
         }
 
-        var suggestedName = FixFileName(target.SceneName) + ".glb";
-        var saveFile = await PickSaveSceneGlbDialogAsync("Export Scene to .glb (Instanced)", suggestedName);
+        var dialogRequest = new SceneExportDialogRequest(
+            scenes: candidates,
+            initialOptions: _lastSceneExportOptions,
+            dialogTitle: "Export Unity Scene to .glb (Instanced)");
+
+        var dialogResult = await ViewModel.DialogService.ShowSceneExportDialogAsync(dialogRequest);
+        if (dialogResult == null || dialogResult.SelectedScenes.Count == 0)
+        {
+            return;
+        }
+
+        _lastSceneExportOptions = dialogResult.Options;
+
+        var selectedBindings = new List<SceneCandidateBinding>(dialogResult.SelectedScenes.Count);
+        foreach (var selectedCandidate in dialogResult.SelectedScenes)
+        {
+            if (bindingMap.TryGetValue(selectedCandidate.Id, out var binding))
+            {
+                selectedBindings.Add(binding);
+            }
+            else
+            {
+                selectedBindings.Add(new SceneCandidateBinding { Candidate = selectedCandidate });
+            }
+        }
+
+        var primaryCandidate = selectedBindings[0].Candidate;
+        var suggestedBaseName = selectedBindings.Count == 1
+            ? primaryCandidate.Name
+            : $"{primaryCandidate.Name}_Combined";
+        var suggestedFileName = FixFileName(string.IsNullOrWhiteSpace(suggestedBaseName) ? "Scene" : suggestedBaseName) + ".glb";
+
+        var saveFile = await PickSaveSceneGlbDialogAsync("Export Scene to .glb (Instanced)", suggestedFileName);
         if (string.IsNullOrWhiteSpace(saveFile))
         {
             return;
@@ -156,92 +93,231 @@ public partial class MainWindow
             SaveExportFolder(exportFolder);
         }
 
-        var displaySourceName = !string.IsNullOrWhiteSpace(target.SerializedFileName)
-            ? target.SerializedFileName
-            : (!string.IsNullOrWhiteSpace(target.SourcePath) ? Path.GetFileName(target.SourcePath) : target.SceneName);
+        var displaySceneName = selectedBindings.Count == 1
+            ? primaryCandidate.Name
+            : $"{primaryCandidate.Name} (+{selectedBindings.Count - 1} additive)";
+        var outputSceneName = !string.IsNullOrWhiteSpace(primaryCandidate.Name) && selectedBindings.Count == 1
+            ? primaryCandidate.Name
+            : Path.GetFileNameWithoutExtension(saveFile);
 
         var ctsToken = ExportState.BeginExport(
             ExportOperationMode.SplitObjects,
             100,
             exportFolder,
-            $"Loading scene '{displaySourceName}'...");
-        StatusStripUpdate($"Loading scene '{displaySourceName}' for .glb export...");
+            $"Preparing scene '{displaySceneName}'...");
+        StatusStripUpdate($"Exporting scene '{displaySceneName}' to {Path.GetFileName(saveFile)}...");
 
         SceneGlbExportResult? result = null;
         try
         {
+            var sceneExportOptions = dialogResult.Options;
             var includeAnimations = exportOptions.ExportAnimations;
+            var cacheFolder = GetCurrentCacheFolderPath();
+            var cacheSignature = currentScanResult != null && !string.IsNullOrWhiteSpace(cacheFolder)
+                ? _sqliteCache.GetFolderSignature(currentScanResult)
+                : null;
+            var projectRoot = !string.IsNullOrWhiteSpace(assetsManager.ProjectRoot)
+                ? assetsManager.ProjectRoot
+                : cacheFolder;
+
             await Task.Run(() =>
             {
                 using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
                 using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
 
                 ctsToken.ThrowIfCancellationRequested();
-                ReportSceneExportProgress(5, $"Materializing hierarchy for '{displaySourceName}'...");
+                ReportSceneExportProgress(4, $"Loading {selectedBindings.Count} selected scene(s)...");
 
-                var targetFiles = EnsureLazySceneSerializedFilesLoaded(target, ctsToken);
-                foreach (var sf in targetFiles)
+                var rootGameObjects = new List<GameObject>();
+                var seenRoots = new HashSet<GameObject>();
+                var seedSerializedFiles = new List<SerializedFile>();
+                var seenSeedFiles = new HashSet<SerializedFile>();
+
+                var requiredObjectTypes = SceneGlbExportService.GetRequiredSceneObjectTypes(
+                    includeAnimations: includeAnimations,
+                    exportCamerasAndLights: sceneExportOptions.ExportCamerasAndLights,
+                    resolveStaticScriptSpawns: sceneExportOptions.ResolveStaticScriptSpawns);
+
+                // Step 1: Resolve and load every selected scene (supports additive multi-scene merging!).
+                for (var i = 0; i < selectedBindings.Count; i++)
                 {
-                    MaterializeSceneObjectsForSerializedFile(sf, includeAnimations, ctsToken);
-                }
+                    ctsToken.ThrowIfCancellationRequested();
+                    var binding = selectedBindings[i];
 
-                ctsToken.ThrowIfCancellationRequested();
-                var roots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(targetFiles, out var usedInactiveFallback);
-
-                // If the targeted SerializedFile had 0 GameObjects (for example a mesh-only CAB), check sibling CABs in the same bundle
-                // and then follow the semantic cache from the selected Mesh/Avatar to its owning prefab/scene SerializedFile.
-                if (roots.Count == 0 && !string.IsNullOrWhiteSpace(target.SourcePath))
-                {
-                    var siblingFiles = GetLoadedFilesSnapshot()
-                        .Where(sf => sf?.reader != null
-                            && !targetFiles.Contains(sf)
-                            && (IsSameLazySource(sf.originalPath, target.SourcePath)
-                                || IsSameLazySource(sf.fullName, target.SourcePath)))
-                        .ToList();
-                    if (siblingFiles.Count > 0)
+                    if (binding.LoadedSceneRootNode != null)
                     {
-                        foreach (var sf in siblingFiles)
+                        var nodeRoots = SceneGlbExportService.CollectRootGameObjectsFromSceneNode(binding.LoadedSceneRootNode);
+                        foreach (var go in nodeRoots)
                         {
-                            MaterializeSceneObjectsForSerializedFile(sf, includeAnimations, ctsToken);
+                            if (go != null && seenRoots.Add(go))
+                            {
+                                rootGameObjects.Add(go);
+                                if (go.assetsFile != null && seenSeedFiles.Add(go.assetsFile))
+                                {
+                                    seedSerializedFiles.Add(go.assetsFile);
+                                }
+                            }
                         }
-                        roots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(siblingFiles, out usedInactiveFallback);
+                        continue;
                     }
-                }
 
-                if (roots.Count == 0 && target.SelectedItem != null)
-                {
-                    var semanticOwnerFile = TryResolveSemanticSceneFileForSelectedAsset(target.SelectedItem, ctsToken);
-                    if (semanticOwnerFile != null)
+                    var targetFiles = EnsureSceneCandidateSerializedFilesLoaded(binding, ctsToken);
+                    foreach (var sf in targetFiles)
                     {
-                        MaterializeSceneObjectsForSerializedFile(semanticOwnerFile, includeAnimations, ctsToken);
-                        roots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(
-                            new[] { semanticOwnerFile },
-                            out usedInactiveFallback);
+                        if (sf != null && seenSeedFiles.Add(sf))
+                        {
+                            seedSerializedFiles.Add(sf);
+                        }
                     }
                 }
 
-                if (roots.Count == 0)
+                // Step 2: Transitive cross-bundle dependency closure (SQLite SourceFileExternals BFS + levelN<->sharedassetsN + Addressables).
+                SceneDependencyClosureResult? dependencyClosure = null;
+                if (seedSerializedFiles.Count > 0)
+                {
+                    ReportSceneExportProgress(10, $"Resolving cross-bundle dependencies for '{displaySceneName}'...");
+                    dependencyClosure = SceneGlbExportService.ResolveAndLoadSceneDependencies(
+                        assetsManager: assetsManager,
+                        seedFiles: seedSerializedFiles,
+                        sqliteCache: _sqliteCache,
+                        cacheFolderPath: cacheFolder,
+                        cacheSignature: cacheSignature,
+                        projectRoot: projectRoot,
+                        resolveSourcePathByFileName: ResolveSceneDependencyDiskPath,
+                        beforeLoadFile: RemovePendingFileFromProgressiveQueue,
+                        maxDepth: sceneExportOptions.MaxExternalDependencyDepth,
+                        maxAdditionalFiles: sceneExportOptions.MaxExternalFilesToLoad,
+                        cancellationToken: ctsToken);
+
+                    // Materialize scene + dependency objects (including LODGroup, Camera, Light, and opt-in MonoBehaviour).
+                    ReportSceneExportProgress(16, $"Materializing hierarchy & components ({dependencyClosure.AllLoadedFiles.Count} file(s))...");
+                    foreach (var sf in dependencyClosure.AllLoadedFiles)
+                    {
+                        MaterializeSceneObjectsForSerializedFile(sf, requiredObjectTypes, ctsToken);
+                    }
+                }
+
+                // Step 3: Collect roots for any lazily loaded scene files not already coming from loaded SceneTreeNodes.
+                var lazySeedFiles = seedSerializedFiles
+                    .Where(sf => !selectedBindings.Any(b => b.LoadedSceneRootNode != null && rootGameObjects.Any(go => ReferenceEquals(go.assetsFile, sf))))
+                    .ToList();
+
+                var usedInactiveFallback = false;
+                if (lazySeedFiles.Count > 0)
+                {
+                    var collectedLazyRoots = sceneExportOptions.IncludeInactive
+                        ? lazySeedFiles.SelectMany(sf => SceneGlbExportService.CollectRootGameObjectsFromSerializedFile(sf, includeInactive: true)).ToList()
+                        : SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(lazySeedFiles, out usedInactiveFallback);
+
+                    // Fallback to sibling CABs in the same bundle or semantic owner if a mesh-only CAB was selected.
+                    if (collectedLazyRoots.Count == 0 && selectedBindings.Count == 1)
+                    {
+                        var primaryBinding = selectedBindings[0];
+                        var srcPath = primaryBinding.Candidate.OriginalPath;
+                        if (!string.IsNullOrWhiteSpace(srcPath))
+                        {
+                            var siblingFiles = GetLoadedFilesSnapshot()
+                                .Where(sf => sf?.reader != null
+                                    && !seenSeedFiles.Contains(sf)
+                                    && (IsSameLazySource(sf.originalPath, srcPath) || IsSameLazySource(sf.fullName, srcPath)))
+                                .ToList();
+                            foreach (var sf in siblingFiles)
+                            {
+                                MaterializeSceneObjectsForSerializedFile(sf, requiredObjectTypes, ctsToken);
+                            }
+                            if (siblingFiles.Count > 0)
+                            {
+                                collectedLazyRoots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(siblingFiles, out usedInactiveFallback);
+                            }
+                        }
+
+                        if (collectedLazyRoots.Count == 0 && primaryBinding.SelectedItem != null)
+                        {
+                            var semanticOwnerFile = TryResolveSemanticSceneFileForSelectedAsset(primaryBinding.SelectedItem, ctsToken);
+                            if (semanticOwnerFile != null)
+                            {
+                                MaterializeSceneObjectsForSerializedFile(semanticOwnerFile, requiredObjectTypes, ctsToken);
+                                collectedLazyRoots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(
+                                    new[] { semanticOwnerFile },
+                                    out usedInactiveFallback);
+                            }
+                        }
+                    }
+
+                    foreach (var go in collectedLazyRoots)
+                    {
+                        if (go != null && seenRoots.Add(go))
+                        {
+                            rootGameObjects.Add(go);
+                        }
+                    }
+                }
+
+                if (rootGameObjects.Count == 0)
                 {
                     result = new SceneGlbExportResult
                     {
                         Success = false,
                         OutputPath = saveFile,
-                        SceneName = Path.GetFileNameWithoutExtension(saveFile),
-                        ErrorMessage = $"No GameObject hierarchy was found inside '{displaySourceName}'."
+                        SceneName = outputSceneName,
+                        ErrorMessage = $"No GameObject hierarchy was found inside '{displaySceneName}'."
                     };
                     return;
                 }
 
-                var options = BuildSceneGlbExportOptions(
-                    saveFile,
-                    Path.GetFileNameWithoutExtension(saveFile),
-                    includeInactive: usedInactiveFallback);
+                // Step 4: Configure opt-in SceneScriptSpawnAnalyzer (bounded external prefab + Addressables ByGuid loading).
+                SceneScriptSpawnAnalysisOptions? scriptSpawnOptions = null;
+                if (sceneExportOptions.ResolveStaticScriptSpawns)
+                {
+                    scriptSpawnOptions = BuildSceneScriptSpawnAnalysisOptions(
+                        sceneExportOptions,
+                        dependencyClosure?.AddressablesCatalogs,
+                        projectRoot,
+                        requiredObjectTypes,
+                        ctsToken);
+                }
+
+                var effectiveIncludeInactive = sceneExportOptions.IncludeInactive
+                    || usedInactiveFallback
+                    || !rootGameObjects.Any(static go => go != null && go.m_IsActive);
+
+                var options = new SceneGlbExportOptions
+                {
+                    OutputPath = saveFile,
+                    SceneName = outputSceneName,
+                    ScenePath = primaryCandidate.ScenePath,
+                    BuildIndex = primaryCandidate.BuildIndex,
+                    AdditionalSceneNames = selectedBindings.Skip(1).Select(static b => b.Candidate.Name).ToList(),
+                    IncludeInactive = effectiveIncludeInactive,
+                    SkipDisabledRenderers = true,
+                    LodMode = sceneExportOptions.LodMode,
+                    ExportCamerasAndLights = sceneExportOptions.ExportCamerasAndLights,
+                    ResolveStaticScriptSpawns = sceneExportOptions.ResolveStaticScriptSpawns,
+                    WriteManifest = sceneExportOptions.WriteManifest,
+                    MaxScriptSpawnInstances = sceneExportOptions.MaxScriptSpawnInstances,
+                    IncludeAnimations = includeAnimations,
+                    ExportSkins = exportOptions.ExportSkins,
+                    ExportBlendShape = exportOptions.ExportBlendShape,
+                    EnableInstancing = true,
+                    ScaleFactor = (float)exportOptions.ScaleFactor,
+                    ImageFormat = exportOptions.ConvertTextureFormat,
+                    Binary = !saveFile.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase),
+                    ResolvedDependencies = dependencyClosure?.ResolvedDependencies,
+                    MissingDependencies = dependencyClosure?.MissingDependencies,
+                    SceneSerializedFiles = seedSerializedFiles,
+                    ScriptSpawnAnalysisOptions = scriptSpawnOptions
+                };
+
                 var resolverContext = new SceneExportResolverContext();
                 result = _sceneGlbExportService.ExportScene(
-                    roots,
+                    rootGameObjects,
                     options,
                     textureResolver: ResolveTextureForModelConverter,
-                    progressCallback: (pct, _, status) => ReportSceneExportProgress(pct, status),
+                    progressCallback: (pct, _, status) =>
+                    {
+                        var mappedPct = 20 + (int)(Math.Clamp(pct, 0, 100) * 0.8);
+                        ReportSceneExportProgress(mappedPct, status);
+                    },
                     cancellationToken: ctsToken,
                     meshResolver: renderer => ResolveSceneMeshForRenderer(renderer, resolverContext),
                     materialResolver: (renderer, mesh, slotIndex) => ResolveSceneMaterialForSubmesh(renderer, mesh, slotIndex, resolverContext));
@@ -253,7 +329,7 @@ public partial class MainWindow
             {
                 Success = false,
                 OutputPath = saveFile,
-                SceneName = Path.GetFileNameWithoutExtension(saveFile),
+                SceneName = outputSceneName,
                 ErrorMessage = "Scene export cancelled."
             };
         }
@@ -322,7 +398,6 @@ public partial class MainWindow
         SceneGlbExportResult? result = null;
         try
         {
-            // Keep inactive proxies/LODs excluded by default, but fall back cleanly if every selected root is inactive.
             var hasActiveRoot = rootGameObjects.Any(static go => go != null && go.m_IsActive);
             var options = BuildSceneGlbExportOptions(exportFile, sceneName, includeInactive: !hasActiveRoot);
             await Task.Run(() =>
@@ -354,6 +429,561 @@ public partial class MainWindow
         await CompleteSceneGlbExportUiAsync(result, exportFolder);
     }
 
+    private (List<SceneExportCandidate> Candidates, Dictionary<string, SceneCandidateBinding> Bindings) GatherAvailableSceneExportCandidates()
+    {
+        var candidates = new List<SceneExportCandidate>();
+        var bindings = new Dictionary<string, SceneCandidateBinding>(StringComparer.Ordinal);
+        var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Determine currently selected scene root or selected AssetItem file for pre-selection.
+        GameObjectNode? activeSceneRoot = null;
+        if (SceneTreeView?.SelectedItem is GameObjectNode selectedNode)
+        {
+            activeSceneRoot = SceneGlbExportService.FindSceneRootNode(selectedNode);
+        }
+        else
+        {
+            var checkedNodes = GetSelectedParentNodes();
+            if (checkedNodes.Count > 0)
+            {
+                activeSceneRoot = SceneGlbExportService.FindSceneRootNode(checkedNodes[0]);
+            }
+        }
+
+        var selectedAssetItem = AssetListDataGrid?.SelectedItem as AssetItem;
+        var selectedAssetSfName = selectedAssetItem?.SourceFile?.fileName
+            ?? selectedAssetItem?.Handle?.SerializedFileName;
+
+        // Fetch indexed scenes from SQLite v16 cache (if available) + live discovery.
+        var indexedScenes = new List<IndexedSceneRecord>();
+        var cacheFolder = GetCurrentCacheFolderPath();
+        if (currentScanResult != null && !string.IsNullOrWhiteSpace(cacheFolder) && Directory.Exists(cacheFolder))
+        {
+            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+            indexedScenes.AddRange(_sqliteCache.GetIndexedScenes(cacheFolder, signature));
+        }
+
+        var discovered = ProjectLoadingService.DiscoverScenesAndExternals(
+            assetsManager,
+            !string.IsNullOrWhiteSpace(cacheFolder) ? cacheFolder : assetsManager.ProjectRoot);
+
+        // Build lookup from SerializedFileName -> richer BuildSettings/Bundle metadata.
+        var richByFileName = new Dictionary<string, IndexedSceneRecord>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rec in indexedScenes.Concat(discovered.Scenes))
+        {
+            if (rec != null && !string.IsNullOrWhiteSpace(rec.EntrySerializedFileName))
+            {
+                richByFileName.TryAdd(rec.EntrySerializedFileName, rec);
+            }
+        }
+
+        void AddCandidate(SceneExportCandidate candidate, GameObjectNode? rootNode = null, SerializedFile? loadedFile = null, AssetItem? selectedItem = null)
+        {
+            var dedupKey = !string.IsNullOrWhiteSpace(candidate.ScenePath)
+                ? $"path:{candidate.ScenePath}"
+                : (!string.IsNullOrWhiteSpace(candidate.SerializedFileName)
+                    ? $"file:{candidate.SerializedFileName}"
+                    : $"id:{candidate.Id}");
+            if (!seenKeys.Add(dedupKey))
+            {
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(candidate.SerializedFileName))
+            {
+                seenKeys.Add($"file:{candidate.SerializedFileName}");
+            }
+
+            candidates.Add(candidate);
+            bindings[candidate.Id] = new SceneCandidateBinding
+            {
+                Candidate = candidate,
+                LoadedSceneRootNode = rootNode,
+                LoadedSerializedFile = loadedFile,
+                SelectedItem = selectedItem
+            };
+        }
+
+        // 1. Loaded Scene Hierarchy roots (Eager mode or already-loaded scene roots).
+        for (var i = 0; i < sceneTreeNodes.Count; i++)
+        {
+            var rootNode = sceneTreeNodes[i];
+            if (rootNode == null)
+            {
+                continue;
+            }
+
+            var rawName = string.IsNullOrWhiteSpace(rootNode.Name) ? $"Scene_{i}" : rootNode.Name;
+            var firstGo = SceneGlbExportService.CollectRootGameObjectsFromSceneNode(rootNode).FirstOrDefault();
+            var sf = firstGo?.assetsFile;
+            var sfName = sf?.fileName ?? rawName;
+            richByFileName.TryGetValue(sfName, out var rich);
+
+            var displayName = rich != null && !string.IsNullOrWhiteSpace(rich.Name) ? rich.Name : rawName;
+            var isPreselected = ReferenceEquals(rootNode, activeSceneRoot)
+                || (activeSceneRoot == null && !string.IsNullOrEmpty(selectedAssetSfName) && string.Equals(sfName, selectedAssetSfName, StringComparison.OrdinalIgnoreCase));
+
+            AddCandidate(new SceneExportCandidate
+            {
+                Id = $"loaded:{i}:{sfName}",
+                Name = displayName,
+                ScenePath = rich?.ScenePath ?? sfName,
+                BuildIndex = rich?.BuildIndex ?? -1,
+                SourceKind = rich != null && !string.IsNullOrWhiteSpace(rich.SourceKind) ? rich.SourceKind : "Loaded",
+                SerializedFileName = sfName,
+                OriginalPath = sf?.originalPath ?? rich?.EntryOriginalPath ?? string.Empty,
+                ContainerKey = rich?.ContainerKey ?? string.Empty,
+                IsPreselected = isPreselected
+            }, rootNode: rootNode, loadedFile: sf);
+        }
+
+        // 2. Persisted SQLite v16 Scenes + Live Discovered Scenes (BuildSettings, AssetBundle .unity, Addressables SceneProvider, Heuristic).
+        var combinedIndexed = indexedScenes.Concat(discovered.Scenes).ToList();
+        for (var i = 0; i < combinedIndexed.Count; i++)
+        {
+            var rec = combinedIndexed[i];
+            if (rec == null)
+            {
+                continue;
+            }
+
+            var isPreselected = activeSceneRoot == null
+                && !string.IsNullOrEmpty(selectedAssetSfName)
+                && string.Equals(rec.EntrySerializedFileName, selectedAssetSfName, StringComparison.OrdinalIgnoreCase);
+
+            AddCandidate(new SceneExportCandidate
+            {
+                Id = $"indexed:{i}:{rec.SourceKind}:{rec.ScenePath}:{rec.EntrySerializedFileName}",
+                Name = string.IsNullOrWhiteSpace(rec.Name) ? rec.EntrySerializedFileName : rec.Name,
+                ScenePath = rec.ScenePath,
+                BuildIndex = rec.BuildIndex,
+                SourceKind = string.IsNullOrWhiteSpace(rec.SourceKind) ? "Indexed" : rec.SourceKind,
+                SerializedFileName = rec.EntrySerializedFileName,
+                OriginalPath = rec.EntryOriginalPath,
+                ContainerKey = rec.ContainerKey,
+                IsPreselected = isPreselected
+            });
+        }
+
+        // 3. Fallback to selected AssetItem's source bundle/file if no dedicated scene matched it.
+        if (selectedAssetItem != null)
+        {
+            var loadedSf = selectedAssetItem.SourceFile?.reader != null
+                ? selectedAssetItem.SourceFile
+                : (selectedAssetItem.Handle?.SourceFile?.reader != null ? selectedAssetItem.Handle.SourceFile : null);
+            var sfName = loadedSf?.fileName
+                ?? selectedAssetItem.SourceFile?.fileName
+                ?? selectedAssetItem.Handle?.SerializedFileName
+                ?? string.Empty;
+            var srcPath = (selectedAssetItem.Handle != null ? ResolveLazyHandleSourcePath(selectedAssetItem.Handle) : null)
+                ?? TryResolveExistingPath(selectedAssetItem.SourceFile?.originalPath)
+                ?? TryResolveExistingPath(selectedAssetItem.SourceFile?.fullName)
+                ?? TryResolveExistingPath(selectedAssetItem.Handle?.OriginalPath)
+                ?? string.Empty;
+
+            if (loadedSf != null || (!string.IsNullOrWhiteSpace(srcPath) && File.Exists(srcPath)))
+            {
+                var name = selectedAssetItem.Type == ClassIDType.SceneAsset && !string.IsNullOrWhiteSpace(selectedAssetItem.Name)
+                    ? selectedAssetItem.Name
+                    : (!string.IsNullOrWhiteSpace(sfName) ? sfName : Path.GetFileNameWithoutExtension(srcPath));
+
+                AddCandidate(new SceneExportCandidate
+                {
+                    Id = $"selected:{sfName}:{srcPath}",
+                    Name = string.IsNullOrWhiteSpace(name) ? "Selected Scene" : name,
+                    ScenePath = selectedAssetItem.Container ?? sfName,
+                    BuildIndex = -1,
+                    SourceKind = "Selected",
+                    SerializedFileName = sfName,
+                    OriginalPath = srcPath,
+                    ContainerKey = selectedAssetItem.Container ?? string.Empty,
+                    IsPreselected = candidates.Count == 0 || !candidates.Any(static c => c.IsPreselected)
+                }, loadedFile: loadedSf, selectedItem: selectedAssetItem);
+            }
+        }
+
+        // 4. Final fallback: any loaded SerializedFile containing GameObjects.
+        if (candidates.Count == 0)
+        {
+            foreach (var sf in GetLoadedFilesSnapshot())
+            {
+                if (sf == null)
+                {
+                    continue;
+                }
+
+                var hasReader = sf.reader != null;
+                var existingPath = TryResolveExistingPath(sf.originalPath) ?? TryResolveExistingPath(sf.fullName);
+                if (!hasReader && string.IsNullOrWhiteSpace(existingPath))
+                {
+                    continue;
+                }
+
+                var hasGo = sf.m_Objects.Any(static info => info != null && info.classID == (int)ClassIDType.GameObject)
+                    || sf.Objects.Any(static o => o is GameObject);
+                if (!hasGo)
+                {
+                    continue;
+                }
+
+                var name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(existingPath ?? "Scene");
+                AddCandidate(new SceneExportCandidate
+                {
+                    Id = $"loadedFile:{sf.fileName}",
+                    Name = name,
+                    ScenePath = sf.fileName ?? string.Empty,
+                    BuildIndex = -1,
+                    SourceKind = "Loaded",
+                    SerializedFileName = sf.fileName ?? string.Empty,
+                    OriginalPath = existingPath ?? string.Empty,
+                    IsPreselected = candidates.Count == 0
+                }, loadedFile: hasReader ? sf : null);
+            }
+        }
+
+        return (candidates, bindings);
+    }
+
+    private SceneScriptSpawnAnalysisOptions BuildSceneScriptSpawnAnalysisOptions(
+        SceneExportOptions exportOpts,
+        IReadOnlyList<ParsedAddressablesCatalog>? catalogs,
+        string? projectRoot,
+        HashSet<ClassIDType> requiredObjectTypes,
+        CancellationToken cancellationToken)
+    {
+        var managedDirs = new List<string>();
+        if (!string.IsNullOrWhiteSpace(projectRoot) && Directory.Exists(projectRoot))
+        {
+            try
+            {
+                var directManaged = Path.Combine(projectRoot, "Managed");
+                if (Directory.Exists(directManaged))
+                {
+                    managedDirs.Add(directManaged);
+                }
+
+                foreach (var dataDir in Directory.EnumerateDirectories(projectRoot, "*_Data", SearchOption.TopDirectoryOnly))
+                {
+                    var subManaged = Path.Combine(dataDir, "Managed");
+                    if (Directory.Exists(subManaged))
+                    {
+                        managedDirs.Add(subManaged);
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        var loadedExtraPrefabBundles = 0;
+        const int maxExtraPrefabBundles = 32;
+
+        SerializedFile? EnsureExternalPrefabFileLoaded(string targetFileName)
+        {
+            if (string.IsNullOrWhiteSpace(targetFileName))
+            {
+                return null;
+            }
+
+            if (assetsManager.TryFindSerializedFile(targetFileName, null, out var existing) && existing?.reader != null)
+            {
+                MaterializeSceneObjectsForSerializedFile(existing, requiredObjectTypes, cancellationToken);
+                return existing;
+            }
+
+            if (loadedExtraPrefabBundles >= maxExtraPrefabBundles)
+            {
+                return null;
+            }
+
+            var diskPath = ResolveSceneDependencyDiskPath(targetFileName);
+            if (string.IsNullOrWhiteSpace(diskPath) || !File.Exists(diskPath))
+            {
+                return null;
+            }
+
+            try
+            {
+                AssetsManager.ThrowIfMemoryPressureTooHigh("script-spawn prefab loading");
+                RemovePendingFileFromProgressiveQueue(diskPath);
+                assetsManager.LoadFilesForPreview(diskPath);
+                assetsManager.WaitForAssetsFileLoaded(targetFileName, 3000);
+                loadedExtraPrefabBundles++;
+
+                if (assetsManager.TryFindSerializedFile(targetFileName, null, out var loaded) && loaded?.reader != null)
+                {
+                    MaterializeSceneObjectsForSerializedFile(loaded, requiredObjectTypes, cancellationToken);
+                    return loaded;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Script-spawn resolver failed to load '{targetFileName}': {ex.Message}");
+            }
+
+            return null;
+        }
+
+        GameObject? ResolveExternalPrefabGameObject(string targetFileName, long targetPathId)
+        {
+            var sf = EnsureExternalPrefabFileLoaded(targetFileName);
+            if (sf == null)
+            {
+                return null;
+            }
+
+            if (sf.TryGetObject(targetPathId, out var obj))
+            {
+                if (obj is GameObject go)
+                {
+                    SceneGlbExportService.EnsureGameObjectComponentsLinked(go);
+                    return go;
+                }
+                if (obj is Transform tr && tr.m_GameObject != null && tr.m_GameObject.TryGet(out var trGo) && trGo != null)
+                {
+                    SceneGlbExportService.EnsureGameObjectComponentsLinked(trGo);
+                    return trGo;
+                }
+            }
+
+            return null;
+        }
+
+        GameObject? ResolveAddressablesPrefab(string guid, CatalogAssetEntry entry)
+        {
+            if (catalogs == null || catalogs.Count == 0 || loadedExtraPrefabBundles >= maxExtraPrefabBundles)
+            {
+                return null;
+            }
+
+            if (!AddressablesCatalogDependencyResolver.TryResolveGuidToBundlePaths(
+                    catalogs,
+                    guid,
+                    out var matches,
+                    projectRoot)
+                || matches.Count == 0)
+            {
+                return null;
+            }
+
+            var match = matches[0];
+            if (string.IsNullOrWhiteSpace(match.PrimaryBundlePath) || !File.Exists(match.PrimaryBundlePath))
+            {
+                return null;
+            }
+
+            try
+            {
+                AssetsManager.ThrowIfMemoryPressureTooHigh("addressables script-spawn prefab loading");
+                RemovePendingFileFromProgressiveQueue(match.PrimaryBundlePath);
+                assetsManager.LoadFilesForPreview(match.PrimaryBundlePath);
+                loadedExtraPrefabBundles++;
+
+                foreach (var depPath in match.DependencyBundlePaths)
+                {
+                    if (loadedExtraPrefabBundles >= maxExtraPrefabBundles || !File.Exists(depPath))
+                    {
+                        break;
+                    }
+
+                    RemovePendingFileFromProgressiveQueue(depPath);
+                    assetsManager.LoadFilesForPreview(depPath);
+                    loadedExtraPrefabBundles++;
+                }
+
+                var bundleFiles = GetLoadedFilesSnapshot()
+                    .Where(sf => sf?.reader != null
+                        && (IsSameLazySource(sf.originalPath, match.PrimaryBundlePath) || IsSameLazySource(sf.fullName, match.PrimaryBundlePath)))
+                    .ToList();
+
+                foreach (var sf in bundleFiles)
+                {
+                    MaterializeSceneObjectsForSerializedFile(sf, requiredObjectTypes, cancellationToken);
+                }
+
+                // Try matching AssetBundle.m_Container by entry.InternalId or PrimaryKey first.
+                foreach (var sf in bundleFiles)
+                {
+                    AssetStudio.Object[] objs;
+                    lock (sf)
+                    {
+                        objs = sf.Objects.ToArray();
+                    }
+
+                    foreach (var obj in objs)
+                    {
+                        if (obj is AssetBundle ab && ab.m_Container != null)
+                        {
+                            foreach (var containerEntry in ab.m_Container)
+                            {
+                                if (string.Equals(containerEntry.Key, entry.InternalId, StringComparison.OrdinalIgnoreCase)
+                                    || string.Equals(containerEntry.Key, entry.PrimaryKey, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    if (containerEntry.Value?.asset != null
+                                        && containerEntry.Value.asset.TryGet(out var targetObj)
+                                        && targetObj is GameObject prefabGo)
+                                    {
+                                        SceneGlbExportService.EnsureGameObjectComponentsLinked(prefabGo);
+                                        return prefabGo;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to the first root GameObject in the prefab bundle.
+                var roots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(bundleFiles, out _);
+                return roots.FirstOrDefault();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Addressables script-spawn prefab resolver failed for GUID '{guid}': {ex.Message}");
+                return null;
+            }
+        }
+
+        return new SceneScriptSpawnAnalysisOptions
+        {
+            IncludeInactiveGameObjects = exportOpts.IncludeInactive,
+            MaxSpawnedInstances = exportOpts.MaxScriptSpawnInstances,
+            EnableMonoIlConfidenceBoost = managedDirs.Count > 0,
+            AddressablesCatalogs = catalogs,
+            ManagedAssemblySearchDirectories = managedDirs,
+            AssemblyLoader = assemblyLoader,
+            ExternalGameObjectResolver = ResolveExternalPrefabGameObject,
+            AddressablesPrefabResolver = ResolveAddressablesPrefab
+        };
+    }
+
+    private string? ResolveSceneDependencyDiskPath(string serializedFileName)
+    {
+        if (string.IsNullOrWhiteSpace(serializedFileName))
+        {
+            return null;
+        }
+
+        var direct = TryResolveExistingPath(serializedFileName);
+        if (!string.IsNullOrEmpty(direct))
+        {
+            return direct;
+        }
+
+        if (lazySourcePathBySerializedFile.TryGetValue(serializedFileName, out var mapped))
+        {
+            direct = TryResolveExistingPath(mapped);
+            if (!string.IsNullOrEmpty(direct))
+            {
+                return direct;
+            }
+        }
+
+        var indexedPath = assetsManager.ProjectIndex
+            .GetHandlesForFile(serializedFileName)
+            .Select(ResolveLazyHandleSourcePath)
+            .FirstOrDefault(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));
+        if (!string.IsNullOrEmpty(indexedPath))
+        {
+            return indexedPath;
+        }
+
+        return FindSourceFileByNameInProjectRoot(serializedFileName);
+    }
+
+    private List<SerializedFile> EnsureSceneCandidateSerializedFilesLoaded(SceneCandidateBinding binding, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (binding.SelectedItem?.Handle != null)
+        {
+            TryAttachLoadedSourceFile(binding.SelectedItem.Handle);
+        }
+
+        var loaded = FindMatchingLoadedSerializedFiles(binding);
+        if (loaded.Count > 0)
+        {
+            return loaded;
+        }
+
+        var srcPath = TryResolveExistingPath(binding.Candidate.OriginalPath)
+            ?? ResolveSceneDependencyDiskPath(binding.Candidate.SerializedFileName);
+
+        if (!string.IsNullOrWhiteSpace(srcPath) && File.Exists(srcPath))
+        {
+            RemovePendingFileFromProgressiveQueue(srcPath);
+            assetsManager.LoadFilesForPreview(srcPath);
+            if (!string.IsNullOrWhiteSpace(binding.Candidate.SerializedFileName))
+            {
+                assetsManager.WaitForAssetsFileLoaded(binding.Candidate.SerializedFileName, 5000);
+            }
+
+            if (binding.SelectedItem?.Handle != null)
+            {
+                TryAttachLoadedSourceFile(binding.SelectedItem.Handle);
+            }
+
+            loaded = FindMatchingLoadedSerializedFiles(binding, resolvedDiskPath: srcPath);
+        }
+
+        return loaded;
+    }
+
+    private List<SerializedFile> FindMatchingLoadedSerializedFiles(SceneCandidateBinding binding, string? resolvedDiskPath = null)
+    {
+        if (binding.LoadedSerializedFile?.reader != null)
+        {
+            return new List<SerializedFile> { binding.LoadedSerializedFile };
+        }
+
+        if (binding.SelectedItem?.Handle?.SourceFile?.reader != null)
+        {
+            return new List<SerializedFile> { binding.SelectedItem.Handle.SourceFile };
+        }
+
+        if (binding.SelectedItem?.SourceFile?.reader != null)
+        {
+            return new List<SerializedFile> { binding.SelectedItem.SourceFile };
+        }
+
+        var sourcePath = !string.IsNullOrWhiteSpace(resolvedDiskPath) ? resolvedDiskPath : binding.Candidate.OriginalPath;
+        var sfName = binding.Candidate.SerializedFileName;
+        var snapshot = GetLoadedFilesSnapshot();
+
+        if (!string.IsNullOrWhiteSpace(sfName))
+        {
+            var exactMatch = snapshot.FirstOrDefault(sf =>
+                sf?.reader != null
+                && string.Equals(sf.fileName, sfName, StringComparison.OrdinalIgnoreCase)
+                && (string.IsNullOrWhiteSpace(sourcePath)
+                    || IsSameLazySource(sf.originalPath, sourcePath)
+                    || IsSameLazySource(sf.fullName, sourcePath)));
+            if (exactMatch != null)
+            {
+                return new List<SerializedFile> { exactMatch };
+            }
+
+            var nameMatch = snapshot.FirstOrDefault(sf =>
+                sf?.reader != null
+                && string.Equals(sf.fileName, sfName, StringComparison.OrdinalIgnoreCase));
+            if (nameMatch != null)
+            {
+                return new List<SerializedFile> { nameMatch };
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(sourcePath))
+        {
+            return snapshot
+                .Where(sf => sf?.reader != null
+                    && (IsSameLazySource(sf.originalPath, sourcePath)
+                        || IsSameLazySource(sf.fullName, sourcePath)))
+                .ToList();
+        }
+
+        return new List<SerializedFile>();
+    }
+
     private SceneGlbExportOptions BuildSceneGlbExportOptions(string outputPath, string sceneName, bool includeInactive = false)
     {
         var binary = !outputPath.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase);
@@ -363,6 +993,10 @@ public partial class MainWindow
             SceneName = sceneName,
             IncludeInactive = includeInactive,
             SkipDisabledRenderers = true,
+            LodMode = _lastSceneExportOptions.LodMode,
+            ExportCamerasAndLights = _lastSceneExportOptions.ExportCamerasAndLights,
+            ResolveStaticScriptSpawns = false,
+            WriteManifest = _lastSceneExportOptions.WriteManifest,
             IncludeAnimations = exportOptions.ExportAnimations,
             ExportSkins = exportOptions.ExportSkins,
             ExportBlendShape = exportOptions.ExportBlendShape,
@@ -373,96 +1007,9 @@ public partial class MainWindow
         };
     }
 
-    private List<SerializedFile> EnsureLazySceneSerializedFilesLoaded(LazySceneExportTarget target, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (target.SelectedItem?.Handle != null)
-        {
-            TryAttachLoadedSourceFile(target.SelectedItem.Handle);
-        }
-
-        var loaded = FindMatchingLoadedSerializedFiles(target);
-        if (loaded.Count > 0)
-        {
-            return loaded;
-        }
-
-        if (!string.IsNullOrWhiteSpace(target.SourcePath) && File.Exists(target.SourcePath))
-        {
-            RemovePendingFileFromProgressiveQueue(target.SourcePath);
-            assetsManager.LoadFilesForPreview(target.SourcePath);
-            if (!string.IsNullOrWhiteSpace(target.SerializedFileName))
-            {
-                assetsManager.WaitForAssetsFileLoaded(target.SerializedFileName, 5000);
-            }
-
-            if (target.SelectedItem?.Handle != null)
-            {
-                TryAttachLoadedSourceFile(target.SelectedItem.Handle);
-            }
-
-            loaded = FindMatchingLoadedSerializedFiles(target);
-        }
-
-        return loaded;
-    }
-
-    private List<SerializedFile> FindMatchingLoadedSerializedFiles(LazySceneExportTarget target)
-    {
-        if (target.LoadedSerializedFile?.reader != null)
-        {
-            return new List<SerializedFile> { target.LoadedSerializedFile };
-        }
-
-        if (target.SelectedItem?.Handle?.SourceFile?.reader != null)
-        {
-            return new List<SerializedFile> { target.SelectedItem.Handle.SourceFile };
-        }
-
-        if (target.SelectedItem?.SourceFile?.reader != null)
-        {
-            return new List<SerializedFile> { target.SelectedItem.SourceFile };
-        }
-
-        var snapshot = GetLoadedFilesSnapshot();
-        if (!string.IsNullOrWhiteSpace(target.SerializedFileName))
-        {
-            var exactMatch = snapshot.FirstOrDefault(sf =>
-                sf?.reader != null
-                && string.Equals(sf.fileName, target.SerializedFileName, StringComparison.OrdinalIgnoreCase)
-                && (string.IsNullOrWhiteSpace(target.SourcePath)
-                    || IsSameLazySource(sf.originalPath, target.SourcePath)
-                    || IsSameLazySource(sf.fullName, target.SourcePath)));
-            if (exactMatch != null)
-            {
-                return new List<SerializedFile> { exactMatch };
-            }
-
-            var nameMatch = snapshot.FirstOrDefault(sf =>
-                sf?.reader != null
-                && string.Equals(sf.fileName, target.SerializedFileName, StringComparison.OrdinalIgnoreCase));
-            if (nameMatch != null)
-            {
-                return new List<SerializedFile> { nameMatch };
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(target.SourcePath))
-        {
-            return snapshot
-                .Where(sf => sf?.reader != null
-                    && (IsSameLazySource(sf.originalPath, target.SourcePath)
-                        || IsSameLazySource(sf.fullName, target.SourcePath)))
-                .ToList();
-        }
-
-        return new List<SerializedFile>();
-    }
-
     private void MaterializeSceneObjectsForSerializedFile(
         SerializedFile sourceFile,
-        bool includeAnimations,
+        HashSet<ClassIDType> objectTypes,
         CancellationToken cancellationToken)
     {
         if (sourceFile == null)
@@ -471,74 +1018,13 @@ public partial class MainWindow
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        var objectTypes = includeAnimations ? SceneExportAnimatedObjectTypes : SceneExportBaseObjectTypes;
 
         if (assetsManager.LazyLoading)
         {
             MaterializeReferenceObjects(sourceFile, objectTypes, diagnostics: null, cancellationToken);
         }
 
-        // Sweep m_Objects directly for any hierarchy/renderer/mesh/material object not covered by ProjectIndex handles.
-        if (sourceFile.reader == null || sourceFile.m_Objects == null || sourceFile.m_Objects.Count == 0)
-        {
-            return;
-        }
-
-        FileReader? localReader = null;
-        try
-        {
-            var infos = sourceFile.m_Objects;
-            for (var i = 0; i < infos.Count; i++)
-            {
-                if ((i & 63) == 0)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-
-                var objectInfo = infos[i];
-                if (objectInfo == null)
-                {
-                    continue;
-                }
-
-                var classId = ClassIDTypeHelper.FromClassId(objectInfo.classID);
-                if (!objectTypes.Contains(classId))
-                {
-                    continue;
-                }
-
-                if (sourceFile.TryGetObject(objectInfo.m_PathID, out var existing) && existing != null)
-                {
-                    continue;
-                }
-
-                localReader ??= sourceFile.reader.Clone();
-                try
-                {
-                    var objectReader = new ObjectReader(localReader, sourceFile, objectInfo);
-                    var obj = AssetsManager.CreateObjectFromReader(objectReader);
-                    sourceFile.AddObject(obj);
-
-                    var handle = assetsManager.ProjectIndex?.GetHandle(sourceFile, objectInfo.m_PathID);
-                    if (handle != null)
-                    {
-                        handle.RealObject = obj;
-                        if (assetsManager.LazyLoading)
-                        {
-                            assetsManager.LruCache.RecordAccess(handle);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"Scene export skipped object {classId} PathID={objectInfo.m_PathID} in '{sourceFile.fileName}': {ex.Message}");
-                }
-            }
-        }
-        finally
-        {
-            localReader?.Dispose();
-        }
+        SceneGlbExportService.MaterializeSceneObjectsForFile(assetsManager, sourceFile, objectTypes, cancellationToken);
     }
 
     private SerializedFile? TryResolveSemanticSceneFileForSelectedAsset(AssetItem selectedItem, CancellationToken cancellationToken)
@@ -872,100 +1358,6 @@ public partial class MainWindow
         {
             return appSettings.ExportFolderPath;
         }
-        return null;
-    }
-
-    private LazySceneExportTarget? ResolveLazySceneExportTarget()
-    {
-        // 1. Selected asset in Asset List (SceneAsset, GameObject, Mesh, Animator, or any asset inside a scene/prefab bundle)
-        if (AssetListDataGrid?.SelectedItem is AssetItem selected)
-        {
-            var loadedSf = selected.SourceFile?.reader != null
-                ? selected.SourceFile
-                : (selected.Handle?.SourceFile?.reader != null ? selected.Handle.SourceFile : null);
-            var sfName = loadedSf?.fileName
-                ?? selected.SourceFile?.fileName
-                ?? selected.Handle?.SerializedFileName;
-
-            var srcPath = (selected.Handle != null ? ResolveLazyHandleSourcePath(selected.Handle) : null)
-                ?? TryResolveExistingPath(selected.SourceFile?.originalPath)
-                ?? TryResolveExistingPath(selected.SourceFile?.fullName)
-                ?? TryResolveExistingPath(selected.Handle?.OriginalPath);
-
-            if (loadedSf != null || (!string.IsNullOrWhiteSpace(srcPath) && File.Exists(srcPath)))
-            {
-                var sceneName = selected.Type == ClassIDType.SceneAsset && !string.IsNullOrWhiteSpace(selected.Name)
-                    ? selected.Name
-                    : (!string.IsNullOrWhiteSpace(sfName)
-                        ? sfName
-                        : (!string.IsNullOrWhiteSpace(srcPath) ? Path.GetFileNameWithoutExtension(srcPath) : "Scene"));
-                return new LazySceneExportTarget(srcPath, sfName, sceneName, loadedSf, selected);
-            }
-        }
-
-        // 2. Loaded SerializedFiles that look like scenes (levelN / mainData / contain GameObjects)
-        foreach (var sf in GetLoadedFilesSnapshot())
-        {
-            if (sf == null)
-            {
-                continue;
-            }
-
-            var hasReader = sf.reader != null;
-            var existingPath = TryResolveExistingPath(sf.originalPath) ?? TryResolveExistingPath(sf.fullName);
-            if (!hasReader && string.IsNullOrWhiteSpace(existingPath))
-            {
-                continue;
-            }
-
-            var looksLikeScene = sf.fileName.StartsWith("level", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(sf.fileName, "mainData", StringComparison.OrdinalIgnoreCase)
-                || sf.m_Objects.Any(static info => info != null && info.classID == (int)ClassIDType.GameObject)
-                || sf.Objects.Any(static o => o is GameObject);
-            if (looksLikeScene)
-            {
-                var sceneName = !string.IsNullOrWhiteSpace(sf.fileName)
-                    ? sf.fileName
-                    : (!string.IsNullOrWhiteSpace(existingPath) ? Path.GetFileNameWithoutExtension(existingPath) : "Scene");
-                return new LazySceneExportTarget(existingPath, sf.fileName, sceneName, hasReader ? sf : null, null);
-            }
-        }
-
-        // 3. Scan Lazy ProjectIndex Arena for a levelN / scene bundle source file
-        var arena = assetsManager.ProjectIndex.Arena;
-        for (int i = 0; i < arena.Count; i++)
-        {
-            if (arena.GetType(i) != ClassIDType.GameObject)
-            {
-                continue;
-            }
-
-            var sfName = arena.GetSerializedFileName(i);
-            var origPath = arena.GetOriginalPath(i);
-            if (string.IsNullOrWhiteSpace(origPath))
-            {
-                continue;
-            }
-
-            var looksLikeScene = sfName.StartsWith("level", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(sfName, "mainData", StringComparison.OrdinalIgnoreCase)
-                || origPath.Contains("scene", StringComparison.OrdinalIgnoreCase);
-            if (!looksLikeScene)
-            {
-                continue;
-            }
-
-            var resolvedPath = TryResolveExistingPath(origPath)
-                ?? FindSourceFileByNameInProjectRoot(GetSafeFileName(origPath));
-            if (!string.IsNullOrWhiteSpace(resolvedPath) && File.Exists(resolvedPath))
-            {
-                var sceneName = !string.IsNullOrWhiteSpace(sfName)
-                    ? sfName
-                    : Path.GetFileNameWithoutExtension(resolvedPath);
-                return new LazySceneExportTarget(resolvedPath, sfName, sceneName, null, null);
-            }
-        }
-
         return null;
     }
 }

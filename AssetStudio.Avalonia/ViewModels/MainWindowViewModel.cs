@@ -1814,6 +1814,9 @@ namespace AssetStudio.Avalonia.ViewModels
             public Task<ProjectManagerDialogResult?> ShowProjectManagerAsync(string? activeProjectPath)
                 => Task.FromResult<ProjectManagerDialogResult?>(null);
 
+            public Task<SceneExportDialogResult?> ShowSceneExportDialogAsync(SceneExportDialogRequest request)
+                => Task.FromResult<SceneExportDialogResult?>(null);
+
             public Task<bool> CopyTextToClipboardAsync(string text)
                 => Task.FromResult(false);
 

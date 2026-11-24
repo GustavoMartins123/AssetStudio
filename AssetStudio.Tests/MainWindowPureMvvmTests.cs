@@ -485,7 +485,8 @@ namespace AssetStudio.Tests
                 "ExportOptionsWindow.axaml",
                 "ProjectEditorWindow.axaml",
                 "ProjectManagerWindow.axaml",
-                "MessageBoxWindow.axaml"
+                "MessageBoxWindow.axaml",
+                "SceneExportDialog.axaml"
             };
 
             foreach (var fileName in windowAxamlFiles)
@@ -602,6 +603,15 @@ namespace AssetStudio.Tests
 
             public Task<ProjectManagerDialogResult?> ShowProjectManagerAsync(string? activeProjectPath)
                 => Task.FromResult(ProjectManagerResult);
+
+            public SceneExportDialogResult? SceneExportResult { get; set; }
+            public SceneExportDialogRequest? LastSceneExportRequest { get; private set; }
+
+            public Task<SceneExportDialogResult?> ShowSceneExportDialogAsync(SceneExportDialogRequest request)
+            {
+                LastSceneExportRequest = request;
+                return Task.FromResult(SceneExportResult);
+            }
 
             public Task<bool> CopyTextToClipboardAsync(string text)
             {

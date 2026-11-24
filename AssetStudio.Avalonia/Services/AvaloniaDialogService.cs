@@ -216,6 +216,21 @@ namespace AssetStudio.Avalonia.Services
             return await dialog.ShowDialog<ViewModels.DecryptionKeyDialogResult?>(owner);
         }
 
+        public async Task<ViewModels.SceneExportDialogResult?> ShowSceneExportDialogAsync(ViewModels.SceneExportDialogRequest request)
+        {
+            ArgumentNullException.ThrowIfNull(request);
+
+            var owner = GetOwner();
+            if (owner == null || !owner.IsVisible)
+            {
+                return null;
+            }
+
+            var vm = new ViewModels.SceneExportDialogViewModel(request);
+            var dialog = new SceneExportDialog(vm);
+            return await dialog.ShowDialog<ViewModels.SceneExportDialogResult?>(owner);
+        }
+
         public async Task<bool> CopyTextToClipboardAsync(string text)
         {
             var clipboard = GetTopLevel()?.Clipboard;

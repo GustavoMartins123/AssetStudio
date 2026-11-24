@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -449,7 +451,7 @@ namespace AssetStudio.Avalonia.Services
             List<(PPtr<AssetStudio.Object>, string)> containers)
         {
             ArgumentNullException.ThrowIfNull(containers);
-            if (assetBundle?.m_Container == null || assetBundle.m_PreloadTable == null)
+            if (assetBundle?.m_Container == null)
             {
                 return;
             }
@@ -458,22 +460,44 @@ namespace AssetStudio.Avalonia.Services
             foreach (var m_Container in assetBundle.m_Container)
             {
                 var assetInfo = m_Container.Value;
-                if (assetInfo == null)
+                if (assetInfo == null || string.IsNullOrEmpty(m_Container.Key))
                 {
                     continue;
                 }
 
-                var preloadIndex = assetInfo.preloadIndex;
-                var preloadSize = assetInfo.preloadSize;
-                if (preloadIndex < 0 || preloadSize <= 0 || preloadIndex >= preloadTable.Length)
+                var directAsset = assetInfo.asset;
+                var addedDirectAsset = false;
+
+                if (preloadTable != null && preloadTable.Length > 0)
                 {
-                    continue;
+                    var preloadIndex = assetInfo.preloadIndex;
+                    var preloadSize = assetInfo.preloadSize;
+                    if (preloadIndex >= 0 && preloadSize > 0 && preloadIndex < preloadTable.Length)
+                    {
+                        long preloadEnd = Math.Min((long)preloadIndex + preloadSize, preloadTable.Length);
+                        for (int k = preloadIndex; k < preloadEnd; k++)
+                        {
+                            var preloadEntry = preloadTable[k];
+                            if (preloadEntry == null || preloadEntry.IsNull)
+                            {
+                                continue;
+                            }
+
+                            containers.Add((preloadEntry, m_Container.Key));
+                            if (directAsset != null
+                                && !directAsset.IsNull
+                                && preloadEntry.m_FileID == directAsset.m_FileID
+                                && preloadEntry.m_PathID == directAsset.m_PathID)
+                            {
+                                addedDirectAsset = true;
+                            }
+                        }
+                    }
                 }
 
-                long preloadEnd = Math.Min((long)preloadIndex + preloadSize, preloadTable.Length);
-                for (int k = preloadIndex; k < preloadEnd; k++)
+                if (!addedDirectAsset && directAsset != null && !directAsset.IsNull)
                 {
-                    containers.Add((preloadTable[k], m_Container.Key));
+                    containers.Add((directAsset, m_Container.Key));
                 }
             }
         }
@@ -1371,6 +1395,21 @@ namespace AssetStudio.Avalonia.Services
 
                 if (saved)
                 {
+                    try
+                    {
+                        var handleList = handles as IReadOnlyList<AssetHandle> ?? handles.ToList();
+                        DiscoverAndPersistScenesAndExternals(
+                            sqliteCache,
+                            assetsManager,
+                            folderPath,
+                            signature,
+                            handleList);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"Failed to persist discovered scenes/externals for '{folderPath}': {ex.Message}");
+                    }
+
                     PublishDatabaseWriteProgress(
                         sqliteCache,
                         folderPath,
@@ -1895,6 +1934,1020 @@ namespace AssetStudio.Avalonia.Services
             }
 
             return ResolveColdIndexFiles(folderPath, scanResult);
+        }
+
+        // --- Scene & External Dependency Discovery (Schema v16) ---
+
+        private const long MaxUncachedLzmaHeaderProbeBytes = 16L * 1024 * 1024;
+
+        private static readonly ConditionalWeakTable<AssetsManager, SceneIndexingMetadataCollector> SceneMetadataCollectors = new();
+
+        public sealed class SceneDiscoveryResult
+        {
+            public List<SourceFileExternalRecord> Externals { get; } = new();
+            public List<IndexedSceneRecord> Scenes { get; } = new();
+        }
+
+        public sealed class SceneIndexingMetadataCollector
+        {
+            private static readonly StringComparer PathComparer =
+                OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+
+            private sealed class FileEntry
+            {
+                public string OriginalPath { get; init; } = string.Empty;
+                public List<SourceFileExternalRecord> Externals { get; } = new();
+                public List<IndexedSceneRecord> BundleScenes { get; } = new();
+                public List<IndexedSceneRecord> HeuristicScenes { get; } = new();
+                public List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)> BuildSettingsMappings { get; } = new();
+            }
+
+            private readonly ConcurrentDictionary<string, FileEntry> _entriesByOriginalPath = new(PathComparer);
+
+            public void Clear()
+            {
+                _entriesByOriginalPath.Clear();
+            }
+
+            public void RemoveByOriginalPath(string? originalPath)
+            {
+                var key = NormalizeCollectorPathKey(originalPath);
+                if (!string.IsNullOrEmpty(key))
+                {
+                    _entriesByOriginalPath.TryRemove(key, out _);
+                }
+            }
+
+            internal void RecordFile(
+                string originalPath,
+                List<SourceFileExternalRecord> externals,
+                List<IndexedSceneRecord> bundleScenes,
+                List<IndexedSceneRecord> heuristicScenes,
+                List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)> buildSettingsMappings)
+            {
+                var key = NormalizeCollectorPathKey(originalPath);
+                if (string.IsNullOrEmpty(key))
+                {
+                    return;
+                }
+
+                var entry = new FileEntry { OriginalPath = originalPath };
+                entry.Externals.AddRange(externals);
+                entry.BundleScenes.AddRange(bundleScenes);
+                entry.HeuristicScenes.AddRange(heuristicScenes);
+                entry.BuildSettingsMappings.AddRange(buildSettingsMappings);
+                _entriesByOriginalPath[key] = entry;
+            }
+
+            internal void CopyTo(
+                List<SourceFileExternalRecord> externalsOut,
+                List<IndexedSceneRecord> bundleScenesOut,
+                List<IndexedSceneRecord> heuristicScenesOut,
+                List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)> buildSettingsMappingsOut)
+            {
+                foreach (var entry in _entriesByOriginalPath.Values)
+                {
+                    externalsOut.AddRange(entry.Externals);
+                    bundleScenesOut.AddRange(entry.BundleScenes);
+                    heuristicScenesOut.AddRange(entry.HeuristicScenes);
+                    buildSettingsMappingsOut.AddRange(entry.BuildSettingsMappings);
+                }
+            }
+
+            private static string NormalizeCollectorPathKey(string? path)
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    return string.Empty;
+                }
+
+                try
+                {
+                    return Path.GetFullPath(path);
+                }
+                catch
+                {
+                    return path.Trim();
+                }
+            }
+        }
+
+        internal static SceneIndexingMetadataCollector GetOrCreateSceneMetadataCollector(AssetsManager assetsManager)
+        {
+            ArgumentNullException.ThrowIfNull(assetsManager);
+            return SceneMetadataCollectors.GetOrCreateValue(assetsManager);
+        }
+
+        internal static SceneIndexingMetadataCollector ResetSceneMetadataCollector(AssetsManager assetsManager)
+        {
+            var collector = GetOrCreateSceneMetadataCollector(assetsManager);
+            collector.Clear();
+            return collector;
+        }
+
+        /// <summary>
+        /// Reads ONLY <see cref="SerializedFile"/> headers (<c>m_Externals</c>) plus tiny <see cref="BuildSettings"/>
+        /// and <see cref="AssetBundle"/> objects (zero full-object deserialization, skipping <c>.resS</c> payloads)
+        /// so scene metadata and cross-file dependencies persist into Schema v16 without bloating memory.
+        /// </summary>
+        public static void TryCollectHeaderExternalsAndScenesFromFile(
+            string filePath,
+            DecompressedBundleCache? decompressionCache,
+            string? specifyUnityVersion,
+            SceneIndexingMetadataCollector collector)
+        {
+            if (collector == null || string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            {
+                return;
+            }
+
+            try
+            {
+                var externals = new List<SourceFileExternalRecord>();
+                var bundleScenes = new List<IndexedSceneRecord>();
+                var heuristicScenes = new List<IndexedSceneRecord>();
+                var buildSettingsMappings = new List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)>();
+
+                using var reader = new FileReader(filePath);
+                if (reader.FileType == FileType.AssetsFile)
+                {
+                    CollectFromSerializedFileHeader(
+                        reader,
+                        originalPath: filePath,
+                        specifyUnityVersion: specifyUnityVersion,
+                        externals: externals,
+                        bundleScenes: bundleScenes,
+                        heuristicScenes: heuristicScenes,
+                        buildSettingsMappings: buildSettingsMappings);
+                }
+                else if (reader.FileType == FileType.BundleFile)
+                {
+                    if (decompressionCache == null && ShouldSkipLargeUncachedLzmaBundle(filePath))
+                    {
+                        return;
+                    }
+
+                    using var bundleFile = new BundleFile(
+                        reader,
+                        decompressionCache,
+                        allowParallelDecompression: false,
+                        lowMemoryThresholdOverride: null,
+                        serializedFilesOnly: true);
+
+                    if (bundleFile.fileList != null)
+                    {
+                        for (var i = 0; i < bundleFile.fileList.Length; i++)
+                        {
+                            var streamFile = bundleFile.fileList[i];
+                            if (streamFile?.stream == null || string.IsNullOrWhiteSpace(streamFile.path))
+                            {
+                                continue;
+                            }
+
+                            var leaf = SQLiteProjectIndexCache.NormalizeExternalLeafName(streamFile.path);
+                            if (leaf.EndsWith(".resS", StringComparison.OrdinalIgnoreCase)
+                                || leaf.EndsWith(".resource", StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            try
+                            {
+                                streamFile.stream.Position = 0;
+                                using var subReader = new FileReader(streamFile.path, streamFile.stream);
+                                if (subReader.FileType == FileType.AssetsFile)
+                                {
+                                    CollectFromSerializedFileHeader(
+                                        subReader,
+                                        originalPath: filePath,
+                                        specifyUnityVersion: specifyUnityVersion,
+                                        externals: externals,
+                                        bundleScenes: bundleScenes,
+                                        heuristicScenes: heuristicScenes,
+                                        buildSettingsMappings: buildSettingsMappings);
+                                }
+                            }
+                            catch
+                            {
+                                // Skip non-serialized or truncated bundle entries safely.
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    return;
+                }
+
+                if (externals.Count > 0 || bundleScenes.Count > 0 || heuristicScenes.Count > 0 || buildSettingsMappings.Count > 0)
+                {
+                    collector.RecordFile(filePath, externals, bundleScenes, heuristicScenes, buildSettingsMappings);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Header scene/external metadata scan skipped '{Path.GetFileName(filePath)}': {ex.Message}");
+            }
+        }
+
+        public static SceneDiscoveryResult DiscoverScenesAndExternals(
+            AssetsManager? assetsManager,
+            string? folderPath,
+            IReadOnlyList<AssetHandle>? handles = null,
+            SceneIndexingMetadataCollector? collectorOverride = null,
+            IReadOnlyList<ParsedAddressablesCatalog>? catalogsOverride = null)
+        {
+            var result = new SceneDiscoveryResult();
+            var externalsRaw = new List<SourceFileExternalRecord>();
+            var bundleScenesRaw = new List<IndexedSceneRecord>();
+            var heuristicScenesRaw = new List<IndexedSceneRecord>();
+            var buildSettingsMappings = new List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)>();
+
+            // 1. Harvest anything already collected during lazy indexing.
+            var collector = collectorOverride ?? (assetsManager != null && SceneMetadataCollectors.TryGetValue(assetsManager, out var attached) ? attached : null);
+            collector?.CopyTo(externalsRaw, bundleScenesRaw, heuristicScenesRaw, buildSettingsMappings);
+
+            // 2. Harvest any currently loaded SerializedFiles in AssetsManager (Eager mode or loaded files).
+            if (assetsManager != null)
+            {
+                SerializedFile[] loadedSnapshot;
+                lock (assetsManager.loadLock)
+                {
+                    loadedSnapshot = assetsManager.assetsFileList.ToArray();
+                }
+
+                for (var i = 0; i < loadedSnapshot.Length; i++)
+                {
+                    var sf = loadedSnapshot[i];
+                    if (sf == null)
+                    {
+                        continue;
+                    }
+
+                    CollectFromLoadedSerializedFile(sf, externalsRaw, bundleScenesRaw, heuristicScenesRaw, buildSettingsMappings);
+                }
+            }
+
+            // 3. Inspect handles (BuildSettings handles not yet parsed, .unity containers, and fallback level*/mainData/*scene*).
+            var pathComparer = OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+            var sourceByFileName = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
+            var sourceFilesWithGameObjects = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
+            var buildSettingsFilesToProbe = new HashSet<string>(pathComparer);
+            var bundleContainerFilesByPath = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
+
+            var handleSource = handles ?? (assetsManager?.ProjectIndex?.Count > 0 ? assetsManager.ProjectIndex.GetHandles().ToList() : null);
+            if (handleSource != null)
+            {
+                for (var i = 0; i < handleSource.Count; i++)
+                {
+                    var h = handleSource[i];
+                    if (h == null)
+                    {
+                        continue;
+                    }
+
+                    var sfName = h.SerializedFileName ?? string.Empty;
+                    var origPath = h.OriginalPath ?? string.Empty;
+                    if (!string.IsNullOrEmpty(sfName))
+                    {
+                        sourceByFileName.TryAdd(sfName, (sfName, origPath));
+                        if (!string.IsNullOrEmpty(origPath))
+                        {
+                            var origLeaf = Path.GetFileName(origPath);
+                            if (!string.IsNullOrEmpty(origLeaf))
+                            {
+                                sourceByFileName.TryAdd(origLeaf, (sfName, origPath));
+                            }
+                        }
+                    }
+
+                    if (h.Type == ClassIDType.GameObject || h.Type == ClassIDType.SceneAsset)
+                    {
+                        var key = !string.IsNullOrEmpty(sfName) ? sfName : origPath;
+                        if (!string.IsNullOrEmpty(key))
+                        {
+                            sourceFilesWithGameObjects.TryAdd(key, (sfName, origPath));
+                        }
+                    }
+
+                    if (h.Type == ClassIDType.BuildSettings && !string.IsNullOrWhiteSpace(origPath) && File.Exists(origPath))
+                    {
+                        buildSettingsFilesToProbe.Add(origPath);
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(h.Container)
+                        && h.Container.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var normalizedContainer = NormalizeScenePath(h.Container);
+                        bundleContainerFilesByPath.TryAdd(normalizedContainer, (sfName, origPath));
+                    }
+                }
+            }
+
+            // If BuildSettings wasn't captured yet (e.g. direct SaveIndexCache or warm cache without collector), probe just that tiny file!
+            if (buildSettingsMappings.Count == 0 && buildSettingsFilesToProbe.Count > 0)
+            {
+                var tempCollector = new SceneIndexingMetadataCollector();
+                foreach (var bsPath in buildSettingsFilesToProbe)
+                {
+                    TryCollectHeaderExternalsAndScenesFromFile(
+                        bsPath,
+                        assetsManager?.DecompressionCache,
+                        assetsManager?.SpecifyUnityVersion,
+                        tempCollector);
+                }
+                tempCollector.CopyTo(externalsRaw, bundleScenesRaw, heuristicScenesRaw, buildSettingsMappings);
+            }
+
+            // Also include any .unity container paths found on AssetHandles.
+            foreach (var kvp in bundleContainerFilesByPath)
+            {
+                var scenePath = kvp.Key;
+                var displayName = BuildSettings.ExtractSceneDisplayName(scenePath);
+                bundleScenesRaw.Add(new IndexedSceneRecord
+                {
+                    Name = string.IsNullOrWhiteSpace(displayName) ? kvp.Value.SerializedFileName : displayName,
+                    ScenePath = scenePath,
+                    BuildIndex = -1,
+                    EntrySerializedFileName = kvp.Value.SerializedFileName,
+                    EntryOriginalPath = kvp.Value.OriginalPath,
+                    ContainerKey = scenePath,
+                    SourceKind = "AssetBundle"
+                });
+            }
+
+            // Deduplicate SourceFileExternals deterministically.
+            var seenExternalKeys = new HashSet<string>(pathComparer);
+            for (var i = 0; i < externalsRaw.Count; i++)
+            {
+                var ext = externalsRaw[i];
+                if (ext == null)
+                {
+                    continue;
+                }
+
+                var dedupKey = $"{ext.SourceSerializedFileName}\u001f{ext.SourceOriginalPath}\u001f{ext.ExternalIndex.ToString(CultureInfo.InvariantCulture)}";
+                if (seenExternalKeys.Add(dedupKey))
+                {
+                    result.Externals.Add(ext);
+                }
+            }
+
+            // Merge & deduplicate discovered scenes by priority: (a) BuildSettings -> (b) AssetBundle -> (c) Addressables -> (d) Heuristic.
+            var mergedScenes = new List<IndexedSceneRecord>();
+            var coveredFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var coveredScenePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // (a) BuildSettings scenes
+            var seenBuildIndices = new HashSet<int>();
+            foreach (var mapping in buildSettingsMappings.OrderBy(static m => m.BuildIndex))
+            {
+                if (string.IsNullOrWhiteSpace(mapping.ScenePath) || !seenBuildIndices.Add(mapping.BuildIndex))
+                {
+                    continue;
+                }
+
+                var normalizedPath = NormalizeScenePath(mapping.ScenePath);
+                var displayName = BuildSettings.ExtractSceneDisplayName(normalizedPath);
+                if (string.IsNullOrWhiteSpace(displayName))
+                {
+                    displayName = mapping.LevelFileName;
+                }
+
+                var entrySfName = mapping.LevelFileName;
+                var entryOrigPath = string.Empty;
+                if (sourceByFileName.TryGetValue(mapping.LevelFileName, out var matchedSource))
+                {
+                    entrySfName = matchedSource.SerializedFileName;
+                    entryOrigPath = matchedSource.OriginalPath;
+                }
+                else if (!string.IsNullOrWhiteSpace(mapping.SourceOriginalPath))
+                {
+                    var siblingDir = Path.GetDirectoryName(mapping.SourceOriginalPath);
+                    if (!string.IsNullOrEmpty(siblingDir))
+                    {
+                        var candidate = Path.Combine(siblingDir, mapping.LevelFileName);
+                        if (File.Exists(candidate))
+                        {
+                            entryOrigPath = candidate;
+                        }
+                    }
+                }
+
+                mergedScenes.Add(new IndexedSceneRecord
+                {
+                    Name = displayName,
+                    ScenePath = normalizedPath,
+                    BuildIndex = mapping.BuildIndex,
+                    EntrySerializedFileName = entrySfName,
+                    EntryOriginalPath = entryOrigPath,
+                    ContainerKey = string.Empty,
+                    SourceKind = "BuildSettings"
+                });
+
+                if (!string.IsNullOrEmpty(entrySfName))
+                {
+                    coveredFileNames.Add(entrySfName);
+                }
+                coveredScenePaths.Add(normalizedPath);
+            }
+
+            // (b) AssetBundle .unity container entries
+            for (var i = 0; i < bundleScenesRaw.Count; i++)
+            {
+                var scene = bundleScenesRaw[i];
+                if (scene == null)
+                {
+                    continue;
+                }
+
+                var normalizedPath = NormalizeScenePath(scene.ScenePath);
+                if (!string.IsNullOrEmpty(normalizedPath) && coveredScenePaths.Contains(normalizedPath))
+                {
+                    continue;
+                }
+
+                mergedScenes.Add(new IndexedSceneRecord
+                {
+                    Name = string.IsNullOrWhiteSpace(scene.Name)
+                        ? BuildSettings.ExtractSceneDisplayName(normalizedPath)
+                        : scene.Name,
+                    ScenePath = normalizedPath,
+                    BuildIndex = scene.BuildIndex,
+                    EntrySerializedFileName = scene.EntrySerializedFileName,
+                    EntryOriginalPath = scene.EntryOriginalPath,
+                    ContainerKey = string.IsNullOrWhiteSpace(scene.ContainerKey) ? normalizedPath : scene.ContainerKey,
+                    SourceKind = "AssetBundle"
+                });
+
+                if (!string.IsNullOrEmpty(scene.EntrySerializedFileName))
+                {
+                    coveredFileNames.Add(scene.EntrySerializedFileName);
+                }
+                if (!string.IsNullOrEmpty(normalizedPath))
+                {
+                    coveredScenePaths.Add(normalizedPath);
+                }
+            }
+
+            // (c) Addressables SceneEntries (SceneProvider)
+            var catalogs = catalogsOverride
+                ?? (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath)
+                    ? AddressablesCatalogDependencyResolver.LoadCatalogsForFiles(Array.Empty<string>(), folderPath)
+                    : (IReadOnlyList<ParsedAddressablesCatalog>)Array.Empty<ParsedAddressablesCatalog>());
+
+            var sourceByOrigPath = new Dictionary<string, string>(pathComparer);
+            if (handleSource != null)
+            {
+                for (var i = 0; i < handleSource.Count; i++)
+                {
+                    var h = handleSource[i];
+                    if (h != null && !string.IsNullOrWhiteSpace(h.OriginalPath) && !string.IsNullOrWhiteSpace(h.SerializedFileName))
+                    {
+                        sourceByOrigPath.TryAdd(SafeNormalizePath(h.OriginalPath), h.SerializedFileName);
+                    }
+                }
+            }
+
+            for (var c = 0; c < catalogs.Count; c++)
+            {
+                var catalog = catalogs[c];
+                if (catalog?.SceneEntries == null)
+                {
+                    continue;
+                }
+
+                for (var s = 0; s < catalog.SceneEntries.Count; s++)
+                {
+                    var entry = catalog.SceneEntries[s];
+                    if (entry == null)
+                    {
+                        continue;
+                    }
+
+                    var rawScenePath = !string.IsNullOrWhiteSpace(entry.InternalId) ? entry.InternalId : entry.PrimaryKey;
+                    var normalizedPath = NormalizeScenePath(rawScenePath);
+                    if (!string.IsNullOrEmpty(normalizedPath) && coveredScenePaths.Contains(normalizedPath))
+                    {
+                        continue;
+                    }
+
+                    var resolvedBundlePath = !string.IsNullOrWhiteSpace(entry.PrimaryBundleInternalId)
+                        ? AddressablesCatalogDependencyResolver.TryResolveLocalBundlePath(catalog, entry.PrimaryBundleInternalId, folderPath)
+                        : null;
+                    if (string.IsNullOrEmpty(resolvedBundlePath) && !string.IsNullOrWhiteSpace(entry.PrimaryBundleFileName))
+                    {
+                        resolvedBundlePath = AddressablesCatalogDependencyResolver.TryResolveLocalBundlePath(catalog, entry.PrimaryBundleFileName, folderPath);
+                    }
+
+                    var entrySfName = string.Empty;
+                    if (!string.IsNullOrEmpty(resolvedBundlePath)
+                        && sourceByOrigPath.TryGetValue(SafeNormalizePath(resolvedBundlePath), out var mappedSf))
+                    {
+                        entrySfName = mappedSf;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(entry.PrimaryBundleFileName))
+                    {
+                        entrySfName = entry.PrimaryBundleFileName;
+                    }
+
+                    var displayName = BuildSettings.ExtractSceneDisplayName(normalizedPath);
+                    if (string.IsNullOrWhiteSpace(displayName))
+                    {
+                        displayName = !string.IsNullOrWhiteSpace(entry.PrimaryKey) ? entry.PrimaryKey : entrySfName;
+                    }
+
+                    mergedScenes.Add(new IndexedSceneRecord
+                    {
+                        Name = displayName,
+                        ScenePath = normalizedPath,
+                        BuildIndex = -1,
+                        EntrySerializedFileName = entrySfName,
+                        EntryOriginalPath = resolvedBundlePath ?? string.Empty,
+                        ContainerKey = !string.IsNullOrWhiteSpace(entry.PrimaryKey) ? entry.PrimaryKey : normalizedPath,
+                        SourceKind = "Addressables"
+                    });
+
+                    if (!string.IsNullOrEmpty(entrySfName))
+                    {
+                        coveredFileNames.Add(entrySfName);
+                    }
+                    if (!string.IsNullOrEmpty(normalizedPath))
+                    {
+                        coveredScenePaths.Add(normalizedPath);
+                    }
+                }
+            }
+
+            // (d) Fallback level* / mainData / *scene* serialized files not already covered by (a)-(c)
+            foreach (var heuristic in heuristicScenesRaw)
+            {
+                if (heuristic == null)
+                {
+                    continue;
+                }
+
+                var sfName = heuristic.EntrySerializedFileName;
+                if (!string.IsNullOrEmpty(sfName) && coveredFileNames.Contains(sfName))
+                {
+                    continue;
+                }
+
+                var normalizedPath = NormalizeScenePath(heuristic.ScenePath);
+                if (!string.IsNullOrEmpty(normalizedPath) && coveredScenePaths.Contains(normalizedPath))
+                {
+                    continue;
+                }
+
+                mergedScenes.Add(heuristic);
+                if (!string.IsNullOrEmpty(sfName))
+                {
+                    coveredFileNames.Add(sfName);
+                }
+                if (!string.IsNullOrEmpty(normalizedPath))
+                {
+                    coveredScenePaths.Add(normalizedPath);
+                }
+            }
+
+            foreach (var kvp in sourceFilesWithGameObjects)
+            {
+                var (sfName, origPath) = kvp.Value;
+                if (!IsFallbackSceneSourceName(sfName, origPath))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(sfName) && coveredFileNames.Contains(sfName))
+                {
+                    continue;
+                }
+
+                var displayName = !string.IsNullOrWhiteSpace(sfName)
+                    ? sfName
+                    : Path.GetFileNameWithoutExtension(origPath);
+                mergedScenes.Add(new IndexedSceneRecord
+                {
+                    Name = displayName,
+                    ScenePath = sfName,
+                    BuildIndex = TryParseLevelBuildIndex(sfName),
+                    EntrySerializedFileName = sfName,
+                    EntryOriginalPath = origPath,
+                    ContainerKey = string.Empty,
+                    SourceKind = "Heuristic"
+                });
+
+                if (!string.IsNullOrEmpty(sfName))
+                {
+                    coveredFileNames.Add(sfName);
+                }
+            }
+
+            // Assign deterministic SceneIds (1..N)
+            var orderedScenes = mergedScenes
+                .OrderBy(static s => s.BuildIndex >= 0 ? 0 : 1)
+                .ThenBy(static s => s.BuildIndex)
+                .ThenBy(static s => s.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(static s => s.ScenePath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            for (var i = 0; i < orderedScenes.Count; i++)
+            {
+                var s = orderedScenes[i];
+                result.Scenes.Add(new IndexedSceneRecord
+                {
+                    SceneId = i + 1,
+                    Name = s.Name,
+                    ScenePath = s.ScenePath,
+                    BuildIndex = s.BuildIndex,
+                    EntrySourceFileId = s.EntrySourceFileId,
+                    EntrySerializedFileName = s.EntrySerializedFileName,
+                    EntryOriginalPath = s.EntryOriginalPath,
+                    ContainerKey = s.ContainerKey,
+                    SourceKind = s.SourceKind
+                });
+            }
+
+            return result;
+        }
+
+        public static void DiscoverAndPersistScenesAndExternals(
+            SQLiteProjectIndexCache sqliteCache,
+            AssetsManager? assetsManager,
+            string folderPath,
+            string signature,
+            IReadOnlyList<AssetHandle>? handles = null)
+        {
+            if (sqliteCache == null || string.IsNullOrWhiteSpace(folderPath) || string.IsNullOrWhiteSpace(signature))
+            {
+                return;
+            }
+
+            var discovered = DiscoverScenesAndExternals(assetsManager, folderPath, handles);
+            if (discovered.Externals.Count > 0)
+            {
+                sqliteCache.SaveSourceFileExternals(folderPath, signature, discovered.Externals, replaceExisting: true);
+            }
+
+            if (discovered.Scenes.Count > 0)
+            {
+                sqliteCache.SaveScenes(folderPath, signature, discovered.Scenes, replaceExisting: true);
+            }
+
+            if (assetsManager != null && SceneMetadataCollectors.TryGetValue(assetsManager, out var collector))
+            {
+                collector.Clear();
+            }
+        }
+
+        private static void CollectFromSerializedFileHeader(
+            FileReader reader,
+            string originalPath,
+            string? specifyUnityVersion,
+            List<SourceFileExternalRecord> externals,
+            List<IndexedSceneRecord> bundleScenes,
+            List<IndexedSceneRecord> heuristicScenes,
+            List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)> buildSettingsMappings)
+        {
+            reader.Position = 0;
+            var sf = new SerializedFile(reader, null!)
+            {
+                originalPath = originalPath
+            };
+
+            if (sf.IsVersionStripped && !string.IsNullOrWhiteSpace(specifyUnityVersion))
+            {
+                sf.SetVersion(specifyUnityVersion);
+            }
+
+            RecordSerializedFileExternals(sf, originalPath, externals);
+
+            var hasGameObjects = false;
+            if (sf.m_Objects != null)
+            {
+                for (var i = 0; i < sf.m_Objects.Count; i++)
+                {
+                    var objInfo = sf.m_Objects[i];
+                    if (objInfo == null)
+                    {
+                        continue;
+                    }
+
+                    if (objInfo.classID == (int)ClassIDType.GameObject || objInfo.classID == (int)ClassIDType.SceneAsset)
+                    {
+                        hasGameObjects = true;
+                    }
+                    else if (objInfo.classID == (int)ClassIDType.BuildSettings)
+                    {
+                        try
+                        {
+                            var objReader = new ObjectReader(reader, sf, objInfo);
+                            var bs = new BuildSettings(objReader);
+                            foreach (var (levelName, buildIdx, scenePath) in bs.GetLevelSceneMappings())
+                            {
+                                if (!string.IsNullOrWhiteSpace(scenePath))
+                                {
+                                    buildSettingsMappings.Add((levelName, buildIdx, scenePath, originalPath));
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // Malformed/truncated BuildSettings ignored safely.
+                        }
+                    }
+                    else if (objInfo.classID == (int)ClassIDType.AssetBundle)
+                    {
+                        try
+                        {
+                            var objReader = new ObjectReader(reader, sf, objInfo);
+                            var bundle = new AssetBundle(objReader);
+                            ExtractAssetBundleUnityScenes(bundle, sf.fileName, originalPath, bundleScenes);
+                        }
+                        catch
+                        {
+                            // Malformed/truncated AssetBundle ignored safely.
+                        }
+                    }
+                }
+            }
+
+            if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, originalPath))
+            {
+                heuristicScenes.Add(new IndexedSceneRecord
+                {
+                    Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(originalPath),
+                    ScenePath = sf.fileName ?? string.Empty,
+                    BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                    EntrySerializedFileName = sf.fileName ?? string.Empty,
+                    EntryOriginalPath = originalPath,
+                    ContainerKey = string.Empty,
+                    SourceKind = "Heuristic"
+                });
+            }
+        }
+
+        private static void CollectFromLoadedSerializedFile(
+            SerializedFile sf,
+            List<SourceFileExternalRecord> externals,
+            List<IndexedSceneRecord> bundleScenes,
+            List<IndexedSceneRecord> heuristicScenes,
+            List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)> buildSettingsMappings)
+        {
+            var origPath = !string.IsNullOrWhiteSpace(sf.originalPath) ? sf.originalPath : (sf.fullName ?? string.Empty);
+            RecordSerializedFileExternals(sf, origPath, externals);
+
+            var hasGameObjects = false;
+            AssetStudio.Object[] objectsSnapshot;
+            lock (sf)
+            {
+                objectsSnapshot = sf.Objects != null ? sf.Objects.ToArray() : Array.Empty<AssetStudio.Object>();
+            }
+
+            for (var i = 0; i < objectsSnapshot.Length; i++)
+            {
+                switch (objectsSnapshot[i])
+                {
+                    case BuildSettings bs:
+                        foreach (var (levelName, buildIdx, scenePath) in bs.GetLevelSceneMappings())
+                        {
+                            if (!string.IsNullOrWhiteSpace(scenePath))
+                            {
+                                buildSettingsMappings.Add((levelName, buildIdx, scenePath, origPath));
+                            }
+                        }
+                        break;
+                    case AssetBundle bundle:
+                        ExtractAssetBundleUnityScenes(bundle, sf.fileName, origPath, bundleScenes);
+                        break;
+                    case GameObject:
+                        hasGameObjects = true;
+                        break;
+                }
+            }
+
+            if (!hasGameObjects && sf.m_Objects != null)
+            {
+                for (var i = 0; i < sf.m_Objects.Count; i++)
+                {
+                    var info = sf.m_Objects[i];
+                    if (info != null && (info.classID == (int)ClassIDType.GameObject || info.classID == (int)ClassIDType.SceneAsset))
+                    {
+                        hasGameObjects = true;
+                        break;
+                    }
+                }
+            }
+
+            if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, origPath))
+            {
+                heuristicScenes.Add(new IndexedSceneRecord
+                {
+                    Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(origPath),
+                    ScenePath = sf.fileName ?? string.Empty,
+                    BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                    EntrySerializedFileName = sf.fileName ?? string.Empty,
+                    EntryOriginalPath = origPath,
+                    ContainerKey = string.Empty,
+                    SourceKind = "Heuristic"
+                });
+            }
+        }
+
+        private static void RecordSerializedFileExternals(
+            SerializedFile sf,
+            string originalPath,
+            List<SourceFileExternalRecord> externals)
+        {
+            if (sf?.m_Externals == null || sf.m_Externals.Count == 0)
+            {
+                return;
+            }
+
+            for (var i = 0; i < sf.m_Externals.Count; i++)
+            {
+                var ext = sf.m_Externals[i];
+                if (ext == null)
+                {
+                    continue;
+                }
+
+                var extPath = ext.pathName ?? string.Empty;
+                var extFile = !string.IsNullOrWhiteSpace(ext.fileName)
+                    ? ext.fileName
+                    : SQLiteProjectIndexCache.NormalizeExternalLeafName(extPath);
+                if (string.IsNullOrWhiteSpace(extFile) && string.IsNullOrWhiteSpace(extPath))
+                {
+                    continue;
+                }
+
+                externals.Add(new SourceFileExternalRecord
+                {
+                    SourceSerializedFileName = sf.fileName ?? string.Empty,
+                    SourceOriginalPath = originalPath,
+                    ExternalIndex = i,
+                    ExternalFileName = extFile,
+                    ExternalPathName = extPath,
+                    ExternalGuid = ext.guid == Guid.Empty ? string.Empty : ext.guid.ToString("N")
+                });
+            }
+        }
+
+        private static void ExtractAssetBundleUnityScenes(
+            AssetBundle bundle,
+            string serializedFileName,
+            string originalPath,
+            List<IndexedSceneRecord> bundleScenes)
+        {
+            if (bundle?.m_Container == null || bundle.m_Container.Length == 0)
+            {
+                return;
+            }
+
+            for (var i = 0; i < bundle.m_Container.Length; i++)
+            {
+                var key = bundle.m_Container[i].Key;
+                if (string.IsNullOrWhiteSpace(key) || !key.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var normalizedPath = NormalizeScenePath(key);
+                var displayName = BuildSettings.ExtractSceneDisplayName(normalizedPath);
+                bundleScenes.Add(new IndexedSceneRecord
+                {
+                    Name = string.IsNullOrWhiteSpace(displayName) ? (serializedFileName ?? string.Empty) : displayName,
+                    ScenePath = normalizedPath,
+                    BuildIndex = -1,
+                    EntrySerializedFileName = serializedFileName ?? string.Empty,
+                    EntryOriginalPath = originalPath ?? string.Empty,
+                    ContainerKey = key,
+                    SourceKind = "AssetBundle"
+                });
+            }
+        }
+
+        private static bool ShouldSkipLargeUncachedLzmaBundle(string filePath)
+        {
+            try
+            {
+                var fi = new FileInfo(filePath);
+                if (!fi.Exists || fi.Length <= MaxUncachedLzmaHeaderProbeBytes)
+                {
+                    return false;
+                }
+
+                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var br = new EndianBinaryReader(fs, EndianType.BigEndian);
+                var sig = br.ReadStringToNull(32);
+                if (sig == "UnityWeb")
+                {
+                    return true;
+                }
+
+                if (sig != "UnityFS")
+                {
+                    return false;
+                }
+
+                _ = br.ReadUInt32(); // version
+                _ = br.ReadStringToNull(64);
+                _ = br.ReadStringToNull(64);
+                _ = br.ReadInt64(); // size
+                _ = br.ReadUInt32(); // compressedBlocksInfoSize
+                _ = br.ReadUInt32(); // uncompressedBlocksInfoSize
+                var flags = (ArchiveFlags)br.ReadUInt32();
+                var compType = (CompressionType)(flags & ArchiveFlags.CompressionTypeMask);
+                return compType == CompressionType.Lzma;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsFallbackSceneSourceName(string? serializedFileName, string? originalPath)
+        {
+            if (!string.IsNullOrWhiteSpace(serializedFileName))
+            {
+                if (string.Equals(serializedFileName, "mainData", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                if (serializedFileName.StartsWith("level", StringComparison.OrdinalIgnoreCase)
+                    && serializedFileName.Length > 5
+                    && char.IsDigit(serializedFileName[5]))
+                {
+                    return true;
+                }
+
+                if (serializedFileName.Contains("scene", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(originalPath))
+            {
+                var fileName = Path.GetFileName(originalPath);
+                if (!string.IsNullOrWhiteSpace(fileName)
+                    && (string.Equals(fileName, "mainData", StringComparison.OrdinalIgnoreCase)
+                        || (fileName.StartsWith("level", StringComparison.OrdinalIgnoreCase) && fileName.Length > 5 && char.IsDigit(fileName[5]))
+                        || fileName.Contains("scene", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static int TryParseLevelBuildIndex(string? serializedFileName)
+        {
+            if (string.IsNullOrWhiteSpace(serializedFileName))
+            {
+                return -1;
+            }
+
+            if (serializedFileName.StartsWith("level", StringComparison.OrdinalIgnoreCase) && serializedFileName.Length > 5)
+            {
+                var suffix = serializedFileName.Substring(5);
+                var dot = suffix.IndexOf('.');
+                if (dot >= 0)
+                {
+                    suffix = suffix.Substring(0, dot);
+                }
+
+                if (int.TryParse(suffix, NumberStyles.None, CultureInfo.InvariantCulture, out var idx))
+                {
+                    return idx;
+                }
+            }
+
+            return -1;
+        }
+
+        private static string NormalizeScenePath(string? rawPath)
+        {
+            if (string.IsNullOrWhiteSpace(rawPath))
+            {
+                return string.Empty;
+            }
+
+            return rawPath.Trim().Replace('\\', '/');
+        }
+
+        private static string SafeNormalizePath(string path)
+        {
+            try
+            {
+                return Path.GetFullPath(path);
+            }
+            catch
+            {
+                return path.Trim();
+            }
         }
 
         // --- Preloading Orchestration ---
