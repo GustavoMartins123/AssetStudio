@@ -337,11 +337,18 @@ namespace AssetStudio.Avalonia.Services
             }
             EmitIndexingProgress("running");
 
-            // PERF-11: Snapshot baseline (Length, LastWriteTimeUtc.Ticks) at t0 so workers detect
-            // live file mutations during progressive indexing.
-            var baselineStatsByPath = BuildBaselineFileStats(currentScanResult);
-            var inFlightMutatedPaths = new ConcurrentDictionary<string, byte>(PathKeyComparer);
             var sceneMetadataCollector = ProjectLoadingService.ResetSceneMetadataCollector(assetsManager);
+            var previousLazyCallback = assetsManager.OnLazySerializedFileIndexed;
+            assetsManager.OnLazySerializedFileIndexed = (sf, bundle, buildSettings, hasGameObjects) =>
+            {
+                ProjectLoadingService.RecordFromLazyIndexedSerializedFile(
+                    sf,
+                    bundle,
+                    buildSettings,
+                    hasGameObjects,
+                    sceneMetadataCollector);
+                previousLazyCallback?.Invoke(sf, bundle, buildSettings, hasGameObjects);
+            };
 
             _indexingTask = Task.Run(async () =>
             {
@@ -546,24 +553,7 @@ namespace AssetStudio.Avalonia.Services
 
                             try
                             {
-                                var preStats = CaptureLiveFileStat(file);
-                                if (IsLiveStatMutatedAgainstBaseline(file, preStats, baselineStatsByPath))
-                                {
-                                    inFlightMutatedPaths[NormalizePendingPathKey(file)] = 0;
-                                }
-
                                 await assetsManager.IndexSingleFileInWorkerAsync(file);
-                                ProjectLoadingService.TryCollectHeaderExternalsAndScenesFromFile(
-                                    file,
-                                    assetsManager.DecompressionCache,
-                                    assetsManager.SpecifyUnityVersion,
-                                    sceneMetadataCollector);
-
-                                var postStats = CaptureLiveFileStat(file);
-                                if (preStats != postStats || IsLiveStatMutatedAgainstBaseline(file, postStats, baselineStatsByPath))
-                                {
-                                    inFlightMutatedPaths[NormalizePendingPathKey(file)] = 0;
-                                }
                             }
                             catch (Exception ex)
                             {
@@ -614,6 +604,7 @@ namespace AssetStudio.Avalonia.Services
                 }
 
                 var wasCancelled = token.IsCancellationRequested;
+                assetsManager.OnLazySerializedFileIndexed = previousLazyCallback;
                 EmitIndexingProgress(wasCancelled ? "cancelled" : "completed");
 
                 if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]) && !wasCancelled)
@@ -624,7 +615,7 @@ namespace AssetStudio.Avalonia.Services
                             assetsManager,
                             paths[0],
                             currentScanResult,
-                            inFlightMutatedPaths.Keys.ToList(),
+                            inFlightDirtyPaths: null,
                             token);
 
                         if (reconciliation.CanCommit)
@@ -852,7 +843,16 @@ namespace AssetStudio.Avalonia.Services
                     var scratchManager = new AssetsManager
                     {
                         LazyLoading = true,
-                        SpecifyUnityVersion = assetsManager.SpecifyUnityVersion
+                        SpecifyUnityVersion = assetsManager.SpecifyUnityVersion,
+                        OnLazySerializedFileIndexed = (sf, bundle, buildSettings, hasGameObjects) =>
+                        {
+                            ProjectLoadingService.RecordFromLazyIndexedSerializedFile(
+                                sf,
+                                bundle,
+                                buildSettings,
+                                hasGameObjects,
+                                collector);
+                        }
                     };
                     try
                     {
@@ -867,11 +867,6 @@ namespace AssetStudio.Avalonia.Services
                             try
                             {
                                 await scratchManager.IndexSingleFileInWorkerAsync(changedFile);
-                                ProjectLoadingService.TryCollectHeaderExternalsAndScenesFromFile(
-                                    changedFile,
-                                    assetsManager.DecompressionCache,
-                                    assetsManager.SpecifyUnityVersion,
-                                    collector);
                             }
                             catch (Exception ex)
                             {
@@ -891,68 +886,6 @@ namespace AssetStudio.Avalonia.Services
                 effectiveScan = revalidation.CurrentScanResult;
                 knownDirty = null;
             }
-        }
-
-        private static Dictionary<string, (long Size, long LastWriteUtcTicks)>? BuildBaselineFileStats(ProjectScanResult? scanResult)
-        {
-            if (scanResult == null || scanResult.Files.Count == 0)
-            {
-                return null;
-            }
-
-            var map = new Dictionary<string, (long Size, long LastWriteUtcTicks)>(scanResult.Files.Count, PathKeyComparer);
-            for (var i = 0; i < scanResult.Files.Count; i++)
-            {
-                var f = scanResult.Files[i];
-                if (!string.IsNullOrWhiteSpace(f.Path))
-                {
-                    map[NormalizePendingPathKey(f.Path)] = (f.Size, f.LastWriteTimeUtcTicks);
-                }
-            }
-
-            return map;
-        }
-
-        private static (bool Exists, long Size, long LastWriteUtcTicks) CaptureLiveFileStat(string filePath)
-        {
-            try
-            {
-                var info = new FileInfo(filePath);
-                if (!info.Exists)
-                {
-                    return (false, 0L, 0L);
-                }
-
-                return (true, info.Length, info.LastWriteTimeUtc.Ticks);
-            }
-            catch
-            {
-                return (false, 0L, 0L);
-            }
-        }
-
-        private static bool IsLiveStatMutatedAgainstBaseline(
-            string filePath,
-            (bool Exists, long Size, long LastWriteUtcTicks) liveStat,
-            Dictionary<string, (long Size, long LastWriteUtcTicks)>? baselineStatsByPath)
-        {
-            if (baselineStatsByPath == null)
-            {
-                return false;
-            }
-
-            if (!liveStat.Exists)
-            {
-                return true;
-            }
-
-            var key = NormalizePendingPathKey(filePath);
-            if (!baselineStatsByPath.TryGetValue(key, out var baseline))
-            {
-                return true;
-            }
-
-            return liveStat.Size != baseline.Size || liveStat.LastWriteUtcTicks != baseline.LastWriteUtcTicks;
         }
 
         public void PauseIndexing()

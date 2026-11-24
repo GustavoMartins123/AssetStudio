@@ -52,7 +52,9 @@ namespace AssetStudio
             }
 
             if (UnityHeaderProbe.TryParseUnityBundleHeader(initialHeader, 0, stream.Length, out _, out _, out _, out _)
-                || UnityHeaderProbe.IsSerializedFileHeader(initialHeader, stream.Length))
+                || UnityHeaderProbe.IsSerializedFileHeader(initialHeader, stream.Length)
+                || initialHeader.StartsWith(DecryptionHelper.EncryptionMagicBytes)
+                || LooksLikePlainText(initialHeader.Slice(0, Math.Min(64, initialHeader.Length))))
             {
                 return null;
             }
@@ -409,6 +411,25 @@ namespace AssetStudio
         private static int ReadInt32(byte[] data, int offset) => BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset, 4));
 
         private static bool IsPrintable(byte value) => value >= 0x20 && value <= 0x7E;
+
+        private static bool LooksLikePlainText(ReadOnlySpan<byte> sample)
+        {
+            if (sample.IsEmpty)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < sample.Length; i++)
+            {
+                byte b = sample[i];
+                if (b is not ((>= 0x20 and <= 0x7E) or (byte)'\t' or (byte)'\r' or (byte)'\n'))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
 
         private sealed class ProjectState
         {

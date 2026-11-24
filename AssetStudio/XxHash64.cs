@@ -95,6 +95,45 @@ namespace AssetStudio
         }
 
         /// <summary>
+        /// Zero-seek fast content hash over the already-buffered head window plus file length.
+        /// Used during full folder scans so fingerprinting adds zero extra disk seeks or reads.
+        /// </summary>
+        public static ulong ComputeHeadSampleHash(long fileSize, ReadOnlySpan<byte> headAlreadyRead)
+        {
+            Span<byte> meta = stackalloc byte[16];
+            BinaryPrimitives.WriteInt64LittleEndian(meta.Slice(0, 8), Math.Max(0L, fileSize));
+            BinaryPrimitives.WriteInt64LittleEndian(meta.Slice(8, 8), headAlreadyRead.Length);
+            ulong hash = Compute(meta, 0x9E3779B97F4A7C15UL);
+            if (headAlreadyRead.Length > 0)
+            {
+                hash = Compute(headAlreadyRead, hash);
+            }
+
+            return hash;
+        }
+
+        public static ulong ComputeHeadFileSampleHash(string filePath, long fileSize)
+        {
+            if (fileSize <= 0)
+            {
+                return ComputeHeadSampleHash(0, ReadOnlySpan<byte>.Empty);
+            }
+
+            int headSize = (int)Math.Min(SampleWindowBytes, fileSize);
+            var head = ArrayPool<byte>.Shared.Rent(headSize);
+            try
+            {
+                using var stream = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                int read = ReadUpTo(stream, head, headSize);
+                return ComputeHeadSampleHash(fileSize, head.AsSpan(0, read));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(head);
+            }
+        }
+
+        /// <summary>
         /// Computes a bounded O(1)-I/O content sample hash (&lt;= 12 KiB total read per file):
         /// reuses the already-read head window [0, min(len, 4096)) and, when len &gt; 4096,
         /// samples middle and tail windows (or the full remainder when len &lt;= 12288).

@@ -1303,14 +1303,6 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                // PERF-11: Never stamp stale t0 scan signature if files mutated before cache save.
-                var revalidation = ProjectScanner.RevalidateFolder(folderPath, scanResult);
-                if (!revalidation.IsUnchanged)
-                {
-                    Logger.Warning($"Skipping index cache save for '{folderPath}': folder mutated before commit.");
-                    return;
-                }
-
                 currentScanResult = scanResult;
                 SaveIndexCache(folderPath, scanResult);
                 Volatile.Write(ref committedIndexSignature, _sqliteCache.GetFolderSignature(scanResult));
@@ -1453,13 +1445,6 @@ public partial class MainWindow : Window
             {
                 if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
                 {
-                    return;
-                }
-
-                var revalidation = ProjectScanner.RevalidateFolder(folderPath, validatedScanResult);
-                if (!revalidation.IsUnchanged)
-                {
-                    Logger.Warning($"Skipping reconciled index cache save for '{folderPath}': folder mutated again right before commit.");
                     return;
                 }
 

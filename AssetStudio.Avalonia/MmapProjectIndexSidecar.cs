@@ -755,7 +755,47 @@ namespace AssetStudio.Avalonia
             out string stagedTempPath,
             Action<string>? beforeValidateHook = null)
         {
+            return TryStageSidecar(
+                idxPath,
+                signatureHash,
+                schemaVersion,
+                handles,
+                caseSensitivePaths,
+                out stagedTempPath,
+                out _,
+                beforeValidateHook);
+        }
+
+        private sealed class SourcePairComparer : IEqualityComparer<(string SerializedFileName, string OriginalPath)>
+        {
+            public static readonly SourcePairComparer Ordinal = new(StringComparer.Ordinal);
+            public static readonly SourcePairComparer OrdinalIgnoreCase = new(StringComparer.OrdinalIgnoreCase);
+
+            private readonly StringComparer _comparer;
+
+            private SourcePairComparer(StringComparer comparer) => _comparer = comparer;
+
+            public bool Equals((string SerializedFileName, string OriginalPath) x, (string SerializedFileName, string OriginalPath) y) =>
+                _comparer.Equals(x.SerializedFileName, y.SerializedFileName)
+                && _comparer.Equals(x.OriginalPath, y.OriginalPath);
+
+            public int GetHashCode((string SerializedFileName, string OriginalPath) obj) =>
+                HashCode.Combine(_comparer.GetHashCode(obj.SerializedFileName), _comparer.GetHashCode(obj.OriginalPath));
+        }
+
+        internal static bool TryStageSidecar(
+            string idxPath,
+            string signatureHash,
+            int schemaVersion,
+            IReadOnlyCollection<AssetHandle> handles,
+            bool caseSensitivePaths,
+            out string stagedTempPath,
+            out List<AssetHandle> orderedHandlesOut,
+            Action<string>? beforeValidateHook = null,
+            bool isAlreadyNormalizedAndOrdered = false)
+        {
             stagedTempPath = string.Empty;
+            orderedHandlesOut = new List<AssetHandle>();
             if (string.IsNullOrWhiteSpace(idxPath))
             {
                 return false;
@@ -771,25 +811,45 @@ namespace AssetStudio.Avalonia
                 }
 
                 // Order by UniqueID (Ordinal) and collapse duplicate UniqueIDs to match SQLite PRIMARY KEY (ProjectId, UniqueID)
-                var orderedHandles = NormalizeAndDeduplicateHandles(handles);
+                var orderedHandles = isAlreadyNormalizedAndOrdered && handles is List<AssetHandle> preOrderedList
+                    ? preOrderedList
+                    : NormalizeAndDeduplicateHandles(handles);
+                orderedHandlesOut = orderedHandles;
 
-                // Intern source files using OS-aware path comparison (case-sensitive on Linux).
-                var sourceIndexByKey = new Dictionary<string, int>(caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
+                // Intern source files using OS-aware path comparison without allocating interpolated strings per handle.
+                var pairComparer = caseSensitivePaths ? SourcePairComparer.Ordinal : SourcePairComparer.OrdinalIgnoreCase;
+                var sourceIndexByKey = new Dictionary<(string SerializedFileName, string OriginalPath), int>(pairComparer);
                 var sourceEntries = new List<(string SerializedFileName, string OriginalPath)>();
+                var handleSourceIndices = new int[orderedHandles.Count];
+                string? lastSfn = null;
+                string? lastOrig = null;
+                int lastSourceIdx = -1;
                 for (var i = 0; i < orderedHandles.Count; i++)
                 {
                     var h = orderedHandles[i];
                     var sfn = h.SerializedFileName ?? string.Empty;
                     var orig = h.OriginalPath ?? string.Empty;
-                    var key = $"{sfn}\u001f{orig}";
-                    if (!sourceIndexByKey.ContainsKey(key))
+                    if (ReferenceEquals(sfn, lastSfn) && ReferenceEquals(orig, lastOrig))
                     {
-                        sourceIndexByKey[key] = sourceEntries.Count;
-                        sourceEntries.Add((sfn, orig));
+                        handleSourceIndices[i] = lastSourceIdx;
+                        continue;
                     }
+
+                    var key = (sfn, orig);
+                    if (!sourceIndexByKey.TryGetValue(key, out var srcIdx))
+                    {
+                        srcIdx = sourceEntries.Count;
+                        sourceIndexByKey[key] = srcIdx;
+                        sourceEntries.Add(key);
+                    }
+
+                    lastSfn = sfn;
+                    lastOrig = orig;
+                    lastSourceIdx = srcIdx;
+                    handleSourceIndices[i] = srcIdx;
                 }
 
-                var stringPool = new StringPoolBuilder( Math.Max(256, orderedHandles.Count * 48));
+                var stringPool = new StringPoolBuilder(Math.Max(256, orderedHandles.Count * 48));
                 var (sigOffset, sigLength) = stringPool.AddDeduplicated(signatureHash ?? string.Empty);
                 var signatureUtf8 = Encoding.UTF8.GetBytes(signatureHash ?? string.Empty);
                 var signatureHash64 = ComputeXxHash64(signatureUtf8);
@@ -807,10 +867,7 @@ namespace AssetStudio.Avalonia
                 for (var i = 0; i < orderedHandles.Count; i++)
                 {
                     var h = orderedHandles[i];
-                    var sfn = h.SerializedFileName ?? string.Empty;
-                    var orig = h.OriginalPath ?? string.Empty;
-                    var key = $"{sfn}\u001f{orig}";
-                    var sourceIdx = sourceIndexByKey.TryGetValue(key, out var idx) ? idx : -1;
+                    var sourceIdx = handleSourceIndices[i];
 
                     // UniqueID is unique per record after deduplication; write directly without dictionary overhead
                     var (uidOff, uidLen) = stringPool.AddDirect(h.UniqueID ?? string.Empty);
@@ -908,16 +965,29 @@ namespace AssetStudio.Avalonia
                 using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 65536))
                 {
                     fs.Write(fileSpan);
-                    fs.Flush(flushToDisk: true);
+                    fs.Flush(flushToDisk: beforeValidateHook != null);
                 }
 
-                beforeValidateHook?.Invoke(tempPath);
-
-                if (!ValidateFileImage(tempPath, signatureHash ?? string.Empty, schemaVersion, out _))
+                if (beforeValidateHook != null)
                 {
-                    Logger.Warning($"Staged mmap .idx sidecar failed pre-publish validation: '{tempPath}'");
-                    TryDeleteFileQuietly(tempPath);
-                    return false;
+                    beforeValidateHook.Invoke(tempPath);
+                    if (!ValidateFileImage(tempPath, signatureHash ?? string.Empty, schemaVersion, out _))
+                    {
+                        Logger.Warning($"Staged mmap .idx sidecar failed pre-publish validation: '{tempPath}'");
+                        TryDeleteFileQuietly(tempPath);
+                        return false;
+                    }
+                }
+                else
+                {
+                    // Checksum was already computed over the exact buffer written above; verify written file length without re-reading hundreds of MB.
+                    var writtenLength = new FileInfo(tempPath).Length;
+                    if (writtenLength != totalFileBytes)
+                    {
+                        Logger.Warning($"Staged mmap .idx sidecar length mismatch ({writtenLength} != {totalFileBytes}): '{tempPath}'");
+                        TryDeleteFileQuietly(tempPath);
+                        return false;
+                    }
                 }
 
                 stagedTempPath = tempPath;
@@ -1252,7 +1322,7 @@ namespace AssetStudio.Avalonia
             return XxHash64.Compute(data, seed);
         }
 
-        private static List<AssetHandle> NormalizeAndDeduplicateHandles(IReadOnlyCollection<AssetHandle> handles)
+        internal static List<AssetHandle> NormalizeAndDeduplicateHandles(IReadOnlyCollection<AssetHandle> handles)
         {
             if (handles == null || handles.Count == 0)
             {

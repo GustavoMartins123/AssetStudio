@@ -460,24 +460,15 @@ namespace AssetStudio.Avalonia
             var stagedIdxPath = string.Empty;
             try
             {
-                var handleList = handles?.ToList() ?? new List<AssetHandle>();
+                var handleCollection = handles as IReadOnlyCollection<AssetHandle> ?? handles?.ToList() ?? new List<AssetHandle>();
                 // v16 writes every handle once (unified Assets table) plus source file fingerprint metadata.
-                var totalWork = Math.Max(1, handleList.Count + Math.Max(1, scanResult.TotalFiles));
+                var totalWork = Math.Max(1, handleCollection.Count + Math.Max(1, scanResult.TotalFiles));
                 var reporter = new ThrottledProgressReporter(totalWork, progress);
 
-                reporter.Report("Staging mmap .idx sidecar", force: true);
-                var stagedOk = MmapProjectIndexSidecar.TryStageSidecar(
-                    idxPath,
-                    signature,
-                    SemanticSchemaVersion,
-                    handleList,
-                    _caseSensitivePaths,
-                    out stagedIdxPath,
-                    beforeSidecarValidateHook);
-                if (!stagedOk)
-                {
-                    Logger.Warning($"Pre-commit mmap .idx sidecar staging failed for '{folderPath}'; stale sidecar will be removed.");
-                }
+                // Sort & deduplicate once by UniqueID (Ordinal) so both the WITHOUT ROWID SQLite B-tree insert
+                // and the post-commit mmap .idx sidecar write reuse the same ordered list without holding a
+                // ~500MB sidecar buffer in LOH memory or dirtying disk pages during the SQLite transaction.
+                var orderedHandles = MmapProjectIndexSidecar.NormalizeAndDeduplicateHandles(handleCollection);
 
                 reporter.Report("Waiting for SQLite writer", force: true);
                 lock (WriteGate)
@@ -489,115 +480,139 @@ namespace AssetStudio.Avalonia
                         long committedProjectId;
                         var scanLookup = BuildScanFileLookup(folderPath, scanResult, _caseSensitivePaths);
 
-                        using (var transaction = conn.BeginTransaction())
+                        SetSynchronousMode(conn, "OFF");
+                        try
                         {
-                            reporter.Report("Preparing SQLite project row", force: true);
-                            var projectId = EnsureProject(
-                                conn,
-                                transaction,
-                                folderPath,
-                                signature,
-                                scanResult,
-                                _caseSensitivePaths,
-                                out var signatureChanged,
-                                unityVersion);
-
-                            var existingSources = LoadStoredSourceFiles(conn, transaction, projectId);
-                            var canApplyIncremental = signatureChanged
-                                && existingSources.Count > 0
-                                && scanResult.Files.Count > 0
-                                && HasV16SourceFileMetadata(existingSources);
-
-                            if (canApplyIncremental)
+                            using (var transaction = conn.BeginTransaction())
                             {
-                                reporter.Report("Computing incremental bundle delta", force: true);
-                                PartitionStoredSourcesForDelta(
+                                reporter.Report("Preparing SQLite project row", force: true);
+                                var projectId = EnsureProject(
+                                    conn,
+                                    transaction,
                                     folderPath,
-                                    existingSources,
-                                    scanLookup,
+                                    signature,
+                                    scanResult,
                                     _caseSensitivePaths,
-                                    out var unchangedSourceIds,
-                                    out var dirtySourceIds,
-                                    out var dirtyRatio);
+                                    out var signatureChanged,
+                                    unityVersion);
 
-                                if (unchangedSourceIds.Count > 0)
+                                var existingSources = LoadStoredSourceFiles(conn, transaction, projectId);
+                                var canApplyIncremental = signatureChanged
+                                    && existingSources.Count > 0
+                                    && scanResult.Files.Count > 0
+                                    && HasV16SourceFileMetadata(existingSources);
+
+                                if (canApplyIncremental)
                                 {
-                                    var requiresFullSemanticClear = !preserveSemanticRelations && dirtyRatio > 0.25;
-                                    DeleteDirtySourceRowsAndAffectedData(
-                                        conn,
-                                        transaction,
-                                        projectId,
-                                        dirtySourceIds,
-                                        preserveSemanticRelations,
-                                        requiresFullSemanticClear);
-
-                                    // Keep unchanged SourceFiles (preserving SourceFiles.Id) and unchanged Assets;
-                                    // upsert incoming handles for modified/added files and prune any removed handles.
-                                    UpsertSourceFilesAndAssetsIncremental(
-                                        conn,
-                                        transaction,
-                                        projectId,
+                                    reporter.Report("Computing incremental bundle delta", force: true);
+                                    PartitionStoredSourcesForDelta(
                                         folderPath,
-                                        scanLookup,
                                         existingSources,
-                                        unchangedSourceIds,
-                                        handleList,
+                                        scanLookup,
                                         _caseSensitivePaths,
-                                        reporter.Advance);
+                                        out var unchangedSourceIds,
+                                        out var dirtySourceIds,
+                                        out var dirtyRatio);
+
+                                    if (unchangedSourceIds.Count > 0)
+                                    {
+                                        var requiresFullSemanticClear = !preserveSemanticRelations && dirtyRatio > 0.25;
+                                        DeleteDirtySourceRowsAndAffectedData(
+                                            conn,
+                                            transaction,
+                                            projectId,
+                                            dirtySourceIds,
+                                            preserveSemanticRelations,
+                                            requiresFullSemanticClear);
+
+                                        // Keep unchanged SourceFiles (preserving SourceFiles.Id) and unchanged Assets;
+                                        // upsert incoming handles for modified/added files and prune any removed handles.
+                                        UpsertSourceFilesAndAssetsIncremental(
+                                            conn,
+                                            transaction,
+                                            projectId,
+                                            folderPath,
+                                            scanLookup,
+                                            existingSources,
+                                            unchangedSourceIds,
+                                            orderedHandles,
+                                            _caseSensitivePaths,
+                                            reporter.Advance);
+                                    }
+                                    else
+                                    {
+                                        DeleteDirtySourceRowsAndAffectedData(
+                                            conn,
+                                            transaction,
+                                            projectId,
+                                            dirtySourceIds,
+                                            preserveSemanticRelations,
+                                            requiresFullSemanticClear: !preserveSemanticRelations);
+                                        ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
+                                        InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, orderedHandles, _caseSensitivePaths, reporter.Advance, isAlreadyOrderedByUniqueId: true, isFreshInsert: true);
+                                    }
                                 }
                                 else
                                 {
-                                    DeleteDirtySourceRowsAndAffectedData(
+                                    if (signatureChanged && existingSources.Count > 0)
+                                    {
+                                        var allExistingSourceIds = existingSources.Select(static s => s.Id).ToList();
+                                        DeleteDirtyPreviewCacheEntries(conn, transaction, projectId, allExistingSourceIds);
+                                    }
+
+                                    reporter.Report("Clearing previous index rows", force: true);
+                                    ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
+
+                                    // Single write pass into the unified clustered Assets table (no secondary indexes to rebuild).
+                                    InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, orderedHandles, _caseSensitivePaths, reporter.Advance, isAlreadyOrderedByUniqueId: true, isFreshInsert: true);
+                                }
+
+                                if (markIndexingCompleted)
+                                {
+                                    var completedFiles = Math.Max(1, scanResult.TotalFiles);
+                                    SaveProjectIndexingState(
                                         conn,
                                         transaction,
                                         projectId,
-                                        dirtySourceIds,
-                                        preserveSemanticRelations,
-                                        requiresFullSemanticClear: !preserveSemanticRelations);
-                                    ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
-                                    InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, handleList, _caseSensitivePaths, reporter.Advance);
-                                }
-                            }
-                            else
-                            {
-                                if (signatureChanged && existingSources.Count > 0)
-                                {
-                                    var allExistingSourceIds = existingSources.Select(static s => s.Id).ToList();
-                                    DeleteDirtyPreviewCacheEntries(conn, transaction, projectId, allExistingSourceIds);
+                                        "completed",
+                                        completedFiles,
+                                        completedFiles,
+                                        "SQLite index cache saved",
+                                        completed: true);
                                 }
 
-                                reporter.Report("Clearing previous index rows", force: true);
-                                ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
+                                // PERF-05: Remove any prior .idx right before SQLite commit so a crash between commit and
+                                // sidecar publish can never leave a stale .idx paired with updated DB rows.
+                                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
 
-                                // Single write pass into the unified clustered Assets table (no secondary indexes to rebuild).
-                                InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, handleList, _caseSensitivePaths, reporter.Advance);
+                                reporter.Report("Committing SQLite transaction", force: true);
+                                transaction.Commit();
+                                committedProjectId = projectId;
                             }
-
-                            if (markIndexingCompleted)
-                            {
-                                var completedFiles = Math.Max(1, scanResult.TotalFiles);
-                                SaveProjectIndexingState(
-                                    conn,
-                                    transaction,
-                                    projectId,
-                                    "completed",
-                                    completedFiles,
-                                    completedFiles,
-                                    "SQLite index cache saved",
-                                    completed: true);
-                            }
-
-                            // Remove any prior .idx right before SQLite commit so a crash between commit and
-                            // sidecar rename can never leave a stale .idx paired with updated DB rows.
-                            MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
-
-                            reporter.Report("Committing SQLite transaction", force: true);
-                            transaction.Commit();
-                            committedProjectId = projectId;
+                        }
+                        finally
+                        {
+                            SetSynchronousMode(conn, "NORMAL");
                         }
 
                         CacheProjectId(dbPath, folderPath, signature, committedProjectId);
                         NotifyDatabaseMutated(dbPath);
+                        reporter.Report("Analyzing SQLite statistics", force: true);
+                        TryAnalyzeDatabase(conn, "index cache");
+                        reporter.Report("Checkpointing SQLite WAL", force: true);
+                        TryCheckpointWal(conn, "index cache");
+
+                        reporter.Report("Staging mmap .idx sidecar", force: true);
+                        var stagedOk = MmapProjectIndexSidecar.TryStageSidecar(
+                            idxPath,
+                            signature,
+                            SemanticSchemaVersion,
+                            orderedHandles,
+                            _caseSensitivePaths,
+                            out stagedIdxPath,
+                            out _,
+                            beforeSidecarValidateHook,
+                            isAlreadyNormalizedAndOrdered: true);
                         reporter.Report("Publishing mmap .idx sidecar cache", force: true);
                         if (stagedOk)
                         {
@@ -614,13 +629,10 @@ namespace AssetStudio.Avalonia
                         else
                         {
                             MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                            Logger.Warning($"Post-commit mmap .idx sidecar staging failed for '{folderPath}'; SQLite cache remains valid.");
                         }
 
                         MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
-                        reporter.Report("Analyzing SQLite statistics", force: true);
-                        TryAnalyzeDatabase(conn, "index cache");
-                        reporter.Report("Checkpointing SQLite WAL", force: true);
-                        TryCheckpointWal(conn, "index cache");
                         reporter.MarkCompleted("SQLite index cache saved");
                         reporter.Report("SQLite index cache saved", force: true);
                         Logger.Info($"Saved index cache in SQLite for: {folderPath}");
@@ -1719,6 +1731,23 @@ namespace AssetStudio.Avalonia
             }
         }
 
+        private sealed class SourceFileTupleComparer : IEqualityComparer<(string SerializedFileName, string OriginalPath)>
+        {
+            public static readonly SourceFileTupleComparer Ordinal = new(StringComparer.Ordinal);
+            public static readonly SourceFileTupleComparer OrdinalIgnoreCase = new(StringComparer.OrdinalIgnoreCase);
+
+            private readonly StringComparer _comparer;
+
+            private SourceFileTupleComparer(StringComparer comparer) => _comparer = comparer;
+
+            public bool Equals((string SerializedFileName, string OriginalPath) x, (string SerializedFileName, string OriginalPath) y) =>
+                _comparer.Equals(x.SerializedFileName, y.SerializedFileName)
+                && _comparer.Equals(x.OriginalPath, y.OriginalPath);
+
+            public int GetHashCode((string SerializedFileName, string OriginalPath) obj) =>
+                HashCode.Combine(_comparer.GetHashCode(obj.SerializedFileName), _comparer.GetHashCode(obj.OriginalPath));
+        }
+
         private static void InsertSourceFilesAndAssets(
             SqliteConnection conn,
             SqliteTransaction transaction,
@@ -1727,23 +1756,68 @@ namespace AssetStudio.Avalonia
             ScanFileLookup scanLookup,
             IReadOnlyCollection<AssetHandle> handles,
             bool caseSensitivePaths,
-            Action<string>? advanceProgress = null)
+            Action<string>? advanceProgress = null,
+            bool isAlreadyOrderedByUniqueId = false,
+            bool isFreshInsert = false)
         {
             if (handles.Count == 0)
             {
                 return;
             }
 
-            var pathComparer = caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
-            var sourceFileIds = new Dictionary<string, long>(pathComparer);
-            var sourceGroups = handles
-                .GroupBy(h => new
-                {
-                    SerializedFileName = h.SerializedFileName ?? string.Empty,
-                    OriginalPath = h.OriginalPath ?? string.Empty
-                })
-                .ToList();
+            var tupleComparer = caseSensitivePaths ? SourceFileTupleComparer.Ordinal : SourceFileTupleComparer.OrdinalIgnoreCase;
+            var sourceCounts = new Dictionary<(string SerializedFileName, string OriginalPath), int>(tupleComparer);
+            var sourceList = new List<(string SerializedFileName, string OriginalPath)>();
+            {
+                string? lastSfn = null;
+                string? lastOrig = null;
+                var lastKey = (string.Empty, string.Empty);
+                var runCount = 0;
 
+                foreach (var h in handles)
+                {
+                    var sfn = h.SerializedFileName ?? string.Empty;
+                    var orig = h.OriginalPath ?? string.Empty;
+                    if (ReferenceEquals(sfn, lastSfn) && ReferenceEquals(orig, lastOrig))
+                    {
+                        runCount++;
+                        continue;
+                    }
+
+                    if (runCount > 0)
+                    {
+                        if (sourceCounts.TryGetValue(lastKey, out var existing))
+                        {
+                            sourceCounts[lastKey] = existing + runCount;
+                        }
+                        else
+                        {
+                            sourceCounts[lastKey] = runCount;
+                            sourceList.Add(lastKey);
+                        }
+                    }
+
+                    lastSfn = sfn;
+                    lastOrig = orig;
+                    lastKey = (sfn, orig);
+                    runCount = 1;
+                }
+
+                if (runCount > 0)
+                {
+                    if (sourceCounts.TryGetValue(lastKey, out var existing))
+                    {
+                        sourceCounts[lastKey] = existing + runCount;
+                    }
+                    else
+                    {
+                        sourceCounts[lastKey] = runCount;
+                        sourceList.Add(lastKey);
+                    }
+                }
+            }
+
+            var sourceFileIds = new Dictionary<(string SerializedFileName, string OriginalPath), long>(sourceList.Count, tupleComparer);
             var sourceGroupIndex = 0;
             using (var upsertSourceCmd = conn.CreateCommand())
             {
@@ -1776,13 +1850,14 @@ namespace AssetStudio.Avalonia
                 var pFileKind = upsertSourceCmd.Parameters.Add("@fileKind", SqliteType.Integer);
                 pSrcProjectId.Value = projectId;
 
-                foreach (var group in sourceGroups)
+                for (var i = 0; i < sourceList.Count; i++)
                 {
-                    pSerializedFileName.Value = group.Key.SerializedFileName;
-                    pOriginalPath.Value = group.Key.OriginalPath;
-                    pObjectCount.Value = group.Count();
+                    var key = sourceList[i];
+                    pSerializedFileName.Value = key.SerializedFileName;
+                    pOriginalPath.Value = key.OriginalPath;
+                    pObjectCount.Value = sourceCounts[key];
 
-                    if (TryResolveScanFileMetadata(scanLookup, group.Key.OriginalPath, caseSensitivePaths, out var scanned, out var relPath))
+                    if (TryResolveScanFileMetadata(scanLookup, key.OriginalPath, caseSensitivePaths, out var scanned, out var relPath))
                     {
                         pRelativePath.Value = relPath;
                         pFileSize.Value = scanned.Size;
@@ -1802,29 +1877,33 @@ namespace AssetStudio.Avalonia
                     var id = upsertSourceCmd.ExecuteScalar();
                     if (id != null && id != DBNull.Value)
                     {
-                        sourceFileIds[GetSourceFileKey(group.Key.SerializedFileName, group.Key.OriginalPath)] = Convert.ToInt64(id);
+                        sourceFileIds[key] = Convert.ToInt64(id);
                     }
 
                     sourceGroupIndex++;
-                    advanceProgress?.Invoke($"Saving source files: {sourceGroupIndex:N0}/{sourceGroups.Count:N0}");
+                    advanceProgress?.Invoke($"Saving source files: {sourceGroupIndex:N0}/{sourceList.Count:N0}");
                 }
             }
 
             using (var cmd = conn.CreateCommand())
             {
                 cmd.Transaction = transaction;
-                cmd.CommandText = @"
-                    INSERT INTO Assets (ProjectId, SourceFileId, UniqueID, Name, Type, Container, PathID, ByteStart, ByteSize)
-                    VALUES (@projectId, @sourceFileId, @uniqueId, @name, @type, @container, @pathId, @byteStart, @byteSize)
-                    ON CONFLICT(ProjectId, UniqueID)
-                    DO UPDATE SET
-                        SourceFileId = excluded.SourceFileId,
-                        Name = excluded.Name,
-                        Type = excluded.Type,
-                        Container = excluded.Container,
-                        PathID = excluded.PathID,
-                        ByteStart = excluded.ByteStart,
-                        ByteSize = excluded.ByteSize";
+                cmd.CommandText = isFreshInsert
+                    ? @"
+                        INSERT OR REPLACE INTO Assets (ProjectId, SourceFileId, UniqueID, Name, Type, Container, PathID, ByteStart, ByteSize)
+                        VALUES (@projectId, @sourceFileId, @uniqueId, @name, @type, @container, @pathId, @byteStart, @byteSize)"
+                    : @"
+                        INSERT INTO Assets (ProjectId, SourceFileId, UniqueID, Name, Type, Container, PathID, ByteStart, ByteSize)
+                        VALUES (@projectId, @sourceFileId, @uniqueId, @name, @type, @container, @pathId, @byteStart, @byteSize)
+                        ON CONFLICT(ProjectId, UniqueID)
+                        DO UPDATE SET
+                            SourceFileId = excluded.SourceFileId,
+                            Name = excluded.Name,
+                            Type = excluded.Type,
+                            Container = excluded.Container,
+                            PathID = excluded.PathID,
+                            ByteStart = excluded.ByteStart,
+                            ByteSize = excluded.ByteSize";
 
                 var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
                 var pSourceFileId = cmd.Parameters.Add("@sourceFileId", SqliteType.Integer);
@@ -1839,13 +1918,28 @@ namespace AssetStudio.Avalonia
                 pProjectId.Value = projectId;
                 var assetRowIndex = 0;
                 // Insert in PRIMARY KEY order so the WITHOUT ROWID B-tree is filled by sequential appends
-                // instead of random page splits (SQLite BINARY collation ~ ordinal comparison).
-                foreach (var handle in handles.OrderBy(h => h.UniqueID ?? string.Empty, StringComparer.Ordinal))
+                // instead of random page splits; reuse already-ordered list from sidecar staging when available.
+                IEnumerable<AssetHandle> orderedForInsert = isAlreadyOrderedByUniqueId
+                    ? handles
+                    : handles.OrderBy(h => h.UniqueID ?? string.Empty, StringComparer.Ordinal);
+
+                string? lastSfn = null;
+                string? lastOrig = null;
+                object lastSourceFileIdValue = DBNull.Value;
+                foreach (var handle in orderedForInsert)
                 {
-                    var sourceKey = GetSourceFileKey(handle.SerializedFileName ?? string.Empty, handle.OriginalPath ?? string.Empty);
-                    pSourceFileId.Value = sourceFileIds.TryGetValue(sourceKey, out var sourceFileId)
-                        ? sourceFileId
-                        : DBNull.Value;
+                    var sfn = handle.SerializedFileName ?? string.Empty;
+                    var orig = handle.OriginalPath ?? string.Empty;
+                    if (!ReferenceEquals(sfn, lastSfn) || !ReferenceEquals(orig, lastOrig))
+                    {
+                        lastSfn = sfn;
+                        lastOrig = orig;
+                        lastSourceFileIdValue = sourceFileIds.TryGetValue((sfn, orig), out var sourceFileId)
+                            ? sourceFileId
+                            : DBNull.Value;
+                    }
+
+                    pSourceFileId.Value = lastSourceFileIdValue;
                     pUniqueId.Value = handle.UniqueID ?? string.Empty;
                     pName.Value = handle.Name ?? string.Empty;
                     pType.Value = (int)handle.Type;

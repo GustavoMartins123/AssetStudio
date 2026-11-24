@@ -2431,6 +2431,13 @@ namespace AssetStudio
             }
         }
 
+        /// <summary>
+        /// Optional zero-I/O callback invoked inside <see cref="IndexSingleSerializedFileLazyAsync"/>
+        /// using the <see cref="SerializedFile"/>, <see cref="AssetBundle"/>, and <see cref="BuildSettings"/>
+        /// already parsed in memory during lazy indexing.
+        /// </summary>
+        public Action<SerializedFile, AssetBundle?, BuildSettings?, bool>? OnLazySerializedFileIndexed { get; set; }
+
         private async System.Threading.Tasks.Task IndexSingleSerializedFileLazyAsync(SerializedFile assetsFile, bool highPriority)
         {
             await YieldForUserInteractionIfNeededAsync(highPriority);
@@ -2442,6 +2449,10 @@ namespace AssetStudio
             }
 
             List<(PPtr<Object> PPtr, string Container)>? localContainers = null;
+            AssetBundle? parsedAssetBundle = null;
+            BuildSettings? parsedBuildSettings = null;
+            bool hasGameObjects = false;
+            var onLazyIndexed = OnLazySerializedFileIndexed;
             var fileOrigin = AssetHandleOrigin.Intern(assetsFile);
             using var localReader = assetsFile.reader.Clone();
 
@@ -2470,6 +2481,10 @@ namespace AssetStudio
 
                 var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                 var type = ClassIDTypeHelper.FromClassId(objectInfo.classID);
+                if (type == ClassIDType.GameObject || type == ClassIDType.SceneAsset)
+                {
+                    hasGameObjects = true;
+                }
 
                 string? name = null;
                 if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
@@ -2479,6 +2494,7 @@ namespace AssetStudio
                         var obj = CreateObjectFromReader(objectReader);
                         if (obj is AssetBundle bundle)
                         {
+                            parsedAssetBundle = bundle;
                             name = bundle.m_Name;
                             localContainers ??= new List<(PPtr<Object>, string)>();
                             CollectSafeAssetBundleContainersForLazyIndex(bundle, localContainers);
@@ -2504,6 +2520,17 @@ namespace AssetStudio
                         // Fallback if container loading fails
                     }
                 }
+                else if (type == ClassIDType.BuildSettings && onLazyIndexed != null)
+                {
+                    try
+                    {
+                        parsedBuildSettings = new BuildSettings(objectReader);
+                    }
+                    catch
+                    {
+                        // Ignore malformed BuildSettings during lazy indexing
+                    }
+                }
                 else
                 {
                     name = AssetHandle.TryReadObjectName(objectReader);
@@ -2515,6 +2542,18 @@ namespace AssetStudio
             if (localContainers != null && localContainers.Count > 0)
             {
                 ApplyLazyContainersToProjectIndex(assetsFile, fileOrigin, localContainers);
+            }
+
+            if (onLazyIndexed != null && !ShouldStopLoading)
+            {
+                try
+                {
+                    onLazyIndexed(assetsFile, parsedAssetBundle, parsedBuildSettings, hasGameObjects);
+                }
+                catch
+                {
+                    // Optional callback must never break lazy indexing.
+                }
             }
         }
 

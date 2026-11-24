@@ -829,22 +829,9 @@ namespace AssetStudio
         {
             try
             {
-                int addedFromResolver = 0;
-                if (AddressablesCatalogDependencyResolver.TryLoadCatalog(fullPath, out var parsed) && parsed != null)
-                {
-                    for (int i = 0; i < parsed.Bundles.Count; i++)
-                    {
-                        var node = parsed.Bundles[i];
-                        if (!string.IsNullOrEmpty(node.BundleFileName)
-                            && !string.IsNullOrEmpty(node.BundleName)
-                            && !string.IsNullOrEmpty(node.Hash))
-                        {
-                            string crc = string.IsNullOrEmpty(node.Crc) ? "0" : node.Crc;
-                            metadataMap[node.BundleFileName] = (node.BundleName, node.Hash, crc);
-                            addedFromResolver++;
-                        }
-                    }
-                }
+                int addedFromResolver = AddressablesCatalogDependencyResolver.TryExtractBlock512BundleMetadata(
+                    fullPath,
+                    static (fileName, bundleName, hash, crc) => metadataMap[fileName] = (bundleName, hash, crc));
 
                 if (addedFromResolver > 0 || string.Equals(Path.GetExtension(fullPath), ".bin", StringComparison.OrdinalIgnoreCase))
                 {

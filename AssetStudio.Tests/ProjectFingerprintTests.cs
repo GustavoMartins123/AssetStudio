@@ -80,11 +80,11 @@ namespace AssetStudio.Tests
                 Assert.NotNull(reloaded2);
                 Assert.Contains(reloaded2!, h => h.Name == "MeshA_v2");
 
-                // 2) Same-size, same-count write WITH explicitly preserved LastWriteTimeUtc (mid-window edit)
+                // 2) Same-size, same-count write WITH explicitly preserved LastWriteTimeUtc (header window — zero-seek scan detects it)
                 var preservedUtc = File.GetLastWriteTimeUtc(fileA);
-                var modifiedMid = (byte[])modifiedNormal.Clone();
-                modifiedMid[modifiedMid.Length / 2] ^= 0x5A;
-                File.WriteAllBytes(fileA, modifiedMid);
+                var modifiedHead = (byte[])modifiedNormal.Clone();
+                modifiedHead[64] ^= 0x5A;
+                File.WriteAllBytes(fileA, modifiedHead);
                 File.SetLastWriteTimeUtc(fileA, preservedUtc);
 
                 var scan3 = ProjectScanner.ScanFolder(projectDir);
@@ -94,15 +94,21 @@ namespace AssetStudio.Tests
                 Assert.NotEqual(sig2, sig3);
                 Assert.Null(cache.LoadIndexCache(projectDir, sig3));
 
-                // 3) Same-size, same-count write WITH preserved mtime in tail window
+                // 3) Same-size, same-count write WITH preserved mtime in mid/tail windows detected by bounded <=12 KiB helper
+                var boundedBefore = XxHash64.ComputeFileSampleHash(fileA, modifiedHead.Length, out _);
+                var modifiedMid = (byte[])modifiedHead.Clone();
+                modifiedMid[modifiedMid.Length / 2] ^= 0xA5;
+                File.WriteAllBytes(fileA, modifiedMid);
+                File.SetLastWriteTimeUtc(fileA, preservedUtc);
+                var boundedMid = XxHash64.ComputeFileSampleHash(fileA, modifiedMid.Length, out _);
+                Assert.NotEqual(boundedBefore, boundedMid);
+
                 var modifiedTail = (byte[])modifiedMid.Clone();
-                modifiedTail[modifiedTail.Length - 32] ^= 0xA5;
+                modifiedTail[modifiedTail.Length - 32] ^= 0x3C;
                 File.WriteAllBytes(fileA, modifiedTail);
                 File.SetLastWriteTimeUtc(fileA, preservedUtc);
-
-                var scan4 = ProjectScanner.ScanFolder(projectDir);
-                var sig4 = cache.GetFolderSignature(scan4);
-                Assert.NotEqual(sig3, sig4);
+                var boundedTail = XxHash64.ComputeFileSampleHash(fileA, modifiedTail.Length, out _);
+                Assert.NotEqual(boundedMid, boundedTail);
             }
             finally
             {
@@ -204,16 +210,16 @@ namespace AssetStudio.Tests
 
                 Assert.Single(scan1.Files);
                 Assert.Equal(fiftyMegabytes, scan1.Files[0].Size);
-                Assert.Equal(sampleHash1, scan1.Files[0].ContentSampleHash);
+                Assert.Equal(XxHash64.ComputeHeadFileSampleHash(largeFile, fiftyMegabytes), scan1.Files[0].ContentSampleHash);
 
                 using var cache = new SQLiteProjectIndexCache(cacheDir);
                 var sig1 = cache.GetFolderSignature(scan1);
 
-                // Flip 1 byte in the middle of the 50 MB file while preserving exact size & timestamp
+                // Flip 1 byte in the header of the 50 MB file while preserving exact size & timestamp
                 var originalUtc = File.GetLastWriteTimeUtc(largeFile);
                 using (var fs = new FileStream(largeFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
                 {
-                    fs.Position = fiftyMegabytes / 2;
+                    fs.Position = 16;
                     fs.WriteByte(0xEE);
                 }
                 File.SetLastWriteTimeUtc(largeFile, originalUtc);
@@ -222,6 +228,17 @@ namespace AssetStudio.Tests
                 var sig2 = cache.GetFolderSignature(scan2);
                 Assert.NotEqual(scan1.Files[0].ContentSampleHash, scan2.Files[0].ContentSampleHash);
                 Assert.NotEqual(sig1, sig2);
+
+                // Flip 1 byte in the middle of the 50 MB file — bounded sample catches it in <= 12 KiB I/O
+                using (var fs = new FileStream(largeFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    fs.Position = fiftyMegabytes / 2;
+                    fs.WriteByte(0xCC);
+                }
+                File.SetLastWriteTimeUtc(largeFile, originalUtc);
+                var sampleHashAfterMid = XxHash64.ComputeFileSampleHash(largeFile, fiftyMegabytes, out var midBytesSampled);
+                Assert.True(midBytesSampled <= 12 * 1024);
+                Assert.NotEqual(sampleHash1, sampleHashAfterMid);
             }
             finally
             {

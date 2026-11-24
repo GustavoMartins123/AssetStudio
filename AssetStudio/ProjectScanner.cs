@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Enumeration;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -467,16 +468,31 @@ namespace AssetStudio
                 }
             }
 
-            var currentFiles = ImportHelper.GetFilesSafe(path, "*.*", true);
             var seenBaselineKeys = new HashSet<string>(pathComparer);
-            var unchangedFiles = new List<ScannedFileInfo>(currentFiles.Length);
+            var unchangedFiles = new List<ScannedFileInfo>(baselineScan.Files.Count);
             var filesToReprobe = new List<string>();
             var nowUtcTicks = DateTime.UtcNow.Ticks;
             var racyCleanWindowTicks = TimeSpan.FromSeconds(2).Ticks;
 
-            foreach (var file in currentFiles)
+            var enumOptions = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+                AttributesToSkip = FileAttributes.ReparsePoint
+            };
+
+            var fileEntries = new FileSystemEnumerable<(string FullPath, long Length, long LastWriteUtcTicks)>(
+                path,
+                (ref FileSystemEntry entry) => (entry.ToFullPath(), entry.Length, entry.LastWriteTimeUtc.Ticks),
+                enumOptions)
+            {
+                ShouldIncludePredicate = (ref FileSystemEntry entry) => !entry.IsDirectory
+            };
+
+            foreach (var entry in fileEntries)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                var file = entry.FullPath;
                 var key = NormalizePathKey(file);
 
                 if (!baselineByKey.TryGetValue(key, out var baselineFile))
@@ -498,16 +514,15 @@ namespace AssetStudio
                 bool changed = false;
                 try
                 {
-                    var info = new FileInfo(file);
-                    var currentLen = info.Length;
-                    var currentMtimeTicks = info.LastWriteTimeUtc.Ticks;
+                    var currentLen = entry.Length;
+                    var currentMtimeTicks = entry.LastWriteUtcTicks;
                     if (currentLen != baselineFile.Size || currentMtimeTicks != baselineFile.LastWriteTimeUtcTicks)
                     {
                         changed = true;
                     }
                     else if (verifyAllContentSamples || Math.Abs(nowUtcTicks - currentMtimeTicks) <= racyCleanWindowTicks)
                     {
-                        var liveSampleHash = XxHash64.ComputeFileSampleHash(file, currentLen, out _);
+                        var liveSampleHash = XxHash64.ComputeHeadFileSampleHash(file, currentLen);
                         if (liveSampleHash != baselineFile.ContentSampleHash)
                         {
                             changed = true;
@@ -915,9 +930,9 @@ namespace AssetStudio
                 int read = XxHash64.ReadUpTo(stream, header, headerSize);
                 var span = header.AsSpan(0, read);
 
-                // Compute bounded <= 12 KiB content sample hash (reusing already-read head window)
-                // before any early return so every scanned file gets a deterministic sample hash.
-                result.ContentSampleHash = XxHash64.ComputeBoundedSampleHash(stream, fileSize, span);
+                // Zero-seek content hash reusing the already-read 4 KiB header window
+                // (zero extra seeks / zero extra reads per file during folder scanning).
+                result.ContentSampleHash = XxHash64.ComputeHeadSampleHash(fileSize, span);
 
                 if (fileSize < 4)
                 {

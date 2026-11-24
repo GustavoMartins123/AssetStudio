@@ -556,6 +556,9 @@ namespace AssetStudio.Avalonia
             IReadOnlyList<SourceFileExternalRecord>? externals,
             bool replaceExisting)
         {
+            SetSynchronousMode(conn, "OFF");
+            try
+            {
             using var transaction = conn.BeginTransaction();
             var lookup = LoadSourceFileIdLookup(conn, transaction, projectId);
 
@@ -649,6 +652,11 @@ namespace AssetStudio.Avalonia
             }
 
             transaction.Commit();
+            }
+            finally
+            {
+                SetSynchronousMode(conn, "NORMAL");
+            }
             NotifyDatabaseMutated(dbPath);
             return true;
         }

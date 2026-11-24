@@ -1355,7 +1355,10 @@ namespace AssetStudio.Avalonia.Services
             {
                 var signature = sqliteCache.GetFolderSignature(scanResult);
                 var unityVersion = assetsManager.SpecifyUnityVersion;
-                var handles = handlesOverride ?? assetsManager.ProjectIndex.GetHandles();
+                var rawHandles = handlesOverride ?? assetsManager.ProjectIndex.GetHandles();
+                // Materialize once so ProjectIndex.GetHandles() does not allocate millions of handles twice
+                // across SaveIndexCache and DiscoverAndPersistScenesAndExternals.
+                var materializedHandles = rawHandles as IReadOnlyList<AssetHandle> ?? rawHandles.ToList();
                 PublishDatabaseWriteProgress(
                     sqliteCache,
                     folderPath,
@@ -1388,7 +1391,7 @@ namespace AssetStudio.Avalonia.Services
                     signature,
                     scanResult,
                     unityVersion,
-                    handles,
+                    materializedHandles,
                     preserveSemanticRelations,
                     ReportSaveProgress,
                     markIndexingCompleted: true);
@@ -1397,13 +1400,12 @@ namespace AssetStudio.Avalonia.Services
                 {
                     try
                     {
-                        var handleList = handles as IReadOnlyList<AssetHandle> ?? handles.ToList();
                         DiscoverAndPersistScenesAndExternals(
                             sqliteCache,
                             assetsManager,
                             folderPath,
                             signature,
-                            handleList);
+                            materializedHandles);
                     }
                     catch (Exception ex)
                     {
@@ -1999,6 +2001,41 @@ namespace AssetStudio.Avalonia.Services
                 _entriesByOriginalPath[key] = entry;
             }
 
+            internal void AppendFile(
+                string originalPath,
+                List<SourceFileExternalRecord>? externals,
+                List<IndexedSceneRecord>? bundleScenes,
+                List<IndexedSceneRecord>? heuristicScenes,
+                List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)>? buildSettingsMappings)
+            {
+                var key = NormalizeCollectorPathKey(originalPath);
+                if (string.IsNullOrEmpty(key))
+                {
+                    return;
+                }
+
+                var entry = _entriesByOriginalPath.GetOrAdd(key, _ => new FileEntry { OriginalPath = originalPath });
+                lock (entry)
+                {
+                    if (externals != null && externals.Count > 0)
+                    {
+                        entry.Externals.AddRange(externals);
+                    }
+                    if (bundleScenes != null && bundleScenes.Count > 0)
+                    {
+                        entry.BundleScenes.AddRange(bundleScenes);
+                    }
+                    if (heuristicScenes != null && heuristicScenes.Count > 0)
+                    {
+                        entry.HeuristicScenes.AddRange(heuristicScenes);
+                    }
+                    if (buildSettingsMappings != null && buildSettingsMappings.Count > 0)
+                    {
+                        entry.BuildSettingsMappings.AddRange(buildSettingsMappings);
+                    }
+                }
+            }
+
             internal void CopyTo(
                 List<SourceFileExternalRecord> externalsOut,
                 List<IndexedSceneRecord> bundleScenesOut,
@@ -2043,6 +2080,78 @@ namespace AssetStudio.Avalonia.Services
             var collector = GetOrCreateSceneMetadataCollector(assetsManager);
             collector.Clear();
             return collector;
+        }
+
+        internal static void RecordFromLazyIndexedSerializedFile(
+            SerializedFile sf,
+            AssetBundle? bundle,
+            BuildSettings? buildSettings,
+            bool hasGameObjects,
+            SceneIndexingMetadataCollector collector)
+        {
+            if (sf == null || collector == null)
+            {
+                return;
+            }
+
+            var origPath = !string.IsNullOrWhiteSpace(sf.originalPath) ? sf.originalPath : (sf.fullName ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(origPath))
+            {
+                return;
+            }
+
+            List<SourceFileExternalRecord>? externals = null;
+            if (sf.m_Externals != null && sf.m_Externals.Count > 0)
+            {
+                externals = new List<SourceFileExternalRecord>(sf.m_Externals.Count);
+                RecordSerializedFileExternals(sf, origPath, externals);
+            }
+
+            List<IndexedSceneRecord>? bundleScenes = null;
+            if (bundle?.m_Container != null && bundle.m_Container.Length > 0)
+            {
+                bundleScenes = new List<IndexedSceneRecord>();
+                ExtractAssetBundleUnityScenes(bundle, sf.fileName, origPath, bundleScenes);
+            }
+
+            List<(string LevelFileName, int BuildIndex, string ScenePath, string SourceOriginalPath)>? buildSettingsMappings = null;
+            if (buildSettings != null)
+            {
+                buildSettingsMappings = new List<(string, int, string, string)>();
+                foreach (var (levelName, buildIdx, scenePath) in buildSettings.GetLevelSceneMappings())
+                {
+                    if (!string.IsNullOrWhiteSpace(scenePath))
+                    {
+                        buildSettingsMappings.Add((levelName, buildIdx, scenePath, origPath));
+                    }
+                }
+            }
+
+            List<IndexedSceneRecord>? heuristicScenes = null;
+            if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, origPath))
+            {
+                heuristicScenes = new List<IndexedSceneRecord>(1)
+                {
+                    new IndexedSceneRecord
+                    {
+                        Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(origPath),
+                        ScenePath = sf.fileName ?? string.Empty,
+                        BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                        EntrySerializedFileName = sf.fileName ?? string.Empty,
+                        EntryOriginalPath = origPath,
+                        ContainerKey = string.Empty,
+                        SourceKind = "Heuristic"
+                    }
+                };
+            }
+
+            if ((externals != null && externals.Count > 0)
+                || (bundleScenes != null && bundleScenes.Count > 0)
+                || (heuristicScenes != null && heuristicScenes.Count > 0)
+                || (buildSettingsMappings != null && buildSettingsMappings.Count > 0))
+            {
+                collector.AppendFile(origPath, externals, bundleScenes, heuristicScenes, buildSettingsMappings);
+            }
         }
 
         /// <summary>
@@ -2194,10 +2303,15 @@ namespace AssetStudio.Avalonia.Services
             var sourceFilesWithGameObjects = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
             var buildSettingsFilesToProbe = new HashSet<string>(pathComparer);
             var bundleContainerFilesByPath = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
+            var sourceByOrigPath = new Dictionary<string, string>(pathComparer);
+            var seenRawOrigPaths = new HashSet<string>(pathComparer);
 
             var handleSource = handles ?? (assetsManager?.ProjectIndex?.Count > 0 ? assetsManager.ProjectIndex.GetHandles().ToList() : null);
             if (handleSource != null)
             {
+                string? lastSfName = null;
+                string? lastOrigPath = null;
+                string? lastGameObjectSourceKey = null;
                 for (var i = 0; i < handleSource.Count; i++)
                 {
                     var h = handleSource[i];
@@ -2208,10 +2322,11 @@ namespace AssetStudio.Avalonia.Services
 
                     var sfName = h.SerializedFileName ?? string.Empty;
                     var origPath = h.OriginalPath ?? string.Empty;
-                    if (!string.IsNullOrEmpty(sfName))
+                    if (!ReferenceEquals(sfName, lastSfName) || !ReferenceEquals(origPath, lastOrigPath))
                     {
-                        sourceByFileName.TryAdd(sfName, (sfName, origPath));
-                        if (!string.IsNullOrEmpty(origPath))
+                        lastSfName = sfName;
+                        lastOrigPath = origPath;
+                        if (sfName.Length > 0 && sourceByFileName.TryAdd(sfName, (sfName, origPath)) && origPath.Length > 0)
                         {
                             var origLeaf = Path.GetFileName(origPath);
                             if (!string.IsNullOrEmpty(origLeaf))
@@ -2219,26 +2334,35 @@ namespace AssetStudio.Avalonia.Services
                                 sourceByFileName.TryAdd(origLeaf, (sfName, origPath));
                             }
                         }
-                    }
 
-                    if (h.Type == ClassIDType.GameObject || h.Type == ClassIDType.SceneAsset)
-                    {
-                        var key = !string.IsNullOrEmpty(sfName) ? sfName : origPath;
-                        if (!string.IsNullOrEmpty(key))
+                        if (sfName.Length > 0 && origPath.Length > 0 && seenRawOrigPaths.Add(origPath))
                         {
-                            sourceFilesWithGameObjects.TryAdd(key, (sfName, origPath));
+                            sourceByOrigPath.TryAdd(SafeNormalizePath(origPath), sfName);
                         }
                     }
 
-                    if (h.Type == ClassIDType.BuildSettings && !string.IsNullOrWhiteSpace(origPath) && File.Exists(origPath))
+                    var handleType = h.Type;
+                    if (handleType == ClassIDType.GameObject || handleType == ClassIDType.SceneAsset)
+                    {
+                        var key = sfName.Length > 0 ? sfName : origPath;
+                        if (key.Length > 0 && !ReferenceEquals(key, lastGameObjectSourceKey))
+                        {
+                            lastGameObjectSourceKey = key;
+                            sourceFilesWithGameObjects.TryAdd(key, (sfName, origPath));
+                        }
+                    }
+                    else if (handleType == ClassIDType.BuildSettings && origPath.Length > 0 && !buildSettingsFilesToProbe.Contains(origPath) && File.Exists(origPath))
                     {
                         buildSettingsFilesToProbe.Add(origPath);
                     }
 
-                    if (!string.IsNullOrWhiteSpace(h.Container)
-                        && h.Container.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                    var container = h.Container;
+                    if (container != null
+                        && container.Length >= 6
+                        && (container[container.Length - 1] == 'y' || container[container.Length - 1] == 'Y')
+                        && container.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
                     {
-                        var normalizedContainer = NormalizeScenePath(h.Container);
+                        var normalizedContainer = NormalizeScenePath(container);
                         bundleContainerFilesByPath.TryAdd(normalizedContainer, (sfName, origPath));
                     }
                 }
@@ -2395,19 +2519,6 @@ namespace AssetStudio.Avalonia.Services
                 ?? (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath)
                     ? AddressablesCatalogDependencyResolver.LoadCatalogsForFiles(Array.Empty<string>(), folderPath)
                     : (IReadOnlyList<ParsedAddressablesCatalog>)Array.Empty<ParsedAddressablesCatalog>());
-
-            var sourceByOrigPath = new Dictionary<string, string>(pathComparer);
-            if (handleSource != null)
-            {
-                for (var i = 0; i < handleSource.Count; i++)
-                {
-                    var h = handleSource[i];
-                    if (h != null && !string.IsNullOrWhiteSpace(h.OriginalPath) && !string.IsNullOrWhiteSpace(h.SerializedFileName))
-                    {
-                        sourceByOrigPath.TryAdd(SafeNormalizePath(h.OriginalPath), h.SerializedFileName);
-                    }
-                }
-            }
 
             for (var c = 0; c < catalogs.Count; c++)
             {

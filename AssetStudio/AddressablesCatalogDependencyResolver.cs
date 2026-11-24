@@ -64,6 +64,9 @@ namespace AssetStudio
 
         internal string[] ImmediateSubdirectories { get; set; } = Array.Empty<string>();
 
+        private readonly HashSet<CatalogAssetEntry> _indexedAssetEntries =
+            new HashSet<CatalogAssetEntry>(ReferenceEqualityComparer.Instance);
+
         public bool TryGetEntriesByGuid(string? assetGuid, out IReadOnlyList<CatalogAssetEntry> entries)
         {
             if (AddressablesCatalogDependencyResolver.TryNormalizeAssetGuid(assetGuid, out var normalized)
@@ -99,38 +102,44 @@ namespace AssetStudio
                 return;
             }
 
-            AssetEntries.Add(entry);
-            if (entry.IsScene)
+            // O(1) duplicate guard: when indexing a fresh entry for the first time, any duplicate key
+            // within this entry can only match list[^1], avoiding O(N^2) scans on large shared label buckets.
+            var isFirstTime = _indexedAssetEntries.Add(entry);
+            if (isFirstTime)
             {
-                SceneEntries.Add(entry);
+                AssetEntries.Add(entry);
+                if (entry.IsScene)
+                {
+                    SceneEntries.Add(entry);
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(entry.PrimaryKey))
             {
-                AddKeyOrGuid(entry, entry.PrimaryKey);
+                AddKeyOrGuid(entry, entry.PrimaryKey, isFirstTime);
             }
 
             if (!string.IsNullOrWhiteSpace(entry.InternalId))
             {
-                AddAssetMultiLookup(ByKey, entry.InternalId, entry);
+                AddAssetMultiLookup(ByKey, entry.InternalId, entry, isFirstTime);
             }
 
             for (int i = 0; i < entry.Keys.Count; i++)
             {
-                AddKeyOrGuid(entry, entry.Keys[i]);
+                AddKeyOrGuid(entry, entry.Keys[i], isFirstTime);
             }
 
             for (int i = 0; i < entry.Guids.Count; i++)
             {
                 if (AddressablesCatalogDependencyResolver.TryNormalizeAssetGuid(entry.Guids[i], out var normalizedGuid))
                 {
-                    AddAssetMultiLookup(ByGuid, normalizedGuid, entry);
-                    AddAssetMultiLookup(ByKey, normalizedGuid, entry);
+                    AddAssetMultiLookup(ByGuid, normalizedGuid, entry, isFirstTime);
+                    AddAssetMultiLookup(ByKey, normalizedGuid, entry, isFirstTime);
                 }
             }
         }
 
-        private void AddKeyOrGuid(CatalogAssetEntry entry, string rawKey)
+        private void AddKeyOrGuid(CatalogAssetEntry entry, string rawKey, bool isFirstTime)
         {
             if (string.IsNullOrWhiteSpace(rawKey))
             {
@@ -138,29 +147,39 @@ namespace AssetStudio
             }
 
             var trimmed = rawKey.Trim();
-            AddAssetMultiLookup(ByKey, trimmed, entry);
+            AddAssetMultiLookup(ByKey, trimmed, entry, isFirstTime);
             if (AddressablesCatalogDependencyResolver.TryNormalizeAssetGuid(trimmed, out var normalizedGuid))
             {
                 if (!entry.Guids.Contains(normalizedGuid, StringComparer.OrdinalIgnoreCase))
                 {
                     entry.Guids.Add(normalizedGuid);
                 }
-                AddAssetMultiLookup(ByGuid, normalizedGuid, entry);
+                AddAssetMultiLookup(ByGuid, normalizedGuid, entry, isFirstTime);
             }
         }
 
         private static void AddAssetMultiLookup(
             Dictionary<string, List<CatalogAssetEntry>> dict,
             string key,
-            CatalogAssetEntry entry)
+            CatalogAssetEntry entry,
+            bool isFirstTime)
         {
             if (!dict.TryGetValue(key, out var list))
             {
                 list = new List<CatalogAssetEntry>(1);
                 dict[key] = list;
+                list.Add(entry);
+                return;
             }
 
-            if (!list.Contains(entry))
+            if (isFirstTime)
+            {
+                if (list.Count == 0 || !ReferenceEquals(list[list.Count - 1], entry))
+                {
+                    list.Add(entry);
+                }
+            }
+            else if (!list.Contains(entry))
             {
                 list.Add(entry);
             }
@@ -1088,6 +1107,157 @@ namespace AssetStudio
             return false;
         }
 
+        internal static int TryExtractBlock512BundleMetadata(
+            string catalogPath,
+            Action<string, string, string, string> onBundle)
+        {
+            if (string.IsNullOrWhiteSpace(catalogPath) || onBundle == null || !File.Exists(catalogPath))
+            {
+                return 0;
+            }
+
+            string fullPath;
+            FileInfo fileInfo;
+            try
+            {
+                fullPath = Path.GetFullPath(catalogPath);
+                fileInfo = new FileInfo(fullPath);
+            }
+            catch
+            {
+                return 0;
+            }
+
+            if (fileInfo.Length <= 0 || fileInfo.Length > MaxCatalogFileBytes)
+            {
+                return 0;
+            }
+
+            // If full catalog is already cached and fresh, reuse it in <1ms.
+            if (CatalogCache.TryGetValue(fullPath, out var cached)
+                && cached.LastWriteUtc == fileInfo.LastWriteTimeUtc
+                && cached.Length == fileInfo.Length)
+            {
+                int fromCache = 0;
+                var bundles = cached.Catalog.Bundles;
+                for (int i = 0; i < bundles.Count; i++)
+                {
+                    var node = bundles[i];
+                    if (!string.IsNullOrEmpty(node.BundleFileName)
+                        && !string.IsNullOrEmpty(node.BundleName)
+                        && !string.IsNullOrEmpty(node.Hash))
+                    {
+                        onBundle(node.BundleFileName, node.BundleName, node.Hash, string.IsNullOrEmpty(node.Crc) ? "0" : node.Crc);
+                        fromCache++;
+                    }
+                }
+                return fromCache;
+            }
+
+            // Binary catalogs: use standard parser (already fast and cached).
+            if (string.Equals(Path.GetExtension(fullPath), ".bin", StringComparison.OrdinalIgnoreCase))
+            {
+                int fromBin = 0;
+                if (TryLoadCatalog(fullPath, out var parsed) && parsed != null)
+                {
+                    for (int i = 0; i < parsed.Bundles.Count; i++)
+                    {
+                        var node = parsed.Bundles[i];
+                        if (!string.IsNullOrEmpty(node.BundleFileName)
+                            && !string.IsNullOrEmpty(node.BundleName)
+                            && !string.IsNullOrEmpty(node.Hash))
+                        {
+                            onBundle(node.BundleFileName, node.BundleName, node.Hash, string.IsNullOrEmpty(node.Crc) ? "0" : node.Crc);
+                            fromBin++;
+                        }
+                    }
+                }
+                return fromBin;
+            }
+
+            // JSON catalogs: lightweight bundle-token extraction skipping m_KeyDataString, m_BucketDataString,
+            // dependency edges, and tens of thousands of non-bundle CatalogAssetEntry records.
+            try
+            {
+                using var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var doc = JsonDocument.Parse(stream, new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = true,
+                    CommentHandling = JsonCommentHandling.Skip,
+                    MaxDepth = 64
+                });
+
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                {
+                    return 0;
+                }
+
+                var root = doc.RootElement;
+                var entryBytes = TryDecodeBase64Property(root, "m_EntryDataString");
+                var extraBytes = TryDecodeBase64Property(root, "m_ExtraDataString");
+                if (entryBytes == null || entryBytes.Length < 4 || extraBytes == null || extraBytes.Length == 0)
+                {
+                    return 0;
+                }
+
+                var internalIds = ReadJsonStringArrayProperty(root, "m_InternalIds");
+                if (internalIds.Count == 0)
+                {
+                    return 0;
+                }
+
+                var prefixes = ReadJsonStringArrayProperty(root, "m_InternalIdPrefixes");
+                int entryCount = BinaryPrimitives.ReadInt32LittleEndian(entryBytes.AsSpan(0, 4));
+                int maxEntries = (entryBytes.Length - 4) / 28;
+                int count = Math.Min(entryCount, maxEntries);
+                int added = 0;
+
+                for (int i = 0; i < count; i++)
+                {
+                    int offset = 4 + i * 28;
+                    int dataIdx = BinaryPrimitives.ReadInt32LittleEndian(entryBytes.AsSpan(offset + 16, 4));
+                    if (dataIdx < 0)
+                    {
+                        continue;
+                    }
+
+                    int internalIdIdx = BinaryPrimitives.ReadInt32LittleEndian(entryBytes.AsSpan(offset, 4));
+                    if (internalIdIdx < 0 || internalIdIdx >= internalIds.Count)
+                    {
+                        continue;
+                    }
+
+                    var extraJson = ReadSerializedExtraJson(extraBytes, dataIdx);
+                    if (string.IsNullOrWhiteSpace(extraJson))
+                    {
+                        continue;
+                    }
+
+                    TryParseExtraBundleOptions(extraJson, out var bundleName, out var hash, out var crc);
+                    if (string.IsNullOrEmpty(bundleName) || string.IsNullOrEmpty(hash))
+                    {
+                        continue;
+                    }
+
+                    var expandedId = ExpandInternalId(internalIds[internalIdIdx], prefixes);
+                    var fileName = ExtractBundleFileName(expandedId);
+                    if (string.IsNullOrEmpty(fileName))
+                    {
+                        continue;
+                    }
+
+                    onBundle(fileName, bundleName, hash, string.IsNullOrEmpty(crc) ? "0" : crc);
+                    added++;
+                }
+
+                return added;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
         public static bool TryParseJsonCatalog(string catalogPath, out ParsedAddressablesCatalog? catalog)
         {
             catalog = null;
@@ -1260,7 +1430,7 @@ namespace AssetStudio
                 // Wire dependency edges AND retain non-bundle asset/scene entries (ByKey, ByGuid, SceneEntries):
                 // 1) For non-bundle asset/scene entries, depBucket[0] is the primary bundle and depBucket[1..k] are its dependency bundles.
                 // 2) For bundle entries that directly carry a dependencyKeyIndex, depBucket entries (!= i) are direct dependencies of bundle i.
-                var keysByEntryIndex = new Dictionary<int, List<string>>();
+                var keysByEntryIndex = new List<string>?[entries.Count];
                 for (int b = 0; b < buckets.Count; b++)
                 {
                     var bucket = buckets[b];
@@ -1277,20 +1447,21 @@ namespace AssetStudio
                             continue;
                         }
 
-                        if (!keysByEntryIndex.TryGetValue(targetIdx, out var keyList))
+                        var keyList = keysByEntryIndex[targetIdx];
+                        if (keyList == null)
                         {
                             keyList = new List<string>(2);
                             keysByEntryIndex[targetIdx] = keyList;
+                            keyList.Add(bucket.KeyString);
                         }
-
-                        if (!keyList.Contains(bucket.KeyString, StringComparer.OrdinalIgnoreCase))
+                        else if (!ContainsIgnoreCaseSmall(keyList, bucket.KeyString))
                         {
                             keyList.Add(bucket.KeyString);
                         }
                     }
                 }
 
-                var seenAssetDepBuckets = new HashSet<int>();
+                var depBucketResolved = new (bool Resolved, CatalogBundleNode? Primary, string[] DepIds)[buckets.Count];
                 for (int i = 0; i < entries.Count; i++)
                 {
                     var e = entries[i];
@@ -1325,38 +1496,61 @@ namespace AssetStudio
                     else
                     {
                         CatalogBundleNode? primaryNode = null;
-                        var depBundleIds = new List<string>();
-                        if (depEntries.Length > 0)
+                        string[] depBundleIds = Array.Empty<string>();
+                        if (hasDepBucket && depEntries.Length > 0)
                         {
-                            var primaryIdx = depEntries[0];
-                            if (primaryIdx >= 0 && primaryIdx < entries.Count)
+                            ref var cachedDep = ref depBucketResolved[depBucketIdx];
+                            if (!cachedDep.Resolved)
                             {
-                                primaryNode = bundleNodeByEntryIndex[primaryIdx];
-                            }
-
-                            bool wireBundleDeps = depEntries.Length >= 2 && primaryNode != null && seenAssetDepBuckets.Add(depBucketIdx);
-                            for (int j = 1; j < depEntries.Length; j++)
-                            {
-                                var depIdx = depEntries[j];
-                                if (depIdx < 0 || depIdx >= entries.Count || depIdx == primaryIdx)
+                                CatalogBundleNode? resolvedPrimary = null;
+                                var primaryIdx = depEntries[0];
+                                if (primaryIdx >= 0 && primaryIdx < entries.Count)
                                 {
-                                    continue;
+                                    resolvedPrimary = bundleNodeByEntryIndex[primaryIdx];
                                 }
 
-                                var depNode = bundleNodeByEntryIndex[depIdx];
-                                if (depNode != null)
+                                List<string>? depList = null;
+                                HashSet<string>? depSet = null;
+                                for (int j = 1; j < depEntries.Length; j++)
                                 {
-                                    if (!depBundleIds.Contains(depNode.InternalId, StringComparer.OrdinalIgnoreCase))
+                                    var depIdx = depEntries[j];
+                                    if (depIdx < 0 || depIdx >= entries.Count || depIdx == primaryIdx)
                                     {
-                                        depBundleIds.Add(depNode.InternalId);
+                                        continue;
                                     }
 
-                                    if (wireBundleDeps && primaryNode != null)
+                                    var depNode = bundleNodeByEntryIndex[depIdx];
+                                    if (depNode != null)
                                     {
-                                        AddDependencyEdge(primaryNode, depNode.InternalId);
+                                        depList ??= new List<string>(depEntries.Length - 1);
+                                        bool isNewDep;
+                                        if (depList.Count >= 8)
+                                        {
+                                            depSet ??= new HashSet<string>(depList, StringComparer.OrdinalIgnoreCase);
+                                            isNewDep = depSet.Add(depNode.InternalId);
+                                        }
+                                        else
+                                        {
+                                            isNewDep = !ContainsIgnoreCaseSmall(depList, depNode.InternalId);
+                                        }
+
+                                        if (isNewDep)
+                                        {
+                                            depList.Add(depNode.InternalId);
+                                        }
+
+                                        if (resolvedPrimary != null)
+                                        {
+                                            AddDependencyEdge(resolvedPrimary, depNode.InternalId);
+                                        }
                                     }
                                 }
+
+                                cachedDep = (true, resolvedPrimary, depList != null ? depList.ToArray() : Array.Empty<string>());
                             }
+
+                            primaryNode = cachedDep.Primary;
+                            depBundleIds = cachedDep.DepIds;
                         }
 
                         if (e.InternalIdIndex >= 0 && e.InternalIdIndex < expandedInternalIds.Length)
@@ -1376,20 +1570,15 @@ namespace AssetStudio
                                 IsScene = isScene
                             };
 
-                            if (depBundleIds.Count > 0)
+                            if (depBundleIds.Length > 0)
                             {
                                 assetEntry.DependencyBundleInternalIds.AddRange(depBundleIds);
                             }
 
-                            if (keysByEntryIndex.TryGetValue(i, out var entryKeys))
+                            var entryKeys = keysByEntryIndex[i];
+                            if (entryKeys != null && entryKeys.Count > 0)
                             {
-                                for (int k = 0; k < entryKeys.Count; k++)
-                                {
-                                    if (!assetEntry.Keys.Contains(entryKeys[k], StringComparer.OrdinalIgnoreCase))
-                                    {
-                                        assetEntry.Keys.Add(entryKeys[k]);
-                                    }
-                                }
+                                assetEntry.Keys.AddRange(entryKeys);
                             }
 
                             parsed.IndexAssetEntry(assetEntry);
@@ -2433,6 +2622,139 @@ namespace AssetStudio
             return null;
         }
 
+        private static bool ContainsIgnoreCaseSmall(List<string> list, string value)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (string.Equals(list[i], value, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool TryExtractSimpleJsonStringField(string json, string fieldToken, out string value)
+        {
+            value = string.Empty;
+            int idx = json.IndexOf(fieldToken, StringComparison.Ordinal);
+            if (idx < 0)
+            {
+                return false;
+            }
+
+            int pos = idx + fieldToken.Length;
+            while (pos < json.Length && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n'))
+            {
+                pos++;
+            }
+
+            if (pos >= json.Length || json[pos] != ':')
+            {
+                return false;
+            }
+
+            pos++;
+            while (pos < json.Length && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n'))
+            {
+                pos++;
+            }
+
+            if (pos >= json.Length || json[pos] != '"')
+            {
+                return false;
+            }
+
+            int start = ++pos;
+            while (pos < json.Length)
+            {
+                char ch = json[pos];
+                if (ch == '\\')
+                {
+                    return false; // Fall back to JsonDocument for escaped strings
+                }
+                if (ch == '"')
+                {
+                    value = json.Substring(start, pos - start);
+                    return true;
+                }
+                pos++;
+            }
+
+            return false;
+        }
+
+        private static bool TryExtractSimpleJsonScalarField(string json, string fieldToken, out string value)
+        {
+            value = string.Empty;
+            int idx = json.IndexOf(fieldToken, StringComparison.Ordinal);
+            if (idx < 0)
+            {
+                return false;
+            }
+
+            int pos = idx + fieldToken.Length;
+            while (pos < json.Length && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n'))
+            {
+                pos++;
+            }
+
+            if (pos >= json.Length || json[pos] != ':')
+            {
+                return false;
+            }
+
+            pos++;
+            while (pos < json.Length && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n'))
+            {
+                pos++;
+            }
+
+            if (pos >= json.Length)
+            {
+                return false;
+            }
+
+            if (json[pos] == '"')
+            {
+                int start = ++pos;
+                while (pos < json.Length)
+                {
+                    char ch = json[pos];
+                    if (ch == '\\') return false;
+                    if (ch == '"')
+                    {
+                        value = json.Substring(start, pos - start);
+                        return true;
+                    }
+                    pos++;
+                }
+                return false;
+            }
+
+            int numStart = pos;
+            while (pos < json.Length)
+            {
+                char ch = json[pos];
+                if ((ch >= '0' && ch <= '9') || ch == '-')
+                {
+                    pos++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (pos > numStart)
+            {
+                value = json.Substring(numStart, pos - numStart);
+                return true;
+            }
+
+            return false;
+        }
+
         private static void TryParseExtraBundleOptions(
             string json,
             out string bundleName,
@@ -2442,6 +2764,19 @@ namespace AssetStudio
             bundleName = string.Empty;
             hash = string.Empty;
             crc = string.Empty;
+
+            // Fast zero-JsonDocument path for standard Unity AssetBundleRequestOptions JSON.
+            if (TryExtractSimpleJsonStringField(json, "\"m_BundleName\"", out var fastName)
+                && TryExtractSimpleJsonStringField(json, "\"m_Hash\"", out var fastHash))
+            {
+                bundleName = fastName;
+                hash = fastHash;
+                if (TryExtractSimpleJsonScalarField(json, "\"m_Crc\"", out var fastCrc))
+                {
+                    crc = fastCrc;
+                }
+                return;
+            }
 
             try
             {
