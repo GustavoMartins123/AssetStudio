@@ -396,14 +396,22 @@ namespace AssetStudio
             {
                 ProjectRoot = path;
             }
-            var dirComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-            foreach (var dir in nonEmptyFiles
-                .Select(f => Path.GetDirectoryName(Path.GetFullPath(f)))
-                .Where(d => !string.IsNullOrEmpty(d))
-                .Select(d => d!)
-                .Distinct(dirComparer))
+            // In Lazy preview loads for non-split files, skip scanning the entire bundle directory for *.split0
+            // on every single asset click (cold folder indexing already merges split assets upfront).
+            var shouldScanSplitAssets = !LazyLoading
+                || !highPriority
+                || nonEmptyFiles.Any(static f => f.EndsWith(".split0", StringComparison.OrdinalIgnoreCase));
+            if (shouldScanSplitAssets)
             {
-                MergeSplitAssets(dir);
+                var dirComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+                foreach (var dir in nonEmptyFiles
+                    .Select(f => Path.GetDirectoryName(Path.GetFullPath(f)))
+                    .Where(d => !string.IsNullOrEmpty(d))
+                    .Select(d => d!)
+                    .Distinct(dirComparer))
+                {
+                    MergeSplitAssets(dir);
+                }
             }
             var toReadFile = ProcessingSplitFiles(nonEmptyFiles);
             await LoadAsync(

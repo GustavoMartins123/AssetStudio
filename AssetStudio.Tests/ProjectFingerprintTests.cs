@@ -816,6 +816,48 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Fact]
+        public void Perf01_GetFolderSignature_CachesRepeatedLookups_AndInvalidatesOnFileListChange()
+        {
+            var root = Path.Combine(Path.GetTempPath(), "SigCacheProject");
+            var entries = new List<ScannedFileInfo>(500);
+            for (var i = 0; i < 500; i++)
+            {
+                entries.Add(new ScannedFileInfo(
+                    Path.Combine(root, "Bundles", $"Asset_{i:D4}.bundle"),
+                    4096,
+                    ProjectFileKind.UnityBundle,
+                    638000000000000000L + i,
+                    (ulong)(i + 1)));
+            }
+
+            var scan = new ProjectScanResult(root, entries);
+            var ciFirst = SQLiteProjectIndexCache.ComputeFolderSignature(scan, caseSensitive: false);
+            var csFirst = SQLiteProjectIndexCache.ComputeFolderSignature(scan, caseSensitive: true);
+            Assert.NotEqual(ciFirst, csFirst);
+
+            // Repeated lookups on the same ProjectScanResult must hit the cache and return identical strings in O(1).
+            var sw = Stopwatch.StartNew();
+            for (var r = 0; r < 500; r++)
+            {
+                Assert.Same(ciFirst, SQLiteProjectIndexCache.ComputeFolderSignature(scan, caseSensitive: false));
+                Assert.Same(csFirst, SQLiteProjectIndexCache.ComputeFolderSignature(scan, caseSensitive: true));
+            }
+            sw.Stop();
+            Assert.True(sw.ElapsedMilliseconds < 250, $"Expected cached GetFolderSignature x1000 < 250ms, took {sw.ElapsedMilliseconds}ms.");
+
+            // Appending a file to Files must invalidate the cached entry automatically.
+            scan.Files.Add(new ScannedFileInfo(
+                Path.Combine(root, "Bundles", "Asset_0500.bundle"),
+                4096,
+                ProjectFileKind.UnityBundle,
+                638000000000000500L,
+                501UL));
+
+            var ciAfter = SQLiteProjectIndexCache.ComputeFolderSignature(scan, caseSensitive: false);
+            Assert.NotEqual(ciFirst, ciAfter);
+        }
+
         private static AssetHandle CreateHandle(string serializedFileName, string originalPath, long pathId, string name, ClassIDType type)
         {
             return new AssetHandle

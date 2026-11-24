@@ -32,7 +32,7 @@ namespace AssetStudio.Avalonia
             {
                 using var conn = CreateConnectionByDbPath(dbPath);
                 using var transaction = conn.BeginTransaction();
-                var foundProjectId = FindProjectId(conn, transaction, folderPath, projectSignature);
+                var foundProjectId = FindProjectId(conn, transaction, folderPath, projectSignature, _caseSensitivePaths);
                 if (foundProjectId.HasValue)
                 {
                     projectId = foundProjectId.Value;
@@ -318,7 +318,7 @@ namespace AssetStudio.Avalonia
                         using var conn = CreateConnectionByDbPath(_dbPath);
 
                         reporter.Report("Resolving project row", force: true);
-                        var foundProjectId = FindProjectId(conn, null, _folderPath, _projectSignature);
+                        var foundProjectId = FindProjectId(conn, null, _folderPath, _projectSignature, _owner._caseSensitivePaths);
                         if (foundProjectId == null)
                         {
                             _owner.EvictProjectIdCacheEntry(_dbPath, _folderPath, _projectSignature);
@@ -522,7 +522,7 @@ namespace AssetStudio.Avalonia
                     using var conn = CreateConnectionByDbPath(dbPath);
 
                     reporter.Report("Resolving project row", force: true);
-                    var foundProjectId = FindProjectId(conn, null, folderPath, signature);
+                    var foundProjectId = FindProjectId(conn, null, folderPath, signature, _caseSensitivePaths);
                     if (foundProjectId == null)
                     {
                         EvictProjectIdCacheEntry(dbPath, folderPath, signature);
@@ -779,7 +779,7 @@ namespace AssetStudio.Avalonia
                 {
                     using var conn = CreateConnectionByDbPath(dbPath);
                     using var transaction = conn.BeginTransaction();
-                    var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                    var projectId = FindProjectId(conn, transaction, folderPath, signature, _caseSensitivePaths);
                     if (projectId == null)
                     {
                         EvictProjectIdCacheEntry(dbPath, folderPath, signature);
@@ -2649,6 +2649,7 @@ namespace AssetStudio.Avalonia
                         UNION ALL
 
                         -- (b1) ModelGroups linked directly via ControllerAssetUniqueID -> AnimationClip edges
+                        -- CROSS JOIN locks SQLite join order (mg -> clipEdge) even before sqlite_stat1 exists on recreated indexes.
                         SELECT
                             clipEdge.TargetAssetUniqueID AS ClipId,
                             mg.AnimatorAssetUniqueID AS AnimatorId,
@@ -2658,7 +2659,7 @@ namespace AssetStudio.Avalonia
                             'AnimatorController' AS RelationKind,
                             10000 + COALESCE(mg.Confidence, 0) + 150 - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
                         FROM ModelGroups mg
-                        INNER JOIN AssetEdges clipEdge
+                        CROSS JOIN AssetEdges clipEdge
                           ON clipEdge.ProjectId = @projectId
                          AND clipEdge.EdgeKind = 'AnimationClip'
                          AND clipEdge.SourceAssetUniqueID = mg.ControllerAssetUniqueID
@@ -2671,6 +2672,7 @@ namespace AssetStudio.Avalonia
                         UNION ALL
 
                         -- (b2) ModelGroups linked via AnimatorOverrideController -> base AnimatorController -> AnimationClip edges
+                        -- CROSS JOIN prevents SQLite from reordering (mg x clipEdge) into a billion-row Cartesian product without sqlite_stat1.
                         SELECT
                             clipEdge.TargetAssetUniqueID AS ClipId,
                             mg.AnimatorAssetUniqueID AS AnimatorId,
@@ -2680,13 +2682,13 @@ namespace AssetStudio.Avalonia
                             'AnimatorOverrideController' AS RelationKind,
                             9800 + COALESCE(mg.Confidence, 0) + 150 - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
                         FROM ModelGroups mg
-                        INNER JOIN AssetEdges ctrlEdge
+                        CROSS JOIN AssetEdges ctrlEdge
                           ON ctrlEdge.ProjectId = @projectId
                          AND ctrlEdge.EdgeKind = 'AnimatorController'
                          AND ctrlEdge.SourceAssetUniqueID = mg.ControllerAssetUniqueID
                          AND ctrlEdge.SlotName = 'm_Controller'
                          AND ctrlEdge.TargetAssetUniqueID <> ''
-                        INNER JOIN AssetEdges clipEdge
+                        CROSS JOIN AssetEdges clipEdge
                           ON clipEdge.ProjectId = @projectId
                          AND clipEdge.EdgeKind = 'AnimationClip'
                          AND clipEdge.SourceAssetUniqueID = ctrlEdge.TargetAssetUniqueID
@@ -2732,6 +2734,7 @@ namespace AssetStudio.Avalonia
                         UNION ALL
 
                         -- (c2) Animator -> AnimatorController edge -> AnimationClip edge
+                        -- CROSS JOIN guarantees ctrlEdge -> clipEdge indexed lookup via idx_asset_edges_kind_source.
                         SELECT
                             clipEdge.TargetAssetUniqueID AS ClipId,
                             ctrlEdge.SourceAssetUniqueID AS AnimatorId,
@@ -2741,7 +2744,7 @@ namespace AssetStudio.Avalonia
                             'AnimatorController' AS RelationKind,
                             10000 - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
                         FROM AssetEdges ctrlEdge
-                        INNER JOIN AssetEdges clipEdge
+                        CROSS JOIN AssetEdges clipEdge
                           ON clipEdge.ProjectId = @projectId
                          AND clipEdge.EdgeKind = 'AnimationClip'
                          AND clipEdge.SourceAssetUniqueID = ctrlEdge.TargetAssetUniqueID
@@ -3533,7 +3536,7 @@ namespace AssetStudio.Avalonia
 
                 using var conn = CreateConnectionByDbPath(dbPath);
                 using var transaction = conn.BeginTransaction();
-                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                var projectId = FindProjectId(conn, transaction, folderPath, signature, _caseSensitivePaths);
                 if (projectId == null)
                 {
                     return true;

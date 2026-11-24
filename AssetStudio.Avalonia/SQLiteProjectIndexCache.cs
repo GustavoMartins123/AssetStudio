@@ -1,10 +1,12 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -70,6 +72,54 @@ namespace AssetStudio.Avalonia
         internal long PhysicalReadConnectionsOpened => Interlocked.Read(ref _physicalReadConnectionsOpened);
         internal long ReadPoolHits => Interlocked.Read(ref _readPoolHits);
 
+        private sealed class CachedFolderSignature
+        {
+            public readonly object Sync = new();
+            public string? CaseInsensitiveSignature;
+            public string? CaseSensitiveSignature;
+            public int FileCount;
+            public int TotalFiles;
+            public long TotalBytes;
+            public int UnityBundleCount;
+            public int SerializedFileCount;
+            public int ResourceFileCount;
+            public int EncryptedFileCount;
+            public int OtherFileCount;
+            public int ErrorCount;
+            public string? DecryptionContextDigest;
+            public string? RootPath;
+
+            public bool MatchesHeader(ProjectScanResult sr) =>
+                FileCount == sr.Files.Count
+                && TotalFiles == sr.TotalFiles
+                && TotalBytes == sr.TotalBytes
+                && UnityBundleCount == sr.UnityBundleCount
+                && SerializedFileCount == sr.SerializedFileCount
+                && ResourceFileCount == sr.ResourceFileCount
+                && EncryptedFileCount == sr.EncryptedFileCount
+                && OtherFileCount == sr.OtherFileCount
+                && ErrorCount == sr.ErrorCount
+                && string.Equals(DecryptionContextDigest, sr.DecryptionContextDigest, StringComparison.Ordinal)
+                && string.Equals(RootPath, sr.RootPath, StringComparison.Ordinal);
+
+            public void CaptureHeader(ProjectScanResult sr)
+            {
+                FileCount = sr.Files.Count;
+                TotalFiles = sr.TotalFiles;
+                TotalBytes = sr.TotalBytes;
+                UnityBundleCount = sr.UnityBundleCount;
+                SerializedFileCount = sr.SerializedFileCount;
+                ResourceFileCount = sr.ResourceFileCount;
+                EncryptedFileCount = sr.EncryptedFileCount;
+                OtherFileCount = sr.OtherFileCount;
+                ErrorCount = sr.ErrorCount;
+                DecryptionContextDigest = sr.DecryptionContextDigest;
+                RootPath = sr.RootPath;
+            }
+        }
+
+        private static readonly ConditionalWeakTable<ProjectScanResult, CachedFolderSignature> s_folderSignatureCache = new();
+
         public string GetFolderSignature(ProjectScanResult scanResult)
         {
             return ComputeFolderSignature(scanResult, _caseSensitivePaths);
@@ -79,99 +129,203 @@ namespace AssetStudio.Avalonia
         {
             ArgumentNullException.ThrowIfNull(scanResult);
 
-            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            AppendSignatureUtf8(hasher, "manifest-v2\0");
-            AppendSignatureUtf8(hasher, "C|");
-            AppendSignatureUtf8(hasher, scanResult.TotalFiles.ToString(CultureInfo.InvariantCulture));
-            AppendSignatureUtf8(hasher, "|");
-            AppendSignatureUtf8(hasher, scanResult.TotalBytes.ToString(CultureInfo.InvariantCulture));
-            AppendSignatureUtf8(hasher, "|");
-            AppendSignatureUtf8(hasher, scanResult.UnityBundleCount.ToString(CultureInfo.InvariantCulture));
-            AppendSignatureUtf8(hasher, "|");
-            AppendSignatureUtf8(hasher, scanResult.SerializedFileCount.ToString(CultureInfo.InvariantCulture));
-            AppendSignatureUtf8(hasher, "|");
-            AppendSignatureUtf8(hasher, scanResult.ResourceFileCount.ToString(CultureInfo.InvariantCulture));
-            AppendSignatureUtf8(hasher, "|");
-            AppendSignatureUtf8(hasher, scanResult.EncryptedFileCount.ToString(CultureInfo.InvariantCulture));
-            AppendSignatureUtf8(hasher, "|");
-            AppendSignatureUtf8(hasher, scanResult.OtherFileCount.ToString(CultureInfo.InvariantCulture));
-            AppendSignatureUtf8(hasher, "|");
-            AppendSignatureUtf8(hasher, scanResult.ErrorCount.ToString(CultureInfo.InvariantCulture));
-            AppendSignatureUtf8(hasher, "\0D|");
-            AppendSignatureUtf8(hasher, scanResult.DecryptionContextDigest ?? string.Empty);
-            AppendSignatureUtf8(hasher, "\0");
-
-            if (scanResult.Files.Count > 0)
+            var cacheEntry = s_folderSignatureCache.GetOrCreateValue(scanResult);
+            lock (cacheEntry.Sync)
             {
-                var rootFull = string.IsNullOrWhiteSpace(scanResult.RootPath)
-                    ? string.Empty
-                    : TrimTrailingDirectorySeparatorsPreservingRoot(GetFullPathOrOriginal(scanResult.RootPath));
-
-                var entries = new List<(string RelativePath, long Size, int Kind, long LastWriteTicks, ulong SampleHash, string AppliedProvider)>(scanResult.Files.Count);
-                for (var i = 0; i < scanResult.Files.Count; i++)
+                if (cacheEntry.MatchesHeader(scanResult))
                 {
-                    var file = scanResult.Files[i];
-                    var relPath = NormalizeRelativeManifestPath(rootFull, file.Path, caseSensitive);
-                    entries.Add((
-                        relPath,
-                        file.Size,
-                        (int)file.Kind,
-                        file.LastWriteTimeUtcTicks,
-                        file.ContentSampleHash,
-                        file.AppliedDecryptionProvider ?? string.Empty));
+                    var cached = caseSensitive ? cacheEntry.CaseSensitiveSignature : cacheEntry.CaseInsensitiveSignature;
+                    if (cached != null)
+                    {
+                        return cached;
+                    }
                 }
-
-                entries.Sort(static (a, b) =>
+                else
                 {
-                    var cmp = string.CompareOrdinal(a.RelativePath, b.RelativePath);
-                    if (cmp != 0) return cmp;
-                    cmp = a.Size.CompareTo(b.Size);
-                    if (cmp != 0) return cmp;
-                    cmp = a.Kind.CompareTo(b.Kind);
-                    if (cmp != 0) return cmp;
-                    cmp = a.LastWriteTicks.CompareTo(b.LastWriteTicks);
-                    if (cmp != 0) return cmp;
-                    cmp = a.SampleHash.CompareTo(b.SampleHash);
-                    if (cmp != 0) return cmp;
-                    return string.CompareOrdinal(a.AppliedProvider, b.AppliedProvider);
-                });
-
-                for (var i = 0; i < entries.Count; i++)
-                {
-                    var e = entries[i];
-                    AppendSignatureUtf8(hasher, "F|");
-                    AppendSignatureUtf8(hasher, e.RelativePath);
-                    AppendSignatureUtf8(hasher, "|");
-                    AppendSignatureUtf8(hasher, e.Size.ToString(CultureInfo.InvariantCulture));
-                    AppendSignatureUtf8(hasher, "|");
-                    AppendSignatureUtf8(hasher, e.Kind.ToString(CultureInfo.InvariantCulture));
-                    AppendSignatureUtf8(hasher, "|");
-                    AppendSignatureUtf8(hasher, e.LastWriteTicks.ToString(CultureInfo.InvariantCulture));
-                    AppendSignatureUtf8(hasher, "|");
-                    AppendSignatureUtf8(hasher, e.SampleHash.ToString("x16", CultureInfo.InvariantCulture));
-                    AppendSignatureUtf8(hasher, "|");
-                    AppendSignatureUtf8(hasher, e.AppliedProvider);
-                    AppendSignatureUtf8(hasher, "\0");
+                    cacheEntry.CaseInsensitiveSignature = null;
+                    cacheEntry.CaseSensitiveSignature = null;
+                    cacheEntry.CaptureHeader(scanResult);
                 }
             }
 
-            var hex = Convert.ToHexStringLower(hasher.GetHashAndReset());
-            if (scanResult.EncryptedFileCount > 0)
+            var computed = ComputeFolderSignatureUncached(scanResult, caseSensitive);
+
+            lock (cacheEntry.Sync)
             {
-                return $"v2:{hex}_e{scanResult.EncryptedFileCount}";
+                if (!cacheEntry.MatchesHeader(scanResult))
+                {
+                    cacheEntry.CaseInsensitiveSignature = null;
+                    cacheEntry.CaseSensitiveSignature = null;
+                    cacheEntry.CaptureHeader(scanResult);
+                }
+
+                if (caseSensitive)
+                {
+                    cacheEntry.CaseSensitiveSignature = computed;
+                }
+                else
+                {
+                    cacheEntry.CaseInsensitiveSignature = computed;
+                }
             }
 
-            return $"v2:{hex}";
+            return computed;
         }
 
-        private static void AppendSignatureUtf8(IncrementalHash hasher, string text)
+        private static string ComputeFolderSignatureUncached(ProjectScanResult scanResult, bool caseSensitive)
         {
-            if (text.Length == 0)
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var utf8Buf = ArrayPool<byte>.Shared.Rent(4096);
+            try
             {
-                return;
-            }
+                var utf8Pos = 0;
 
-            hasher.AppendData(Encoding.UTF8.GetBytes(text));
+                void FlushUtf8()
+                {
+                    if (utf8Pos > 0)
+                    {
+                        hasher.AppendData(utf8Buf.AsSpan(0, utf8Pos));
+                        utf8Pos = 0;
+                    }
+                }
+
+                void AppendText(string text)
+                {
+                    if (text.Length == 0)
+                    {
+                        return;
+                    }
+
+                    var maxBytes = Encoding.UTF8.GetMaxByteCount(text.Length);
+                    if (maxBytes > utf8Buf.Length)
+                    {
+                        FlushUtf8();
+                        ArrayPool<byte>.Shared.Return(utf8Buf);
+                        utf8Buf = ArrayPool<byte>.Shared.Rent(maxBytes);
+                    }
+                    else if (utf8Pos + maxBytes > utf8Buf.Length)
+                    {
+                        FlushUtf8();
+                    }
+
+                    utf8Pos += Encoding.UTF8.GetBytes(text.AsSpan(), utf8Buf.AsSpan(utf8Pos));
+                }
+
+                void AppendInt64(long value)
+                {
+                    Span<char> chars = stackalloc char[32];
+                    if (value.TryFormat(chars, out var written, default, CultureInfo.InvariantCulture))
+                    {
+                        if (utf8Pos + written > utf8Buf.Length)
+                        {
+                            FlushUtf8();
+                        }
+
+                        utf8Pos += Encoding.UTF8.GetBytes(chars.Slice(0, written), utf8Buf.AsSpan(utf8Pos));
+                    }
+                }
+
+                void AppendHexUInt64(ulong value)
+                {
+                    Span<char> chars = stackalloc char[16];
+                    if (value.TryFormat(chars, out var written, "x16", CultureInfo.InvariantCulture))
+                    {
+                        if (utf8Pos + written > utf8Buf.Length)
+                        {
+                            FlushUtf8();
+                        }
+
+                        utf8Pos += Encoding.UTF8.GetBytes(chars.Slice(0, written), utf8Buf.AsSpan(utf8Pos));
+                    }
+                }
+
+                AppendText("manifest-v2\0C|");
+                AppendInt64(scanResult.TotalFiles);
+                AppendText("|");
+                AppendInt64(scanResult.TotalBytes);
+                AppendText("|");
+                AppendInt64(scanResult.UnityBundleCount);
+                AppendText("|");
+                AppendInt64(scanResult.SerializedFileCount);
+                AppendText("|");
+                AppendInt64(scanResult.ResourceFileCount);
+                AppendText("|");
+                AppendInt64(scanResult.EncryptedFileCount);
+                AppendText("|");
+                AppendInt64(scanResult.OtherFileCount);
+                AppendText("|");
+                AppendInt64(scanResult.ErrorCount);
+                AppendText("\0D|");
+                AppendText(scanResult.DecryptionContextDigest ?? string.Empty);
+                AppendText("\0");
+
+                if (scanResult.Files.Count > 0)
+                {
+                    var rootFull = string.IsNullOrWhiteSpace(scanResult.RootPath)
+                        ? string.Empty
+                        : TrimTrailingDirectorySeparatorsPreservingRoot(GetFullPathOrOriginal(scanResult.RootPath));
+
+                    var entries = new List<(string RelativePath, long Size, int Kind, long LastWriteTicks, ulong SampleHash, string AppliedProvider)>(scanResult.Files.Count);
+                    for (var i = 0; i < scanResult.Files.Count; i++)
+                    {
+                        var file = scanResult.Files[i];
+                        var relPath = NormalizeRelativeManifestPath(rootFull, file.Path, caseSensitive);
+                        entries.Add((
+                            relPath,
+                            file.Size,
+                            (int)file.Kind,
+                            file.LastWriteTimeUtcTicks,
+                            file.ContentSampleHash,
+                            file.AppliedDecryptionProvider ?? string.Empty));
+                    }
+
+                    entries.Sort(static (a, b) =>
+                    {
+                        var cmp = string.CompareOrdinal(a.RelativePath, b.RelativePath);
+                        if (cmp != 0) return cmp;
+                        cmp = a.Size.CompareTo(b.Size);
+                        if (cmp != 0) return cmp;
+                        cmp = a.Kind.CompareTo(b.Kind);
+                        if (cmp != 0) return cmp;
+                        cmp = a.LastWriteTicks.CompareTo(b.LastWriteTicks);
+                        if (cmp != 0) return cmp;
+                        cmp = a.SampleHash.CompareTo(b.SampleHash);
+                        if (cmp != 0) return cmp;
+                        return string.CompareOrdinal(a.AppliedProvider, b.AppliedProvider);
+                    });
+
+                    for (var i = 0; i < entries.Count; i++)
+                    {
+                        var e = entries[i];
+                        AppendText("F|");
+                        AppendText(e.RelativePath);
+                        AppendText("|");
+                        AppendInt64(e.Size);
+                        AppendText("|");
+                        AppendInt64(e.Kind);
+                        AppendText("|");
+                        AppendInt64(e.LastWriteTicks);
+                        AppendText("|");
+                        AppendHexUInt64(e.SampleHash);
+                        AppendText("|");
+                        AppendText(e.AppliedProvider);
+                        AppendText("\0");
+                    }
+                }
+
+                FlushUtf8();
+                var hex = Convert.ToHexStringLower(hasher.GetHashAndReset());
+                if (scanResult.EncryptedFileCount > 0)
+                {
+                    return $"v2:{hex}_e{scanResult.EncryptedFileCount}";
+                }
+
+                return $"v2:{hex}";
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(utf8Buf);
+            }
         }
 
         internal static string NormalizeRelativeManifestPath(string rootFullPath, string? filePath, bool caseSensitive)
@@ -184,13 +338,26 @@ namespace AssetStudio.Avalonia
             string relative;
             if (!string.IsNullOrWhiteSpace(rootFullPath))
             {
-                try
+                // Fast path when filePath is already a canonical descendant of rootFullPath (standard ScanFolder output),
+                // avoiding tens of thousands of Path.GetFullPath + Path.GetRelativePath allocations.
+                var prefixComparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+                if (filePath.Length > rootFullPath.Length
+                    && filePath.StartsWith(rootFullPath, prefixComparison)
+                    && (filePath[rootFullPath.Length] == Path.DirectorySeparatorChar || filePath[rootFullPath.Length] == Path.AltDirectorySeparatorChar)
+                    && filePath.IndexOf("..", rootFullPath.Length, StringComparison.Ordinal) < 0)
                 {
-                    relative = Path.GetRelativePath(rootFullPath, GetFullPathOrOriginal(filePath));
+                    relative = filePath.Substring(rootFullPath.Length + 1);
                 }
-                catch
+                else
                 {
-                    relative = filePath;
+                    try
+                    {
+                        relative = Path.GetRelativePath(rootFullPath, GetFullPathOrOriginal(filePath));
+                    }
+                    catch
+                    {
+                        relative = filePath;
+                    }
                 }
             }
             else
@@ -198,7 +365,7 @@ namespace AssetStudio.Avalonia
                 relative = filePath;
             }
 
-            var normalized = relative.Replace('\\', '/');
+            var normalized = relative.Contains('\\') ? relative.Replace('\\', '/') : relative;
             return caseSensitive ? normalized : normalized.ToUpperInvariant();
         }
 

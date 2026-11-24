@@ -1023,7 +1023,7 @@ namespace AssetStudio.Avalonia
                     using var transaction = conn.BeginTransaction();
                     EnsurePreviewCacheColumns(conn, transaction);
 
-                    var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                    var projectId = FindProjectId(conn, transaction, folderPath, signature, _caseSensitivePaths);
                     if (projectId == null)
                     {
                         EvictProjectIdCacheEntry(dbPath, folderPath, signature);
