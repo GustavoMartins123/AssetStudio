@@ -29,7 +29,7 @@ namespace AssetStudio
         public bool Enabled { get; set; } = true;
 
         /// <summary>
-        /// Cipher algorithm: "xor", "aes-cbc", "aes-ecb", "aes-ctr", "chacha20", "block512", or "none" (header skip only).
+        /// Cipher algorithm: "xor", "aes-cbc", "aes-ecb", "aes-ctr", "chacha20", "chacha-512b-xor" (legacy alias "block512"), or "none" (header skip only).
         /// When omitted, defaults to "xor" if xorKeyHex/keyHex/keyUtf8 is provided, else "none".
         /// </summary>
         [JsonPropertyName("algorithm")]
@@ -144,13 +144,13 @@ namespace AssetStudio
 
         /// <summary>
         /// Optional explicit Addressables catalog path (catalog.json / catalog_*.json / catalog.bin)
-        /// used by "block512" profiles when auto-discovery cannot find the catalog adjacent to the bundle.
+        /// used by Custom ChaCha (512B Block XOR) ("chacha-512b-xor" / "block512") profiles when auto-discovery cannot find the catalog adjacent to the bundle.
         /// </summary>
         [JsonPropertyName("catalogPath")]
         public string? CatalogPath { get; set; }
 
         /// <summary>
-        /// Optional direct Block 512 token (e.g. "bundleName_hash-crc") used by "block512" profiles
+        /// Optional direct stream-key token (e.g. "bundleName_hash-crc") used by Custom ChaCha (512B Block XOR) ("chacha-512b-xor" / "block512") profiles
         /// when no Addressables catalog is available.
         /// </summary>
         [JsonPropertyName("block512Token")]
@@ -229,7 +229,7 @@ namespace AssetStudio
                 "aes-ecb" or "aesecb" or "aes_ecb" => StreamCipherAlgorithm.AesEcb,
                 "aes-ctr" or "aesctr" or "aes_ctr" => StreamCipherAlgorithm.AesCtr,
                 "chacha20" or "chacha" or "chacha-20" => StreamCipherAlgorithm.ChaCha20,
-                "block512" or "block-512" or "block_512" => StreamCipherAlgorithm.Block512,
+                "block512" or "block-512" or "block_512" or "chacha-512b-xor" or "custom-chacha-512b" => StreamCipherAlgorithm.Block512,
                 "none" or "skip" or "offset" => StreamCipherAlgorithm.None,
                 _ => throw new ArgumentException($"Unsupported decryption algorithm '{Algorithm}'.")
             };
@@ -277,13 +277,13 @@ namespace AssetStudio
                 bool hasCatalog = !string.IsNullOrWhiteSpace(CatalogPath);
                 if (!hasToken && !hasCatalog)
                 {
-                    error = "Block 512 profile requires an Addressables catalog path or a direct Block 512 token.";
+                    error = "Custom ChaCha (512B Block XOR) profile requires an Addressables catalog path or a direct token.";
                     return false;
                 }
 
                 if (hasCatalog && !File.Exists(CatalogPath!.Trim()))
                 {
-                    error = $"Block 512 catalog file not found: '{CatalogPath}'.";
+                    error = $"Custom ChaCha (512B Block XOR) catalog file not found: '{CatalogPath}'.";
                     return false;
                 }
 

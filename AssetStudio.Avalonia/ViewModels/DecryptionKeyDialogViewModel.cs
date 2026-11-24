@@ -223,7 +223,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 "ChaCha20",
                 "XOR",
                 "Offset Skip (None)",
-                "Block 512"
+                "Custom ChaCha (512B Block XOR)"
             };
             KeyFormatOptions = new[] { "Hex", "UTF-8 Text" };
             IvModeOptions = new[] { "Hex", "UTF-8 Text", "Read from Stream Prefix", "None (All Zeros)", "Derive from Filename (MD5)" };
@@ -1887,7 +1887,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 "chacha20" => 3,
                 "xor" => 4,
                 "none" => 5,
-                "block512" => 6,
+                "block512" or "block-512" or "block_512" or "chacha-512b-xor" or "custom-chacha-512b" => 6,
                 _ => -1
             };
         }

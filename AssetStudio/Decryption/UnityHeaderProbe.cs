@@ -547,15 +547,15 @@ namespace AssetStudio
 
             var candidates = new List<DetectedCipherCandidate>();
 
-            // 1. Deterministic single match: Block 512 "Encryption" magic header at offset 0
+            // 1. Deterministic single match: Custom ChaCha (512B Block XOR) "Encryption" magic header at offset 0
             if (probeBuffer.Length >= 26 && MatchesAt(probeBuffer, 0, DecryptionHelper.EncryptionMagicBytes))
             {
                 candidates.Add(new DetectedCipherCandidate(
                     StreamCipherAlgorithm.Block512,
                     "block512",
-                    "Block 512",
+                    "Custom ChaCha (512B Block XOR)",
                     0.98,
-                    "Block 512 'Encryption' magic header (26-byte prefix)",
+                    "Custom chained ChaCha12/8/4 512B-block stream XOR ('Encryption' 26B header)",
                     SuggestedSkipBytes: 26));
                 return candidates;
             }
@@ -801,17 +801,23 @@ namespace AssetStudio
                 return false;
             }
 
-            // Block 512 explicit provider / catalog hint
+            // Custom ChaCha (512B Block XOR) explicit provider / catalog hint
             if (combined.Contains("Block512", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("block-512", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("block_512", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("chacha-512b", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("custom-chacha-512b", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("512B Block XOR", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("ChaCha12/8/4", StringComparison.OrdinalIgnoreCase)
                 || combined.Contains("EncryptionMagic", StringComparison.OrdinalIgnoreCase)
                 || combined.Contains("'Encryption' magic", StringComparison.OrdinalIgnoreCase))
             {
                 candidates.Add(new DetectedCipherCandidate(
                     StreamCipherAlgorithm.Block512,
                     "block512",
-                    "Block 512",
+                    "Custom ChaCha (512B Block XOR)",
                     0.98,
-                    $"Explicit Block 512 hint ({providerHint ?? "catalog"})",
+                    $"Custom chained ChaCha12/8/4 512B-block stream XOR ('Encryption' 26B header) via {providerHint ?? "catalog"}",
                     SuggestedSkipBytes: 26));
                 return true;
             }
@@ -1140,7 +1146,7 @@ namespace AssetStudio
                 return false;
             }
 
-            // 0. Check for unresolved Block 512 "Encryption" magic header
+            // 0. Check for unresolved Custom ChaCha (512B Block XOR) "Encryption" magic header
             if (MatchesAt(probeBuffer, 0, DecryptionHelper.EncryptionMagicBytes))
             {
                 string prefixHex = FormatHexPrefix(probeBuffer, 16);
@@ -1148,7 +1154,7 @@ namespace AssetStudio
                 barrier = new StreamEncryptionBarrier(
                     providerId: "Block512MissingCatalog",
                     filePath: filePath,
-                    reason: $"Block 512 'Encryption' container header detected (prefix: {prefixHex}), but no matching Addressables catalog entry was found to derive the decryption token.",
+                    reason: $"Custom chained ChaCha12/8/4 512B-block stream XOR ('Encryption' 26B header) detected (prefix: {prefixHex}), but no matching Addressables catalog entry was found to derive the decryption token.",
                     confidence: 0.98,
                     headerPrefixHex: prefixHex,
                     candidateAlgorithms: candidates);

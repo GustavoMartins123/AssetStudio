@@ -520,8 +520,8 @@ namespace AssetStudio.Tests
                 string token = $"{bundleName}_{hashHex}-{crcVal}";
                 byte[] encryptedBlock512 = EncryptBlock512Bundle(plainBundle, token);
 
-                // 1. Unresolved Block 512 (no catalog): ProjectScanner classifies as Encrypted with Block512MissingCatalog barrier,
-                //    and DecryptionKeyDialogViewModel pre-selects Block 512 (index 6, SkipBytes=26)
+                // 1. Unresolved Custom ChaCha (512B Block XOR) (no catalog): ProjectScanner classifies as Encrypted with Block512MissingCatalog barrier,
+                //    and DecryptionKeyDialogViewModel pre-selects Custom ChaCha (512B Block XOR) (index 6, SkipBytes=26)
                 var orphanDir = Path.Combine(tempRoot, "orphan");
                 Directory.CreateDirectory(orphanDir);
                 var orphanBundlePath = Path.Combine(orphanDir, bundleFileName);
@@ -537,10 +537,14 @@ namespace AssetStudio.Tests
                 Assert.NotNull(blockBarrier.CandidateAlgorithms);
                 Assert.Single(blockBarrier.CandidateAlgorithms!);
                 Assert.Equal("block512", blockBarrier.CandidateAlgorithms![0].SchemeId);
+                Assert.Equal("Custom ChaCha (512B Block XOR)", blockBarrier.CandidateAlgorithms![0].DisplayName);
+                Assert.Contains("Custom chained ChaCha12/8/4 512B-block stream XOR ('Encryption' 26B header)", blockBarrier.CandidateAlgorithms![0].Evidence, StringComparison.Ordinal);
                 Assert.Equal(26, blockBarrier.CandidateAlgorithms![0].SuggestedSkipBytes);
 
                 Assert.True(DecryptionHelper.InspectFileBarrier(orphanBundlePath, out var inspectedBarrier));
                 Assert.Equal("Block512MissingCatalog", inspectedBarrier.ProviderId);
+                Assert.Contains("Custom chained ChaCha12/8/4 512B-block stream XOR ('Encryption' 26B header)", inspectedBarrier.Reason, StringComparison.Ordinal);
+                Assert.Equal("Custom ChaCha (512B Block XOR)", inspectedBarrier.CandidateAlgorithms![0].DisplayName);
 
                 var dialogContext = new DecryptionDialogContext(
                     IsInitialLoadPrompt: true,
@@ -554,7 +558,10 @@ namespace AssetStudio.Tests
                 var dialogVm = new DecryptionKeyDialogViewModel(dialogContext, userProfilesDirectoryOverride: profilesDir);
                 Assert.True(dialogVm.HasDetectedAlgorithms);
                 Assert.Single(dialogVm.DetectedAlgorithms);
-                Assert.Equal(6, dialogVm.SelectedAlgorithmIndex); // Block 512
+                Assert.Equal(6, dialogVm.SelectedAlgorithmIndex); // Custom ChaCha (512B Block XOR)
+                Assert.Equal("Custom ChaCha (512B Block XOR)", dialogVm.AlgorithmOptions[6]);
+                Assert.Equal("Custom ChaCha (512B Block XOR)", dialogVm.DetectedAlgorithms[0].DisplayName);
+                Assert.Contains("Custom ChaCha (512B Block XOR)", dialogVm.DetectedAlgorithmsBannerText, StringComparison.Ordinal);
                 Assert.True(dialogVm.IsBlock512Selected);
                 Assert.False(dialogVm.IsKeySectionVisible);
                 Assert.True(dialogVm.IsSelectedAlgorithmAutoDetected);
@@ -563,7 +570,7 @@ namespace AssetStudio.Tests
                 Assert.True(dialogVm.DetectedAlgorithms[0].IsSelected);
                 Assert.True(dialogVm.DetectedAlgorithms[0].IsChecked);
 
-                // 2. Explicit non-adjacent catalog via Block 512 profile + TestKeyCommand verification
+                // 2. Explicit non-adjacent catalog via Custom ChaCha (512B Block XOR) profile + TestKeyCommand verification
                 var remoteCatalogDir = Path.Combine(tempRoot, "remote_catalog");
                 Directory.CreateDirectory(remoteCatalogDir);
                 var remoteCatalogPath = Path.Combine(remoteCatalogDir, "catalog_external.json");
@@ -573,6 +580,7 @@ namespace AssetStudio.Tests
                 dialogVm.TestKeyCommand.Execute(null);
                 Assert.False(dialogVm.HasValidationError);
                 Assert.Contains("verified", dialogVm.StatusMessage, StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("Custom ChaCha (512B Block XOR)", dialogVm.StatusMessage, StringComparison.Ordinal);
 
                 dialogVm.ProfileId = "block512-remote-catalog";
                 dialogVm.SaveProfileCommand.Execute(null);
@@ -647,6 +655,124 @@ namespace AssetStudio.Tests
                     Assert.Equal(FileType.BundleFile, binReader.FileType);
                     Assert.False(binReader.EncryptionBarrier.HasValue);
                 }
+            }
+            finally
+            {
+                DecryptionHelper.Clear();
+                try { Directory.Delete(tempRoot, recursive: true); } catch { }
+            }
+        }
+
+        [Fact]
+        public void CustomChaCha512B_AlgorithmAliases_DisplayName_And_BackwardCompatibility()
+        {
+            DecryptionHelper.Clear();
+            var tempRoot = Path.Combine(Path.GetTempPath(), "AssetStudio_ChaCha512BAliasTests_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempRoot);
+
+            try
+            {
+                foreach (var alias in new[] { "block512", "block-512", "block_512", "chacha-512b-xor", "custom-chacha-512b", " ChaCha-512B-XOR " })
+                {
+                    var profile = new DecryptionProfile
+                    {
+                        Algorithm = alias,
+                        Block512Token = "bundle_0123456789abcdef-123"
+                    };
+                    Assert.Equal(StreamCipherAlgorithm.Block512, profile.ResolveAlgorithm());
+                    Assert.True(profile.Validate(out var err), $"Alias '{alias}' failed validation: {err}");
+                }
+
+                // Missing token/catalog reports updated technical name without legacy "Block 512" label
+                var invalidProfile = new DecryptionProfile { Algorithm = "chacha-512b-xor" };
+                Assert.False(invalidProfile.Validate(out var missingErr));
+                Assert.NotNull(missingErr);
+                Assert.Contains("Custom ChaCha (512B Block XOR)", missingErr!, StringComparison.Ordinal);
+                Assert.DoesNotContain("Block 512", missingErr!, StringComparison.OrdinalIgnoreCase);
+
+                // Explicit provider hint routing for both legacy and new aliases
+                var explicitAliasCandidates = UnityHeaderProbe.AnalyzeExplicitProviderHint("chacha-512b-xor");
+                Assert.Single(explicitAliasCandidates);
+                Assert.Equal(StreamCipherAlgorithm.Block512, explicitAliasCandidates[0].CipherAlgorithm);
+                Assert.Equal("Custom ChaCha (512B Block XOR)", explicitAliasCandidates[0].DisplayName);
+                Assert.Contains("Custom chained ChaCha12/8/4 512B-block stream XOR ('Encryption' 26B header)", explicitAliasCandidates[0].Evidence, StringComparison.Ordinal);
+
+                // UI AlgorithmOptions uses "Custom ChaCha (512B Block XOR)" and zero "Block 512" labels
+                var emptyDialogVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: false,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 0,
+                    CoveragePercent: 100.0,
+                    DetectedBarriers: Array.Empty<StreamEncryptionBarrier>()));
+                Assert.Equal("Custom ChaCha (512B Block XOR)", emptyDialogVm.AlgorithmOptions[6]);
+                Assert.DoesNotContain(emptyDialogVm.AlgorithmOptions, o => o.Contains("Block 512", StringComparison.OrdinalIgnoreCase));
+
+                // Roundtrip saved legacy JSON profile ("block512" + "block512Token") AND new alias ("chacha-512b-xor" + "block512Token")
+                byte[] nodePayload = BuildValidSerializedHeaderPayload(1024);
+                byte[] plainBundle = BuildValidLz4UnityFsBundle("CAB-chacha512b-alias", nodePayload);
+                const string token = "alias_pack_0123456789abcdef0123456789abcdef-777";
+                byte[] encryptedBundle = EncryptBlock512Bundle(plainBundle, token);
+                var bundlePath = Path.Combine(tempRoot, "alias_pack.bundle");
+                File.WriteAllBytes(bundlePath, encryptedBundle);
+
+                var legacyJsonPath = Path.Combine(tempRoot, "legacy_block512.json");
+                File.WriteAllText(legacyJsonPath, $$"""
+                {
+                  "id": "legacy-block512-profile",
+                  "enabled": true,
+                  "algorithm": "block512",
+                  "fileNamePattern": "*.bundle",
+                  "block512Token": "{{token}}",
+                  "validateUnityHeader": true
+                }
+                """, Encoding.UTF8);
+
+                Assert.Equal(1, DecryptionHelper.LoadProfilesFromFile(legacyJsonPath));
+                using (var legacyReader = new FileReader(bundlePath))
+                {
+                    Assert.Equal("DeclarativeProfile", legacyReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, legacyReader.FileType);
+                }
+
+                DecryptionHelper.Clear();
+                var aliasJsonPath = Path.Combine(tempRoot, "chacha_512b_xor.json");
+                File.WriteAllText(aliasJsonPath, $$"""
+                {
+                  "id": "chacha-512b-xor-profile",
+                  "enabled": true,
+                  "algorithm": "chacha-512b-xor",
+                  "fileNamePattern": "*.bundle",
+                  "block512Token": "{{token}}",
+                  "validateUnityHeader": true
+                }
+                """, Encoding.UTF8);
+
+                Assert.Equal(1, DecryptionHelper.LoadProfilesFromFile(aliasJsonPath));
+                using (var aliasReader = new FileReader(bundlePath))
+                {
+                    Assert.Equal("DeclarativeProfile", aliasReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, aliasReader.FileType);
+                    using var bundle = new BundleFile(aliasReader);
+                    Assert.Single(bundle.fileList);
+                    using var ms = new MemoryStream();
+                    bundle.fileList[0].stream.CopyTo(ms);
+                    Assert.Equal(nodePayload, ms.ToArray());
+                }
+
+                // Loading the saved chacha-512b-xor profile in ViewModel selects index 6 ("Custom ChaCha (512B Block XOR)")
+                var editVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: false,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 0,
+                    CoveragePercent: 100.0,
+                    DetectedBarriers: Array.Empty<StreamEncryptionBarrier>()));
+                editVm.SelectedProfile = editVm.Profiles.Single(p => p.Id == "chacha-512b-xor-profile");
+                editVm.LoadSelectedProfileCommand.Execute(null);
+                Assert.Equal(6, editVm.SelectedAlgorithmIndex);
+                Assert.True(editVm.IsBlock512Selected);
+                Assert.Equal(token, editVm.Block512Token);
             }
             finally
             {
@@ -928,7 +1054,8 @@ namespace AssetStudio.Tests
                     DetectedBarriers: new[] { partialBarrier, heroBlockBarrier }));
 
                 Assert.True(heteroVm.DetectedAlgorithms.Count >= 3);
-                Assert.Equal(6, heteroVm.SelectedAlgorithmIndex); // Block 512 (98%) highest confidence
+                Assert.Equal(6, heteroVm.SelectedAlgorithmIndex); // Custom ChaCha (512B Block XOR) (98%) highest confidence
+                Assert.Equal("Custom ChaCha (512B Block XOR)", heteroVm.DetectedAlgorithms[0].DisplayName);
                 Assert.Equal("26", heteroVm.SkipBytesText);
 
                 // Enter user key & IV, then click XOR candidate chip (from partial header barrier)
