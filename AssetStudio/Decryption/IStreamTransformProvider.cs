@@ -29,7 +29,7 @@ namespace AssetStudio
         public bool Enabled { get; set; } = true;
 
         /// <summary>
-        /// Cipher algorithm: "xor", "aes-cbc", "aes-ecb", "aes-ctr", "chacha20", "chacha-512b-xor" (legacy alias "block512"), or "none" (header skip only).
+        /// Cipher algorithm: "xor", "aes-cbc", "aes-ecb", "aes-ctr", "chacha20", "rijndael-cbc", "chacha-512b-xor" (legacy alias "block512"), or "none" (header skip only).
         /// When omitted, defaults to "xor" if xorKeyHex/keyHex/keyUtf8 is provided, else "none".
         /// </summary>
         [JsonPropertyName("algorithm")]
@@ -119,7 +119,7 @@ namespace AssetStudio
         public bool CounterLittleEndian { get; set; }
 
         /// <summary>
-        /// Optional key derivation: "none" (default), "sha256", "md5", "pbkdf2-sha1", or "pbkdf2-sha256".
+        /// Optional key derivation: "none" (default), "sha256", "md5", "pbkdf2-sha1", "pbkdf2-sha256", or "pbkdf1-sha1".
         /// </summary>
         [JsonPropertyName("keyDerivation")]
         public string? KeyDerivation { get; set; }
@@ -155,6 +155,18 @@ namespace AssetStudio
         /// </summary>
         [JsonPropertyName("block512Token")]
         public string? Block512Token { get; set; }
+
+        /// <summary>
+        /// Rijndael block size in bits (128, 192 or 256) for "rijndael-cbc" profiles. 0 defaults to 128.
+        /// </summary>
+        [JsonPropertyName("blockSizeBits")]
+        public int BlockSizeBits { get; set; }
+
+        /// <summary>
+        /// Optional XOR mask applied over the leading bytes of the stream after the cipher is removed.
+        /// </summary>
+        [JsonPropertyName("headerMask")]
+        public HeaderMaskProfile? HeaderMask { get; set; }
 
         /// <summary>
         /// When true, skips already-plaintext Unity files and verifies that the transformed stream
@@ -200,6 +212,8 @@ namespace AssetStudio
                 RangeLength = RangeLength,
                 CatalogPath = CatalogPath,
                 Block512Token = Block512Token,
+                BlockSizeBits = BlockSizeBits,
+                HeaderMask = HeaderMask?.Clone(),
                 ValidateUnityHeader = ValidateUnityHeader
             };
         }
@@ -230,6 +244,7 @@ namespace AssetStudio
                 "aes-ctr" or "aesctr" or "aes_ctr" => StreamCipherAlgorithm.AesCtr,
                 "chacha20" or "chacha" or "chacha-20" => StreamCipherAlgorithm.ChaCha20,
                 "block512" or "block-512" or "block_512" or "chacha-512b-xor" or "custom-chacha-512b" => StreamCipherAlgorithm.Block512,
+                "rijndael" or "rijndael-cbc" or "rijndaelcbc" or "rijndael_cbc" => StreamCipherAlgorithm.RijndaelCbc,
                 "none" or "skip" or "offset" => StreamCipherAlgorithm.None,
                 _ => throw new ArgumentException($"Unsupported decryption algorithm '{Algorithm}'.")
             };
@@ -321,6 +336,19 @@ namespace AssetStudio
                         return false;
                     }
                     break;
+                case StreamCipherAlgorithm.RijndaelCbc:
+                    if (keyBytes.Length is not (16 or 24 or 32))
+                    {
+                        error = $"Rijndael key must be 16, 24, or 32 bytes (got {keyBytes.Length} bytes).";
+                        return false;
+                    }
+
+                    if (BlockSizeBits is not (0 or 128 or 192 or 256))
+                    {
+                        error = "Rijndael block size must be 128, 192, or 256 bits.";
+                        return false;
+                    }
+                    break;
             }
 
             if (!IvFromStreamPrefix)
@@ -335,6 +363,12 @@ namespace AssetStudio
             if (!string.IsNullOrWhiteSpace(MagicHex) && DeclarativeProfileTransformProvider.TryParseHexBytes(MagicHex) == null)
             {
                 error = "Magic hex contains invalid hexadecimal characters.";
+                return false;
+            }
+
+            if (HeaderMask != null && !HeaderMask.Validate(out string? maskError))
+            {
+                error = maskError;
                 return false;
             }
 
@@ -537,15 +571,18 @@ namespace AssetStudio
                 {
                     xorStream.LeaveBaseStreamOpen = true;
                 }
-                return xorStream;
+
+                return ApplyHeaderMask(xorStream, profile, keyBytes, stream.Length - skipBytes);
             }
 
             byte[]? ivOrNonce = null;
             long effectiveSkip = skipBytes;
 
-            if (profile.IvFromStreamPrefix && algo is StreamCipherAlgorithm.AesCbc or StreamCipherAlgorithm.AesCtr or StreamCipherAlgorithm.ChaCha20)
+            if (profile.IvFromStreamPrefix && algo is StreamCipherAlgorithm.AesCbc or StreamCipherAlgorithm.AesCtr or StreamCipherAlgorithm.ChaCha20 or StreamCipherAlgorithm.RijndaelCbc)
             {
-                int ivLen = algo == StreamCipherAlgorithm.ChaCha20 ? 12 : 16;
+                int ivLen = algo == StreamCipherAlgorithm.ChaCha20
+                    ? 12
+                    : algo == StreamCipherAlgorithm.RijndaelCbc ? ResolveBlockSizeBits(profile) / 8 : 16;
                 if (skipBytes + ivLen >= stream.Length)
                 {
                     return null;
@@ -588,6 +625,25 @@ namespace AssetStudio
 
             try
             {
+                if (algo == StreamCipherAlgorithm.RijndaelCbc)
+                {
+                    int blockSize = ResolveBlockSizeBits(profile) / 8;
+                    if (ivOrNonce != null && ivOrNonce.Length != blockSize)
+                    {
+                        return null;
+                    }
+
+                    ivOrNonce ??= new byte[blockSize];
+                    var rijndaelStream = new RijndaelCbcTransformStream(
+                        stream,
+                        new RijndaelBlockCipher(keyBytes, ResolveBlockSizeBits(profile)),
+                        ivOrNonce,
+                        headerSkipBytes: effectiveSkip,
+                        pkcs7Padding: pkcs7);
+                    rijndaelStream.LeaveBaseStreamOpen = profile.ValidateUnityHeader;
+                    return ApplyHeaderMask(rijndaelStream, profile, keyBytes, stream.Length - effectiveSkip);
+                }
+
                 var cipherStream = new CipherTransformStream(
                     stream,
                     algo,
@@ -603,12 +659,32 @@ namespace AssetStudio
                 {
                     cipherStream.LeaveBaseStreamOpen = true;
                 }
-                return cipherStream;
+
+                return ApplyHeaderMask(cipherStream, profile, keyBytes, stream.Length - effectiveSkip);
             }
             catch
             {
                 return null;
             }
+        }
+
+        internal static int ResolveBlockSizeBits(DecryptionProfile profile)
+            => profile.BlockSizeBits == 0 ? 128 : profile.BlockSizeBits;
+
+        private static Stream? ApplyHeaderMask(Stream candidate, DecryptionProfile profile, byte[] keyBytes, long cipherLength)
+        {
+            if (profile.HeaderMask == null)
+            {
+                return candidate;
+            }
+
+            if (!profile.HeaderMask.TryCreate(keyBytes, cipherLength, out byte[] mask))
+            {
+                candidate.Dispose();
+                return null;
+            }
+
+            return new HeaderMaskStream(candidate, mask);
         }
 
         internal static bool ValidateDecryptedUnityHeader(Stream candidate, out string? headerSummary)
@@ -681,9 +757,18 @@ namespace AssetStudio
 
         private static void SetLeaveBaseStreamOpen(Stream stream, bool leaveOpen)
         {
+            if (stream is HeaderMaskStream headerMask)
+            {
+                stream = headerMask.InnerStream;
+            }
+
             if (stream is CipherTransformStream cipher)
             {
                 cipher.LeaveBaseStreamOpen = leaveOpen;
+            }
+            else if (stream is RijndaelCbcTransformStream rijndael)
+            {
+                rijndael.LeaveBaseStreamOpen = leaveOpen;
             }
             else if (stream is XorTransformStream xor)
             {
@@ -834,6 +919,40 @@ namespace AssetStudio
                     var hashAlg = kdf == "pbkdf2-sha1" ? HashAlgorithmName.SHA1 : HashAlgorithmName.SHA256;
                     return Rfc2898DeriveBytes.Pbkdf2(rawKey, salt, iterations, hashAlg, targetLen);
                 }
+                case "pbkdf1":
+                case "pbkdf1-sha1":
+                case "password-derive-bytes":
+                {
+                    int length = profile.DerivedKeyLength > 0 ? profile.DerivedKeyLength : 16;
+                    if (length > SHA1.HashSizeInBytes)
+                    {
+                        error = $"PBKDF1-SHA1 derives at most {SHA1.HashSizeInBytes} bytes.";
+                        return null;
+                    }
+
+                    byte[] salt = Array.Empty<byte>();
+                    if (profile.UseFileNameAsSalt && !string.IsNullOrEmpty(fileToken))
+                    {
+                        salt = Encoding.UTF8.GetBytes(fileToken);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(profile.SaltHex))
+                    {
+                        byte[]? parsedSalt = TryParseHexBytes(profile.SaltHex);
+                        if (parsedSalt == null)
+                        {
+                            error = "KDF Salt (Hex) is not a valid hexadecimal string.";
+                            return null;
+                        }
+
+                        salt = parsedSalt;
+                    }
+                    else if (!string.IsNullOrEmpty(profile.SaltUtf8))
+                    {
+                        salt = Encoding.UTF8.GetBytes(profile.SaltUtf8);
+                    }
+
+                    return LegacyKeyDerivation.Pbkdf1Sha1(rawKey, salt, profile.KdfIterations > 0 ? profile.KdfIterations : 100, length);
+                }
                 default:
                     error = $"Unsupported key derivation '{profile.KeyDerivation}'.";
                     return null;
@@ -892,6 +1011,13 @@ namespace AssetStudio
                     if (ivOrNonce.Length != 12)
                     {
                         error = $"ChaCha20 nonce must be 12 bytes (got {ivOrNonce.Length} bytes).";
+                        return false;
+                    }
+                    break;
+                case StreamCipherAlgorithm.RijndaelCbc:
+                    if (ivOrNonce.Length != ResolveBlockSizeBits(profile) / 8)
+                    {
+                        error = $"Rijndael IV must be {ResolveBlockSizeBits(profile) / 8} bytes (got {ivOrNonce.Length} bytes).";
                         return false;
                     }
                     break;

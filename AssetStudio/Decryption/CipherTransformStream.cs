@@ -1,5 +1,6 @@
 #nullable enable
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.IO;
 using System.Security.Cryptography;
@@ -14,7 +15,8 @@ namespace AssetStudio
         AesEcb = 3,
         AesCtr = 4,
         ChaCha20 = 5,
-        Block512 = 6
+        Block512 = 6,
+        RijndaelCbc = 7
     }
 
     /// <summary>
@@ -305,6 +307,25 @@ namespace AssetStudio
             long fullBlockBytes = (availableCipherBytes / AesBlockSize) * AesBlockSize;
 
             int written = 0;
+            if (algorithm == StreamCipherAlgorithm.AesCbc)
+            {
+                while (written < destination.Length)
+                {
+                    int chunk = ReadAesCbcChunk(cipherOffset + written, destination.Slice(written), fullBlockBytes);
+                    if (chunk <= 0)
+                    {
+                        break;
+                    }
+
+                    written += chunk;
+                }
+
+                if (written >= destination.Length)
+                {
+                    return written;
+                }
+            }
+
             Span<byte> plainBlock = stackalloc byte[AesBlockSize];
 
             while (written < destination.Length)
@@ -332,6 +353,64 @@ namespace AssetStudio
             }
 
             return written;
+        }
+
+        private int ReadAesCbcChunk(long cipherOffset, Span<byte> destination, long fullBlockBytes)
+        {
+            if (aes == null || destination.Length < AesBlockSize * 2)
+            {
+                return 0;
+            }
+
+            long firstBlock = cipherOffset / AesBlockSize;
+            long endBlock = Math.Min((cipherOffset + destination.Length + AesBlockSize - 1) / AesBlockSize, fullBlockBytes / AesBlockSize);
+            int blocks = (int)Math.Min(endBlock - firstBlock, 4096);
+            if (blocks < 2)
+            {
+                return 0;
+            }
+
+            int bytes = blocks * AesBlockSize;
+            byte[] cipher = ArrayPool<byte>.Shared.Rent(bytes);
+            byte[] plain = ArrayPool<byte>.Shared.Rent(bytes);
+            Span<byte> previous = stackalloc byte[AesBlockSize];
+            try
+            {
+                if (ReadRawExact(cipherRangeStart + firstBlock * AesBlockSize, cipher.AsSpan(0, bytes)) != bytes)
+                {
+                    return 0;
+                }
+
+                if (firstBlock > 0)
+                {
+                    if (ReadRawExact(cipherRangeStart + (firstBlock - 1) * AesBlockSize, previous) != AesBlockSize)
+                    {
+                        return 0;
+                    }
+                }
+                else
+                {
+                    ivOrNonce.AsSpan(0, AesBlockSize).CopyTo(previous);
+                }
+
+                aes.DecryptEcb(cipher.AsSpan(0, bytes), plain.AsSpan(0, bytes), PaddingMode.None);
+                for (int i = 0; i < AesBlockSize; i++)
+                {
+                    plain[i] ^= previous[i];
+                }
+
+                UnityHeaderProbe.XorBytes(plain, AesBlockSize, cipher, 0, bytes - AesBlockSize);
+
+                int from = (int)(cipherOffset - firstBlock * AesBlockSize);
+                int count = (int)Math.Min(destination.Length, bytes - from);
+                plain.AsSpan(from, count).CopyTo(destination);
+                return count;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(cipher);
+                ArrayPool<byte>.Shared.Return(plain);
+            }
         }
 
         private bool TryDecryptAesBlock(long blockIndex, Span<byte> plainOut)

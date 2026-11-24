@@ -135,6 +135,21 @@ namespace AssetStudio
                 var newCipherStream = cipherStream.Clone(clonedUnderlying);
                 return new FileReader(FullPath, newCipherStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
             }
+            else if (BaseStream is RijndaelCbcTransformStream rijndaelStream)
+            {
+                var clonedUnderlying = CloneStream(rijndaelStream.BaseStream);
+                var newRijndaelStream = rijndaelStream.Clone(clonedUnderlying);
+                return new FileReader(FullPath, newRijndaelStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+            }
+            else if (BaseStream is HeaderMaskStream maskStream)
+            {
+                Stream inner = maskStream.InnerStream;
+                Stream clonedInner = inner is CipherTransformStream innerCipher
+                    ? innerCipher.Clone(CloneStream(innerCipher.BaseStream))
+                    : CloneStream(inner);
+                var newMaskStream = maskStream.Clone(clonedInner);
+                return new FileReader(FullPath, newMaskStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+            }
             else if (BaseStream is SubStream subStream)
             {
                 Stream newStream = !string.IsNullOrEmpty(subStream.FilePath)

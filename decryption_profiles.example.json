@@ -51,6 +51,60 @@
       "rangeStart": 0,
       "rangeLength": 512,
       "validateUnityHeader": true
+    },
+    {
+      "id": "example-rijndael-cbc-wide-block",
+      "description": "Generic example: Rijndael-CBC with a 256-bit block, ASCII key/IV, PKCS7 padding.",
+      "enabled": false,
+      "algorithm": "rijndael-cbc",
+      "fileNamePattern": "*",
+      "pathPattern": "*/StreamingAssets/game_bin/*",
+      "blockSizeBits": 256,
+      "keyUtf8": "replace-this-key-32-characters-x",
+      "ivUtf8": "replace-this-iv--32-characters-x",
+      "padding": "pkcs7",
+      "validateUnityHeader": true
+    },
+    {
+      "id": "example-aes-cbc-xorshift-header-mask",
+      "description": "Generic example: AES-256-CBC with a fixed IV and a xorshift32 mask over the first 256 decrypted bytes.",
+      "enabled": false,
+      "algorithm": "aes-cbc",
+      "fileNamePattern": "*.bundle.enc",
+      "keyHex": "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF",
+      "ivHex": "A1B2C3D4E5F60718293A4B5C6D7E8F90",
+      "padding": "pkcs7",
+      "headerMask": { "type": "xorshift32", "seed": "0x00000000", "length": 256 },
+      "validateUnityHeader": true
+    },
+    {
+      "id": "example-aes-cbc-hmac-header-mask",
+      "description": "Generic example: AES-256-CBC with a 16-byte IV prefix and an HMAC-SHA256 counter mask over the first 4096 decrypted bytes.",
+      "enabled": false,
+      "algorithm": "aes-cbc",
+      "fileNamePattern": "*.bundle.enc",
+      "keyHex": "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF",
+      "ivFromStreamPrefix": true,
+      "padding": "pkcs7",
+      "headerMask": { "type": "hmac-sha256-counter", "length": 4096 },
+      "validateUnityHeader": true
+    },
+    {
+      "id": "example-aes-ctr-pbkdf1-filename-salt",
+      "description": "Generic example: AES-128-CTR keystream (little-endian counter starting at 1) over the first 128 bytes; key derived from a passphrase and the file name. Detected automatically when the passphrase is present in the game assemblies.",
+      "enabled": false,
+      "algorithm": "aes-ctr",
+      "fileNamePattern": "*.bundle",
+      "keyUtf8": "replace-with-passphrase",
+      "keyDerivation": "pbkdf1-sha1",
+      "useFileNameAsSalt": true,
+      "useFileNameWithoutExtension": true,
+      "derivedKeyLength": 16,
+      "kdfIterations": 100,
+      "counterStart": 1,
+      "counterLittleEndian": true,
+      "rangeLength": 128,
+      "validateUnityHeader": true
     }
   ]
 }

@@ -223,12 +223,13 @@ namespace AssetStudio.Avalonia.ViewModels
                 "ChaCha20",
                 "XOR",
                 "Offset Skip (None)",
-                "Custom ChaCha (512B Block XOR)"
+                "Custom ChaCha (512B Block XOR)",
+                "Rijndael-CBC"
             };
             KeyFormatOptions = new[] { "Hex", "UTF-8 Text" };
             IvModeOptions = new[] { "Hex", "UTF-8 Text", "Read from Stream Prefix", "None (All Zeros)", "Derive from Filename (MD5)" };
             PaddingOptions = new[] { "None", "PKCS7" };
-            KdfOptions = new[] { "None", "SHA-256", "MD5", "PBKDF2-SHA256", "PBKDF2-SHA1" };
+            KdfOptions = new[] { "None", "SHA-256", "MD5", "PBKDF2-SHA256", "PBKDF2-SHA1", "PBKDF1-SHA1" };
             SaltFormatOptions = new[] { "UTF-8 Text", "Hex" };
             DerivedKeyLengthOptions = new[] { "Auto (32 bytes)", "16 bytes (128-bit)", "24 bytes (192-bit)", "32 bytes (256-bit)" };
 
@@ -614,11 +615,11 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public bool IsBlock512Selected => SelectedAlgorithmIndex == 6;
         public bool IsKeySectionVisible => SelectedAlgorithmIndex != 5 && !IsBlock512Selected;
-        public bool IsIvSectionVisible => SelectedAlgorithmIndex is 0 or 1 or 3;
+        public bool IsIvSectionVisible => SelectedAlgorithmIndex is 0 or 1 or 3 or 7;
         public bool IsIvTextInputEnabled => IsIvSectionVisible && SelectedIvModeIndex is 0 or 1;
-        public bool IsPaddingVisible => SelectedAlgorithmIndex is 0 or 2;
+        public bool IsPaddingVisible => SelectedAlgorithmIndex is 0 or 2 or 7;
         public bool IsCtrOptionsVisible => SelectedAlgorithmIndex is 1 or 3;
-        public bool IsKdfSaltVisible => IsKeySectionVisible && SelectedKdfIndex is 3 or 4;
+        public bool IsKdfSaltVisible => IsKeySectionVisible && SelectedKdfIndex is 3 or 4 or 5;
         public bool IsKdfLengthVisible => IsKeySectionVisible && SelectedKdfIndex > 0;
 
         public RelayCommand NewProfileCommand { get; }
@@ -718,9 +719,9 @@ namespace AssetStudio.Avalonia.ViewModels
 
             bool isBlock512 = algorithmIndex == 6;
             bool usesKey = algorithmIndex != 5 && !isBlock512;
-            bool usesIv = algorithmIndex is 0 or 1 or 3;
-            bool usesPadding = algorithmIndex is 0 or 2;
-            bool usesKdfSalt = usesKey && SelectedKdfIndex is 3 or 4;
+            bool usesIv = algorithmIndex is 0 or 1 or 3 or 7;
+            bool usesPadding = algorithmIndex is 0 or 2 or 7;
+            bool usesKdfSalt = usesKey && SelectedKdfIndex is 3 or 4 or 5;
 
             var candidate = new DecryptionProfile
             {
@@ -741,6 +742,14 @@ namespace AssetStudio.Avalonia.ViewModels
                 CounterStart = counterStart,
                 CounterLittleEndian = CounterLittleEndian
             };
+
+            DecryptionProfile? registered = DecryptionHelper.GetRegisteredProfiles()
+                .FirstOrDefault(p => string.Equals(p.Id, candidate.Id, StringComparison.OrdinalIgnoreCase));
+            if (registered != null)
+            {
+                candidate.BlockSizeBits = registered.BlockSizeBits;
+                candidate.HeaderMask = registered.HeaderMask?.Clone();
+            }
 
             if (isBlock512)
             {
@@ -769,6 +778,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     2 => "md5",
                     3 => "pbkdf2-sha256",
                     4 => "pbkdf2-sha1",
+                    5 => "pbkdf1-sha1",
                     _ => null
                 };
                 if (kdf != null)
@@ -915,6 +925,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 StreamCipherAlgorithm.Xor => 4,
                 StreamCipherAlgorithm.None => 5,
                 StreamCipherAlgorithm.Block512 => 6,
+                StreamCipherAlgorithm.RijndaelCbc => 7,
                 _ => 0
             };
 
@@ -986,6 +997,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 "md5" => 2,
                 "pbkdf2" or "pbkdf2-sha256" => 3,
                 "pbkdf2-sha1" => 4,
+                "pbkdf1" or "pbkdf1-sha1" or "password-derive-bytes" => 5,
                 _ => 0
             };
 
@@ -1553,7 +1565,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 }
 
                 // If IV was left blank in Hex mode for AES-CBC/AES-CTR/ChaCha20, also probe stream-prefix IV
-                if (SelectedAlgorithmIndex is 0 or 1 or 3
+                if (SelectedAlgorithmIndex is 0 or 1 or 3 or 7
                     && SelectedIvModeIndex == 0
                     && string.IsNullOrWhiteSpace(IvInput))
                 {
@@ -1615,7 +1627,7 @@ namespace AssetStudio.Avalonia.ViewModels
                         return;
                     }
 
-                    if (candidate.AlgorithmIndex is 0 or 1 or 3
+                    if (candidate.AlgorithmIndex is 0 or 1 or 3 or 7
                         && trialIvMode == 0
                         && string.IsNullOrWhiteSpace(IvInput))
                     {
@@ -1888,6 +1900,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 "xor" => 4,
                 "none" => 5,
                 "block512" or "block-512" or "block_512" or "chacha-512b-xor" or "custom-chacha-512b" => 6,
+                "rijndael" or "rijndael-cbc" or "rijndaelcbc" or "rijndael_cbc" => 7,
                 _ => -1
             };
         }
@@ -1903,6 +1916,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 4 => "xor",
                 5 => "none",
                 6 => "block512",
+                7 => "rijndael-cbc",
                 _ => "aes-cbc"
             };
         }
