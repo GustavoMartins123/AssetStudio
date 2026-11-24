@@ -2258,7 +2258,7 @@ namespace AssetStudio
             {
                 assetsFile.Objects.Clear();
                 assetsFile.ObjectsDic.Clear();
-                assetsFile.reader.Close();
+                assetsFile.reader?.Close();
             }
             assetsFileList.Clear();
             assetsFileListHash.Clear();
@@ -2564,11 +2564,11 @@ namespace AssetStudio
             }
         }
 
-        private static void CollectSafeAssetBundleContainersForLazyIndex(
+        public static void CollectSafeAssetBundleContainersForLazyIndex(
             AssetBundle? assetBundle,
             List<(PPtr<Object> PPtr, string Container)> containers)
         {
-            if (assetBundle?.m_Container == null || assetBundle.m_PreloadTable == null)
+            if (assetBundle?.m_Container == null)
             {
                 return;
             }
@@ -2582,17 +2582,39 @@ namespace AssetStudio
                     continue;
                 }
 
-                var preloadIndex = assetInfo.preloadIndex;
-                var preloadSize = assetInfo.preloadSize;
-                if (preloadIndex < 0 || preloadSize <= 0 || preloadIndex >= preloadTable.Length)
+                var directAsset = assetInfo.asset;
+                bool addedDirectAsset = false;
+
+                if (preloadTable != null && preloadTable.Length > 0)
                 {
-                    continue;
+                    var preloadIndex = assetInfo.preloadIndex;
+                    var preloadSize = assetInfo.preloadSize;
+                    if (preloadIndex >= 0 && preloadSize > 0 && preloadIndex < preloadTable.Length)
+                    {
+                        long preloadEnd = Math.Min((long)preloadIndex + preloadSize, preloadTable.Length);
+                        for (int k = preloadIndex; k < preloadEnd; k++)
+                        {
+                            var preloadEntry = preloadTable[k];
+                            if (preloadEntry == null || preloadEntry.IsNull)
+                            {
+                                continue;
+                            }
+
+                            containers.Add((preloadEntry, entry.Key));
+                            if (directAsset != null
+                                && !directAsset.IsNull
+                                && preloadEntry.m_FileID == directAsset.m_FileID
+                                && preloadEntry.m_PathID == directAsset.m_PathID)
+                            {
+                                addedDirectAsset = true;
+                            }
+                        }
+                    }
                 }
 
-                long preloadEnd = Math.Min((long)preloadIndex + preloadSize, preloadTable.Length);
-                for (int k = preloadIndex; k < preloadEnd; k++)
+                if (!addedDirectAsset && directAsset != null && !directAsset.IsNull)
                 {
-                    containers.Add((preloadTable[k], entry.Key));
+                    containers.Add((directAsset, entry.Key));
                 }
             }
         }
@@ -2754,10 +2776,18 @@ namespace AssetStudio
                     return new AudioClip(objectReader);
                 case ClassIDType.Avatar:
                     return new Avatar(objectReader);
+                case ClassIDType.BuildSettings:
+                    return new BuildSettings(objectReader);
+                case ClassIDType.Camera:
+                    return new Camera(objectReader);
                 case ClassIDType.Font:
                     return new Font(objectReader);
                 case ClassIDType.GameObject:
                     return new GameObject(objectReader);
+                case ClassIDType.Light:
+                    return new Light(objectReader);
+                case ClassIDType.LODGroup:
+                    return new LODGroup(objectReader);
                 case ClassIDType.Material:
                     return new Material(objectReader);
                 case ClassIDType.Mesh:

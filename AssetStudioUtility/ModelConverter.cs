@@ -9,6 +9,41 @@ using System.Threading.Tasks;
 
 namespace AssetStudio
 {
+    public enum SceneLodExportMode
+    {
+        Lod0Only = 0,
+        AllLods = 1
+    }
+
+    public sealed class SceneScriptSpawnAttachment
+    {
+        public Transform? AnchorTransform { get; init; }
+        public GameObject? OwnerGameObject { get; init; }
+        public long OwnerPathId { get; init; }
+        public long AnchorTransformPathId { get; init; }
+        public required GameObject PrefabRoot { get; init; }
+        public Vector3 LocalPositionOffset { get; init; }
+        public Quaternion LocalRotationOffset { get; init; } = new Quaternion(0, 0, 0, 1);
+        public Vector3 LocalScaleMultiplier { get; init; } = Vector3.One;
+        public string ScriptClass { get; init; } = string.Empty;
+        public string FieldPath { get; init; } = string.Empty;
+        public string SourceKind { get; init; } = string.Empty;
+        public string Confidence { get; init; } = string.Empty;
+        public string TargetFileName { get; init; } = string.Empty;
+        public long TargetPathId { get; init; }
+        public string TargetGuid { get; init; } = string.Empty;
+    }
+
+    public sealed class SceneConversionOptions
+    {
+        public SceneLodExportMode LodExportMode { get; init; } = SceneLodExportMode.Lod0Only;
+        public bool IncludeCamerasAndLights { get; init; } = true;
+        public bool SkipDisabledCamerasAndLights { get; init; } = true;
+        public bool IncludeNodeProvenanceExtras { get; init; } = true;
+        public IReadOnlyList<SceneScriptSpawnAttachment>? ScriptSpawnAttachments { get; init; }
+        public int MaxScriptSpawnInstances { get; init; } = 512;
+    }
+
     public class ModelConverter : IImported
     {
         public ImportedFrame RootFrame { get; protected set; } = new ImportedFrame();
@@ -17,6 +52,11 @@ namespace AssetStudio
         public List<ImportedTexture> TextureList { get; protected set; } = new List<ImportedTexture>();
         public List<ImportedKeyframedAnimation> AnimationList { get; protected set; } = new List<ImportedKeyframedAnimation>();
         public List<ImportedMorph> MorphList { get; protected set; } = new List<ImportedMorph>();
+        public List<ImportedCamera> CameraList { get; protected set; } = new List<ImportedCamera>();
+        public List<ImportedLight> LightList { get; protected set; } = new List<ImportedLight>();
+
+        public int SkippedLodRendererCount { get; private set; }
+        public int AttachedScriptSpawnCount { get; private set; }
 
         public Avatar? SourceAvatar => avatar;
 
@@ -79,6 +119,11 @@ namespace AssetStudio
         Dictionary<uint, string> morphChannelNames = new Dictionary<uint, string>();
         private readonly List<(Texture2D Texture, string Name, string MaterialName, string PropertyName, bool ForceNormalMapUnpack)> pendingTextures = new();
         private readonly HashSet<string> pendingTextureNames = new HashSet<string>(StringComparer.Ordinal);
+        private bool _populateFrameExtras;
+        private readonly HashSet<Renderer> _excludedLodRenderers = new HashSet<Renderer>();
+        private readonly HashSet<(string FileName, long PathId)> _excludedLodRendererIds = new HashSet<(string, long)>();
+        private readonly Dictionary<long, ImportedFrame> _frameByGameObjectPathId = new Dictionary<long, ImportedFrame>();
+        private readonly Dictionary<long, ImportedFrame> _frameByTransformPathId = new Dictionary<long, ImportedFrame>();
 
         private void SetRootFrame(ImportedFrame frame)
         {
@@ -186,15 +231,18 @@ namespace AssetStudio
             CancellationToken cancellationToken = default,
             Func<Renderer, Mesh?>? meshResolver = null,
             Func<Renderer, Mesh, int, Material?>? materialResolver = null,
-            bool skipDisabledRenderers = true)
+            bool skipDisabledRenderers = true,
+            SceneConversionOptions? sceneOptions = null)
         {
             ArgumentNullException.ThrowIfNull(rootGameObjects);
 
+            var effectiveOptions = sceneOptions ?? new SceneConversionOptions();
             var converter = new ModelConverter(imageFormat, textureResolver)
             {
                 meshResolver = meshResolver,
                 materialResolver = materialResolver,
-                skipEmptyMeshes = true
+                skipEmptyMeshes = true,
+                _populateFrameExtras = effectiveOptions.IncludeNodeProvenanceExtras
             };
             var safeSceneName = string.IsNullOrWhiteSpace(sceneName) ? "Scene" : sceneName.Trim();
             converter.SetRootFrame(CreateFrame(safeSceneName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One));
@@ -231,6 +279,11 @@ namespace AssetStudio
                 }
             }
 
+            if (effectiveOptions.LodExportMode == SceneLodExportMode.Lod0Only)
+            {
+                converter.CollectLodGroupExclusions(rootGameObjects, includeInactive, cancellationToken);
+            }
+
             var visitedRenderers = new HashSet<Transform>();
             for (int i = 0; i < totalRoots; i++)
             {
@@ -244,13 +297,30 @@ namespace AssetStudio
                 var tr = go.m_Transform;
                 if (tr != null)
                 {
-                    converter.ConvertMeshRendererForScene(tr, visitedRenderers, includeInactive, includeAnimations, skipDisabledRenderers, cancellationToken);
+                    converter.ConvertMeshRendererForScene(
+                        tr,
+                        visitedRenderers,
+                        includeInactive,
+                        includeAnimations,
+                        skipDisabledRenderers,
+                        effectiveOptions,
+                        cancellationToken);
                 }
 
                 if ((i & 31) == 0 || i == totalRoots - 1)
                 {
                     progressCallback?.Invoke(totalRoots + i + 1, Math.Max(1, totalRoots * 2), $"Converting scene meshes ({i + 1}/{totalRoots})...");
                 }
+            }
+
+            if (effectiveOptions.ScriptSpawnAttachments is { Count: > 0 })
+            {
+                converter.AttachScriptSpawnedPrefabs(
+                    effectiveOptions.ScriptSpawnAttachments,
+                    includeInactive,
+                    skipDisabledRenderers,
+                    effectiveOptions,
+                    cancellationToken);
             }
 
             if (includeAnimations)
@@ -332,6 +402,7 @@ namespace AssetStudio
             bool includeInactive,
             bool includeAnimations,
             bool skipDisabledRenderers,
+            SceneConversionOptions sceneOptions,
             CancellationToken cancellationToken)
         {
             if (m_Transform == null || !visited.Add(m_Transform))
@@ -351,13 +422,33 @@ namespace AssetStudio
                 if (m_GameObject.m_MeshRenderer != null
                     && (!skipDisabledRenderers || m_GameObject.m_MeshRenderer.m_Enabled))
                 {
-                    ConvertMeshRenderer(m_GameObject.m_MeshRenderer);
+                    if (IsExcludedByLodGroup(m_GameObject.m_MeshRenderer))
+                    {
+                        SkippedLodRendererCount++;
+                    }
+                    else
+                    {
+                        ConvertMeshRenderer(m_GameObject.m_MeshRenderer);
+                    }
                 }
 
                 if (m_GameObject.m_SkinnedMeshRenderer != null
                     && (!skipDisabledRenderers || m_GameObject.m_SkinnedMeshRenderer.m_Enabled))
                 {
-                    ConvertMeshRenderer(m_GameObject.m_SkinnedMeshRenderer);
+                    if (IsExcludedByLodGroup(m_GameObject.m_SkinnedMeshRenderer))
+                    {
+                        SkippedLodRendererCount++;
+                    }
+                    else
+                    {
+                        ConvertMeshRenderer(m_GameObject.m_SkinnedMeshRenderer);
+                    }
+                }
+
+                if (sceneOptions.IncludeCamerasAndLights)
+                {
+                    var targetFrame = transformDictionary.TryGetValue(m_Transform, out var foundFrame) ? foundFrame : null;
+                    ExtractCamerasAndLightsFromGameObject(m_GameObject, targetFrame, sceneOptions.SkipDisabledCamerasAndLights);
                 }
 
                 if (includeAnimations && m_GameObject.m_Animation != null)
@@ -420,7 +511,785 @@ namespace AssetStudio
 
                 if (child != null)
                 {
-                    ConvertMeshRendererForScene(child, visited, includeInactive, includeAnimations, skipDisabledRenderers, cancellationToken);
+                    ConvertMeshRendererForScene(child, visited, includeInactive, includeAnimations, skipDisabledRenderers, sceneOptions, cancellationToken);
+                }
+            }
+        }
+
+        private void CollectLodGroupExclusions(
+            IReadOnlyList<GameObject> rootGameObjects,
+            bool includeInactive,
+            CancellationToken cancellationToken)
+        {
+            var visited = new HashSet<Transform>();
+            var keptRenderers = new HashSet<Renderer>();
+            var keptIds = new HashSet<(string FileName, long PathId)>();
+
+            for (int i = 0; i < rootGameObjects.Count; i++)
+            {
+                var rootGo = rootGameObjects[i];
+                if (rootGo?.m_Transform == null || (!includeInactive && !rootGo.m_IsActive))
+                {
+                    continue;
+                }
+
+                CollectLodGroupExclusionsRecursive(rootGo.m_Transform, visited, keptRenderers, keptIds, includeInactive, cancellationToken);
+            }
+
+            _excludedLodRenderers.ExceptWith(keptRenderers);
+            _excludedLodRendererIds.ExceptWith(keptIds);
+        }
+
+        private void CollectLodGroupExclusionsRecursive(
+            Transform trans,
+            HashSet<Transform> visited,
+            HashSet<Renderer> keptRenderers,
+            HashSet<(string FileName, long PathId)> keptIds,
+            bool includeInactive,
+            CancellationToken cancellationToken)
+        {
+            if (trans == null || !visited.Add(trans))
+            {
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (TryResolveTransformGameObject(trans, out var go) && go != null)
+            {
+                if (!includeInactive && !go.m_IsActive)
+                {
+                    return;
+                }
+
+                CollectLodExclusionsFromGameObject(go, keptRenderers, keptIds);
+            }
+
+            if (trans.m_Children == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < trans.m_Children.Length; i++)
+            {
+                var childPtr = trans.m_Children[i];
+                if (childPtr == null || childPtr.IsNull)
+                {
+                    continue;
+                }
+
+                if (!childPtr.TryGet(out var child))
+                {
+                    foreach (var sf in SnapshotAssetsFiles(trans.assetsFile?.assetsManager))
+                    {
+                        if (sf.TryGetObject(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        {
+                            child = foundChild;
+                            break;
+                        }
+                    }
+                }
+
+                if (child != null)
+                {
+                    CollectLodGroupExclusionsRecursive(child, visited, keptRenderers, keptIds, includeInactive, cancellationToken);
+                }
+            }
+        }
+
+        private void CollectLodExclusionsFromGameObject(
+            GameObject go,
+            HashSet<Renderer> keptRenderers,
+            HashSet<(string FileName, long PathId)> keptIds)
+        {
+            if (go.m_Components == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < go.m_Components.Length; i++)
+            {
+                var compPtr = go.m_Components[i];
+                if (compPtr == null || compPtr.IsNull)
+                {
+                    continue;
+                }
+
+                if (!TryResolveComponent(go, compPtr, out var comp) || comp is not LODGroup lodGroup)
+                {
+                    continue;
+                }
+
+                if (!lodGroup.m_Enabled || lodGroup.m_LODs == null || lodGroup.m_LODs.Length == 0)
+                {
+                    continue;
+                }
+
+                int selectedLodIndex = -1;
+                for (int l = 0; l < lodGroup.m_LODs.Length; l++)
+                {
+                    if (lodGroup.m_LODs[l]?.renderers is { Length: > 0 })
+                    {
+                        selectedLodIndex = l;
+                        break;
+                    }
+                }
+
+                if (selectedLodIndex < 0)
+                {
+                    continue;
+                }
+
+                for (int l = 0; l < lodGroup.m_LODs.Length; l++)
+                {
+                    var lod = lodGroup.m_LODs[l];
+                    if (lod?.renderers == null)
+                    {
+                        continue;
+                    }
+
+                    bool isSelectedTier = l == selectedLodIndex;
+                    for (int r = 0; r < lod.renderers.Length; r++)
+                    {
+                        var rendPtr = lod.renderers[r];
+                        if (rendPtr == null || rendPtr.IsNull)
+                        {
+                            continue;
+                        }
+
+                        var rend = TryResolveRenderer(lodGroup, rendPtr);
+                        if (rend != null)
+                        {
+                            var key = BuildRendererKey(rend);
+                            if (isSelectedTier)
+                            {
+                                keptRenderers.Add(rend);
+                                if (key.HasValue) keptIds.Add(key.Value);
+                            }
+                            else
+                            {
+                                _excludedLodRenderers.Add(rend);
+                                if (key.HasValue) _excludedLodRendererIds.Add(key.Value);
+                            }
+                        }
+                        else if (!isSelectedTier && rendPtr.m_PathID != 0)
+                        {
+                            var fileKey = ResolvePPtrFileName(lodGroup.assetsFile, rendPtr.m_FileID);
+                            _excludedLodRendererIds.Add((fileKey, rendPtr.m_PathID));
+                        }
+                    }
+                }
+            }
+        }
+
+        private bool IsExcludedByLodGroup(Renderer renderer)
+        {
+            if (_excludedLodRenderers.Count == 0 && _excludedLodRendererIds.Count == 0)
+            {
+                return false;
+            }
+
+            if (_excludedLodRenderers.Contains(renderer))
+            {
+                return true;
+            }
+
+            var key = BuildRendererKey(renderer);
+            return key.HasValue && _excludedLodRendererIds.Contains(key.Value);
+        }
+
+        private static (string FileName, long PathId)? BuildRendererKey(Renderer renderer)
+        {
+            if (renderer.m_PathID == 0)
+            {
+                return null;
+            }
+
+            return (renderer.assetsFile?.fileName ?? string.Empty, renderer.m_PathID);
+        }
+
+        private static string ResolvePPtrFileName(SerializedFile? sourceFile, int fileId)
+        {
+            if (sourceFile == null)
+            {
+                return string.Empty;
+            }
+
+            if (fileId == 0)
+            {
+                return sourceFile.fileName ?? string.Empty;
+            }
+
+            if (fileId > 0 && sourceFile.m_Externals != null && fileId - 1 < sourceFile.m_Externals.Count)
+            {
+                var ext = sourceFile.m_Externals[fileId - 1];
+                if (!string.IsNullOrEmpty(ext?.fileName))
+                {
+                    return ext.fileName;
+                }
+                if (!string.IsNullOrEmpty(ext?.pathName))
+                {
+                    var normalized = ext.pathName.Replace('\\', '/').TrimEnd('/');
+                    var slash = normalized.LastIndexOf('/');
+                    return slash >= 0 ? normalized.Substring(slash + 1) : normalized;
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private static bool TryResolveComponent(GameObject ownerGo, PPtr<Component> compPtr, [NotNullWhen(true)] out Component? component)
+        {
+            component = null;
+            if (compPtr.TryGet(out component) && component != null)
+            {
+                return true;
+            }
+
+            foreach (var sf in SnapshotAssetsFiles(ownerGo.assetsFile?.assetsManager))
+            {
+                if (sf.TryGetObject(compPtr.m_PathID, out var obj) && obj is Component foundComp)
+                {
+                    component = foundComp;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static Renderer? TryResolveRenderer(LODGroup lodGroup, PPtr<Renderer> rendPtr)
+        {
+            if (rendPtr.TryGet(out var renderer) && renderer != null)
+            {
+                return renderer;
+            }
+
+            foreach (var sf in SnapshotAssetsFiles(lodGroup.assetsFile?.assetsManager))
+            {
+                if (sf.TryGetObject(rendPtr.m_PathID, out var obj) && obj is Renderer foundRend)
+                {
+                    return foundRend;
+                }
+            }
+
+            return null;
+        }
+
+        private void ExtractCamerasAndLightsFromGameObject(
+            GameObject gameObject,
+            ImportedFrame? targetFrame,
+            bool skipDisabled)
+        {
+            if (gameObject.m_Components == null)
+            {
+                return;
+            }
+
+            var framePath = targetFrame?.Path ?? gameObject.m_Name ?? string.Empty;
+            var baseName = string.IsNullOrWhiteSpace(gameObject.m_Name)
+                ? $"GameObject_{gameObject.m_PathID}"
+                : gameObject.m_Name;
+
+            for (int i = 0; i < gameObject.m_Components.Length; i++)
+            {
+                var compPtr = gameObject.m_Components[i];
+                if (compPtr == null || compPtr.IsNull || !TryResolveComponent(gameObject, compPtr, out var comp))
+                {
+                    continue;
+                }
+
+                if (comp is Camera cam)
+                {
+                    if (skipDisabled && !cam.Enabled)
+                    {
+                        continue;
+                    }
+
+                    CameraList.Add(new ImportedCamera
+                    {
+                        Name = baseName,
+                        Path = framePath,
+                        TargetFrame = targetFrame,
+                        IsOrthographic = cam.m_Orthographic,
+                        FieldOfViewDegrees = cam.m_FieldOfView,
+                        OrthographicSize = cam.m_OrthographicSize,
+                        AspectRatio = 0f,
+                        NearClipPlane = cam.m_NearClipPlane,
+                        FarClipPlane = cam.m_FarClipPlane,
+                        ClearFlags = cam.m_ClearFlags,
+                        Depth = cam.m_Depth,
+                        Enabled = cam.Enabled
+                    });
+                }
+                else if (comp is Light light)
+                {
+                    if (skipDisabled && !light.Enabled)
+                    {
+                        continue;
+                    }
+
+                    var importedType = light.m_Type switch
+                    {
+                        LightType.Directional => ImportedLightType.Directional,
+                        LightType.Spot => ImportedLightType.Spot,
+                        LightType.Area or LightType.Disc => ImportedLightType.Area,
+                        _ => ImportedLightType.Point
+                    };
+
+                    LightList.Add(new ImportedLight
+                    {
+                        Name = baseName,
+                        Path = framePath,
+                        TargetFrame = targetFrame,
+                        Type = importedType,
+                        Color = light.m_Color,
+                        Intensity = light.m_Intensity,
+                        Range = light.m_Range,
+                        SpotAngleDegrees = light.m_SpotAngle,
+                        InnerSpotAngleDegrees = light.m_InnerSpotAngle,
+                        ShadowType = light.m_Shadows?.m_Type ?? 0,
+                        Enabled = light.Enabled
+                    });
+                }
+            }
+        }
+
+        private void AttachScriptSpawnedPrefabs(
+            IReadOnlyList<SceneScriptSpawnAttachment> attachments,
+            bool includeInactive,
+            bool skipDisabledRenderers,
+            SceneConversionOptions sceneOptions,
+            CancellationToken cancellationToken)
+        {
+            int maxInstances = Math.Max(0, sceneOptions.MaxScriptSpawnInstances);
+            if (maxInstances == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < attachments.Count && AttachedScriptSpawnCount < maxInstances; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var attachment = attachments[i];
+                if (attachment?.PrefabRoot == null)
+                {
+                    continue;
+                }
+
+                var parentFrame = ResolveScriptSpawnAnchorFrame(attachment) ?? RootFrame;
+                AttachSingleScriptSpawnedPrefab(
+                    attachment,
+                    parentFrame,
+                    includeInactive,
+                    skipDisabledRenderers,
+                    sceneOptions,
+                    cancellationToken);
+                AttachedScriptSpawnCount++;
+            }
+        }
+
+        private ImportedFrame? ResolveScriptSpawnAnchorFrame(SceneScriptSpawnAttachment attachment)
+        {
+            if (attachment.AnchorTransform != null && transformDictionary.TryGetValue(attachment.AnchorTransform, out var exactAnchor))
+            {
+                return exactAnchor;
+            }
+
+            if (attachment.AnchorTransformPathId != 0 && _frameByTransformPathId.TryGetValue(attachment.AnchorTransformPathId, out var anchorById))
+            {
+                return anchorById;
+            }
+
+            if (attachment.OwnerGameObject?.m_Transform != null
+                && transformDictionary.TryGetValue(attachment.OwnerGameObject.m_Transform, out var ownerFrame))
+            {
+                return ownerFrame;
+            }
+
+            if (attachment.OwnerPathId != 0 && _frameByGameObjectPathId.TryGetValue(attachment.OwnerPathId, out var ownerById))
+            {
+                return ownerById;
+            }
+
+            return null;
+        }
+
+        private void AttachSingleScriptSpawnedPrefab(
+            SceneScriptSpawnAttachment attachment,
+            ImportedFrame parentFrame,
+            bool includeInactive,
+            bool skipDisabledRenderers,
+            SceneConversionOptions sceneOptions,
+            CancellationToken cancellationToken)
+        {
+            var prefabRoot = attachment.PrefabRoot;
+            HydrateGameObjectHierarchy(prefabRoot);
+
+            var rootTransform = prefabRoot.m_Transform;
+            var localMap = new Dictionary<Transform, ImportedFrame>();
+            var spawnMetadata = new ImportedScriptSpawnMetadata
+            {
+                ScriptClass = attachment.ScriptClass ?? string.Empty,
+                FieldPath = attachment.FieldPath ?? string.Empty,
+                SourceKind = attachment.SourceKind ?? string.Empty,
+                Confidence = attachment.Confidence ?? string.Empty,
+                OwnerPathId = attachment.OwnerPathId,
+                AnchorTransformPathId = attachment.AnchorTransformPathId,
+                TargetFileName = attachment.TargetFileName ?? prefabRoot.assetsFile?.fileName ?? string.Empty,
+                TargetPathId = attachment.TargetPathId != 0 ? attachment.TargetPathId : prefabRoot.m_PathID,
+                TargetGuid = attachment.TargetGuid ?? string.Empty
+            };
+
+            if (rootTransform == null)
+            {
+                var fallbackName = string.IsNullOrWhiteSpace(prefabRoot.m_Name)
+                    ? $"[ScriptSpawned] Prefab_{prefabRoot.m_PathID}"
+                    : $"[ScriptSpawned] {prefabRoot.m_Name}";
+                var fallbackFrame = CreateFrame(
+                    fallbackName,
+                    attachment.LocalPositionOffset,
+                    attachment.LocalRotationOffset,
+                    attachment.LocalScaleMultiplier);
+                fallbackFrame.Extras = new ImportedFrameExtras
+                {
+                    PathId = prefabRoot.m_PathID,
+                    SourceFile = prefabRoot.assetsFile?.fileName ?? string.Empty,
+                    Tag = prefabRoot.m_Tag,
+                    Layer = prefabRoot.m_Layer,
+                    IsActive = prefabRoot.m_IsActive,
+                    IsScriptSpawned = true,
+                    ScriptSpawn = spawnMetadata
+                };
+                parentFrame.AddChild(fallbackFrame);
+                return;
+            }
+
+            ClonePrefabTransformSubtree(
+                rootTransform,
+                parentFrame,
+                isPrefabRoot: true,
+                attachment,
+                spawnMetadata,
+                localMap,
+                includeInactive,
+                cancellationToken);
+
+            var localExcludedLods = new HashSet<Renderer>();
+            if (sceneOptions.LodExportMode == SceneLodExportMode.Lod0Only)
+            {
+                CollectPrefabLodExclusions(rootTransform, localExcludedLods, includeInactive, cancellationToken);
+            }
+
+            var visitedPrefabRenderers = new HashSet<Transform>();
+            ConvertPrefabComponentsRecursive(
+                rootTransform,
+                visitedPrefabRenderers,
+                localMap,
+                localExcludedLods,
+                includeInactive,
+                skipDisabledRenderers,
+                sceneOptions,
+                cancellationToken);
+        }
+
+        private void ClonePrefabTransformSubtree(
+            Transform trans,
+            ImportedFrame parentFrame,
+            bool isPrefabRoot,
+            SceneScriptSpawnAttachment attachment,
+            ImportedScriptSpawnMetadata spawnMetadata,
+            Dictionary<Transform, ImportedFrame> localMap,
+            bool includeInactive,
+            CancellationToken cancellationToken)
+        {
+            if (trans == null || localMap.ContainsKey(trans))
+            {
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            TryResolveTransformGameObject(trans, out var go);
+            if (!isPrefabRoot && !includeInactive && go != null && !go.m_IsActive)
+            {
+                return;
+            }
+
+            var rawName = go != null && !string.IsNullOrWhiteSpace(go.m_Name)
+                ? go.m_Name
+                : $"GameObject_{trans.m_GameObject.m_PathID}";
+            var frameName = isPrefabRoot ? $"[ScriptSpawned] {rawName}" : rawName;
+
+            var pos = trans.m_LocalPosition;
+            var rot = trans.m_LocalRotation;
+            var scale = trans.m_LocalScale;
+            if (isPrefabRoot)
+            {
+                pos = new Vector3(
+                    pos.X + attachment.LocalPositionOffset.X,
+                    pos.Y + attachment.LocalPositionOffset.Y,
+                    pos.Z + attachment.LocalPositionOffset.Z);
+                rot = MultiplyUnityQuaternions(attachment.LocalRotationOffset, rot);
+                scale = new Vector3(
+                    scale.X * attachment.LocalScaleMultiplier.X,
+                    scale.Y * attachment.LocalScaleMultiplier.Y,
+                    scale.Z * attachment.LocalScaleMultiplier.Z);
+            }
+
+            var frame = new ImportedFrame(trans.m_Children?.Length ?? 0)
+            {
+                Name = frameName
+            };
+            SetFrame(frame, pos, rot, scale);
+
+            if (_populateFrameExtras || isPrefabRoot)
+            {
+                frame.Extras = new ImportedFrameExtras
+                {
+                    PathId = go?.m_PathID ?? trans.m_GameObject.m_PathID,
+                    SourceFile = go?.assetsFile?.fileName ?? trans.assetsFile?.fileName ?? string.Empty,
+                    Tag = go?.m_Tag ?? 0,
+                    Layer = go?.m_Layer ?? 0,
+                    IsActive = go?.m_IsActive ?? true,
+                    IsScriptSpawned = true,
+                    ScriptSpawn = isPrefabRoot ? spawnMetadata : null
+                };
+            }
+
+            localMap[trans] = frame;
+            parentFrame.AddChild(frame);
+
+            if (trans.m_Children == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < trans.m_Children.Length; i++)
+            {
+                var childPtr = trans.m_Children[i];
+                if (childPtr == null || childPtr.IsNull)
+                {
+                    continue;
+                }
+
+                if (!childPtr.TryGet(out var child))
+                {
+                    foreach (var sf in SnapshotAssetsFiles(trans.assetsFile?.assetsManager))
+                    {
+                        if (sf.TryGetObject(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        {
+                            child = foundChild;
+                            break;
+                        }
+                    }
+                }
+
+                if (child != null)
+                {
+                    ClonePrefabTransformSubtree(
+                        child,
+                        frame,
+                        isPrefabRoot: false,
+                        attachment,
+                        spawnMetadata,
+                        localMap,
+                        includeInactive,
+                        cancellationToken);
+                }
+            }
+        }
+
+        private static Quaternion MultiplyUnityQuaternions(Quaternion a, Quaternion b)
+        {
+            return new Quaternion(
+                a.W * b.X + a.X * b.W + a.Y * b.Z - a.Z * b.Y,
+                a.W * b.Y - a.X * b.Z + a.Y * b.W + a.Z * b.X,
+                a.W * b.Z + a.X * b.Y - a.Y * b.X + a.Z * b.W,
+                a.W * b.W - a.X * b.X - a.Y * b.Y - a.Z * b.Z);
+        }
+
+        private void CollectPrefabLodExclusions(
+            Transform rootTransform,
+            HashSet<Renderer> excludedRenderers,
+            bool includeInactive,
+            CancellationToken cancellationToken)
+        {
+            var visited = new HashSet<Transform>();
+            var kept = new HashSet<Renderer>();
+            var stack = new Stack<Transform>();
+            stack.Push(rootTransform);
+
+            while (stack.Count > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var trans = stack.Pop();
+                if (trans == null || !visited.Add(trans))
+                {
+                    continue;
+                }
+
+                if (TryResolveTransformGameObject(trans, out var go) && go != null)
+                {
+                    if (!ReferenceEquals(trans, rootTransform) && !includeInactive && !go.m_IsActive)
+                    {
+                        continue;
+                    }
+
+                    if (go.m_Components != null)
+                    {
+                        for (int i = 0; i < go.m_Components.Length; i++)
+                        {
+                            var compPtr = go.m_Components[i];
+                            if (compPtr == null || compPtr.IsNull
+                                || !TryResolveComponent(go, compPtr, out var comp)
+                                || comp is not LODGroup lodGroup
+                                || !lodGroup.m_Enabled
+                                || lodGroup.m_LODs == null
+                                || lodGroup.m_LODs.Length == 0)
+                            {
+                                continue;
+                            }
+
+                            int selectedIdx = -1;
+                            for (int l = 0; l < lodGroup.m_LODs.Length; l++)
+                            {
+                                if (lodGroup.m_LODs[l]?.renderers is { Length: > 0 })
+                                {
+                                    selectedIdx = l;
+                                    break;
+                                }
+                            }
+
+                            if (selectedIdx < 0)
+                            {
+                                continue;
+                            }
+
+                            for (int l = 0; l < lodGroup.m_LODs.Length; l++)
+                            {
+                                var lod = lodGroup.m_LODs[l];
+                                if (lod?.renderers == null) continue;
+                                for (int r = 0; r < lod.renderers.Length; r++)
+                                {
+                                    var rendPtr = lod.renderers[r];
+                                    if (rendPtr == null || rendPtr.IsNull) continue;
+                                    var rend = TryResolveRenderer(lodGroup, rendPtr);
+                                    if (rend == null) continue;
+                                    if (l == selectedIdx) kept.Add(rend);
+                                    else excludedRenderers.Add(rend);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (trans.m_Children != null)
+                {
+                    for (int i = 0; i < trans.m_Children.Length; i++)
+                    {
+                        var childPtr = trans.m_Children[i];
+                        if (childPtr != null && !childPtr.IsNull && childPtr.TryGet(out var child) && child != null)
+                        {
+                            stack.Push(child);
+                        }
+                    }
+                }
+            }
+
+            excludedRenderers.ExceptWith(kept);
+        }
+
+        private void ConvertPrefabComponentsRecursive(
+            Transform trans,
+            HashSet<Transform> visited,
+            Dictionary<Transform, ImportedFrame> localMap,
+            HashSet<Renderer> localExcludedLods,
+            bool includeInactive,
+            bool skipDisabledRenderers,
+            SceneConversionOptions sceneOptions,
+            CancellationToken cancellationToken)
+        {
+            if (trans == null || !visited.Add(trans))
+            {
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!localMap.TryGetValue(trans, out var targetFrame))
+            {
+                return;
+            }
+
+            if (TryResolveTransformGameObject(trans, out var go) && go != null)
+            {
+                if (go.m_MeshRenderer != null
+                    && (!skipDisabledRenderers || go.m_MeshRenderer.m_Enabled))
+                {
+                    if (localExcludedLods.Contains(go.m_MeshRenderer))
+                    {
+                        SkippedLodRendererCount++;
+                    }
+                    else
+                    {
+                        ConvertMeshRenderer(go.m_MeshRenderer, localMap);
+                    }
+                }
+
+                if (go.m_SkinnedMeshRenderer != null
+                    && (!skipDisabledRenderers || go.m_SkinnedMeshRenderer.m_Enabled))
+                {
+                    if (localExcludedLods.Contains(go.m_SkinnedMeshRenderer))
+                    {
+                        SkippedLodRendererCount++;
+                    }
+                    else
+                    {
+                        ConvertMeshRenderer(go.m_SkinnedMeshRenderer, localMap);
+                    }
+                }
+
+                if (sceneOptions.IncludeCamerasAndLights)
+                {
+                    ExtractCamerasAndLightsFromGameObject(go, targetFrame, sceneOptions.SkipDisabledCamerasAndLights);
+                }
+            }
+
+            if (trans.m_Children == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < trans.m_Children.Length; i++)
+            {
+                var childPtr = trans.m_Children[i];
+                if (childPtr == null || childPtr.IsNull)
+                {
+                    continue;
+                }
+
+                if (!childPtr.TryGet(out var child))
+                {
+                    foreach (var sf in SnapshotAssetsFiles(trans.assetsFile?.assetsManager))
+                    {
+                        if (sf.TryGetObject(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        {
+                            child = foundChild;
+                            break;
+                        }
+                    }
+                }
+
+                if (child != null)
+                {
+                    ConvertPrefabComponentsRecursive(
+                        child,
+                        visited,
+                        localMap,
+                        localExcludedLods,
+                        includeInactive,
+                        skipDisabledRenderers,
+                        sceneOptions,
+                        cancellationToken);
                 }
             }
         }
@@ -842,6 +1711,29 @@ namespace AssetStudio
             }
             frame.Name = m_GameObject != null ? m_GameObject.m_Name : $"GameObject_{trans.m_GameObject.m_PathID}";
             SetFrame(frame, trans.m_LocalPosition, trans.m_LocalRotation, trans.m_LocalScale);
+            if (trans.m_PathID != 0 && !_frameByTransformPathId.ContainsKey(trans.m_PathID))
+            {
+                _frameByTransformPathId[trans.m_PathID] = frame;
+            }
+            if (m_GameObject != null)
+            {
+                if (m_GameObject.m_PathID != 0 && !_frameByGameObjectPathId.ContainsKey(m_GameObject.m_PathID))
+                {
+                    _frameByGameObjectPathId[m_GameObject.m_PathID] = frame;
+                }
+
+                if (_populateFrameExtras)
+                {
+                    frame.Extras = new ImportedFrameExtras
+                    {
+                        PathId = m_GameObject.m_PathID,
+                        SourceFile = m_GameObject.assetsFile?.fileName ?? string.Empty,
+                        Tag = m_GameObject.m_Tag,
+                        Layer = m_GameObject.m_Layer,
+                        IsActive = m_GameObject.m_IsActive
+                    };
+                }
+            }
             return frame;
         }
 
@@ -944,7 +1836,7 @@ namespace AssetStudio
             }
         }
 
-        private void ConvertMeshRenderer(Renderer meshR)
+        private void ConvertMeshRenderer(Renderer meshR, Dictionary<Transform, ImportedFrame>? frameMapOverride = null)
         {
             var mesh = GetMesh(meshR) ?? TryResolveMeshWithResolver(meshR);
             if (mesh == null)
@@ -967,10 +1859,15 @@ namespace AssetStudio
                     }
                 }
             }
-            iMesh.Path = (m_GameObject2 != null ? GetTransformPath(m_GameObject2.m_Transform) : null) ?? "";
-            if (m_GameObject2?.m_Transform != null && transformDictionary.TryGetValue(m_GameObject2.m_Transform, out var exactTargetFrame))
+            var activeFrameMap = frameMapOverride ?? transformDictionary;
+            if (m_GameObject2?.m_Transform != null && activeFrameMap.TryGetValue(m_GameObject2.m_Transform, out var exactTargetFrame))
             {
                 iMesh.TargetFrame = exactTargetFrame;
+                iMesh.Path = exactTargetFrame.Path;
+            }
+            else
+            {
+                iMesh.Path = (m_GameObject2 != null ? GetTransformPath(m_GameObject2.m_Transform) : null) ?? "";
             }
             if (!string.IsNullOrWhiteSpace(mesh.m_Name))
             {

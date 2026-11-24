@@ -23,6 +23,19 @@ namespace AssetStudio
         public List<string> DirectDependencyInternalIds { get; } = new List<string>();
     }
 
+    public sealed class CatalogAssetEntry
+    {
+        public string PrimaryKey { get; init; } = string.Empty;
+        public string InternalId { get; init; } = string.Empty;
+        public string ProviderId { get; init; } = string.Empty;
+        public string PrimaryBundleInternalId { get; init; } = string.Empty;
+        public string PrimaryBundleFileName { get; init; } = string.Empty;
+        public List<string> DependencyBundleInternalIds { get; } = new List<string>();
+        public List<string> Keys { get; } = new List<string>();
+        public List<string> Guids { get; } = new List<string>();
+        public bool IsScene { get; init; }
+    }
+
     public sealed class ParsedAddressablesCatalog
     {
         public string CatalogPath { get; init; } = string.Empty;
@@ -31,6 +44,14 @@ namespace AssetStudio
         public string LocatorId { get; set; } = string.Empty;
         public List<CatalogBundleNode> Bundles { get; } = new List<CatalogBundleNode>();
         public List<string> Providers { get; } = new List<string>();
+        public List<CatalogAssetEntry> AssetEntries { get; } = new List<CatalogAssetEntry>();
+        public List<CatalogAssetEntry> SceneEntries { get; } = new List<CatalogAssetEntry>();
+
+        public Dictionary<string, List<CatalogAssetEntry>> ByKey { get; } =
+            new Dictionary<string, List<CatalogAssetEntry>>(StringComparer.OrdinalIgnoreCase);
+
+        public Dictionary<string, List<CatalogAssetEntry>> ByGuid { get; } =
+            new Dictionary<string, List<CatalogAssetEntry>>(StringComparer.OrdinalIgnoreCase);
 
         internal Dictionary<string, CatalogBundleNode> ByInternalId { get; } =
             new Dictionary<string, CatalogBundleNode>(StringComparer.OrdinalIgnoreCase);
@@ -42,6 +63,108 @@ namespace AssetStudio
             new Dictionary<string, List<CatalogBundleNode>>(StringComparer.OrdinalIgnoreCase);
 
         internal string[] ImmediateSubdirectories { get; set; } = Array.Empty<string>();
+
+        public bool TryGetEntriesByGuid(string? assetGuid, out IReadOnlyList<CatalogAssetEntry> entries)
+        {
+            if (AddressablesCatalogDependencyResolver.TryNormalizeAssetGuid(assetGuid, out var normalized)
+                && ByGuid.TryGetValue(normalized, out var list)
+                && list.Count > 0)
+            {
+                entries = list;
+                return true;
+            }
+
+            entries = Array.Empty<CatalogAssetEntry>();
+            return false;
+        }
+
+        public bool TryGetEntriesByKey(string? key, out IReadOnlyList<CatalogAssetEntry> entries)
+        {
+            if (!string.IsNullOrWhiteSpace(key)
+                && ByKey.TryGetValue(key.Trim(), out var list)
+                && list.Count > 0)
+            {
+                entries = list;
+                return true;
+            }
+
+            entries = Array.Empty<CatalogAssetEntry>();
+            return false;
+        }
+
+        public void IndexAssetEntry(CatalogAssetEntry entry)
+        {
+            if (entry == null)
+            {
+                return;
+            }
+
+            AssetEntries.Add(entry);
+            if (entry.IsScene)
+            {
+                SceneEntries.Add(entry);
+            }
+
+            if (!string.IsNullOrWhiteSpace(entry.PrimaryKey))
+            {
+                AddKeyOrGuid(entry, entry.PrimaryKey);
+            }
+
+            if (!string.IsNullOrWhiteSpace(entry.InternalId))
+            {
+                AddAssetMultiLookup(ByKey, entry.InternalId, entry);
+            }
+
+            for (int i = 0; i < entry.Keys.Count; i++)
+            {
+                AddKeyOrGuid(entry, entry.Keys[i]);
+            }
+
+            for (int i = 0; i < entry.Guids.Count; i++)
+            {
+                if (AddressablesCatalogDependencyResolver.TryNormalizeAssetGuid(entry.Guids[i], out var normalizedGuid))
+                {
+                    AddAssetMultiLookup(ByGuid, normalizedGuid, entry);
+                    AddAssetMultiLookup(ByKey, normalizedGuid, entry);
+                }
+            }
+        }
+
+        private void AddKeyOrGuid(CatalogAssetEntry entry, string rawKey)
+        {
+            if (string.IsNullOrWhiteSpace(rawKey))
+            {
+                return;
+            }
+
+            var trimmed = rawKey.Trim();
+            AddAssetMultiLookup(ByKey, trimmed, entry);
+            if (AddressablesCatalogDependencyResolver.TryNormalizeAssetGuid(trimmed, out var normalizedGuid))
+            {
+                if (!entry.Guids.Contains(normalizedGuid, StringComparer.OrdinalIgnoreCase))
+                {
+                    entry.Guids.Add(normalizedGuid);
+                }
+                AddAssetMultiLookup(ByGuid, normalizedGuid, entry);
+            }
+        }
+
+        private static void AddAssetMultiLookup(
+            Dictionary<string, List<CatalogAssetEntry>> dict,
+            string key,
+            CatalogAssetEntry entry)
+        {
+            if (!dict.TryGetValue(key, out var list))
+            {
+                list = new List<CatalogAssetEntry>(1);
+                dict[key] = list;
+            }
+
+            if (!list.Contains(entry))
+            {
+                list.Add(entry);
+            }
+        }
 
         internal void IndexNode(CatalogBundleNode node)
         {
@@ -1134,28 +1257,55 @@ namespace AssetStudio
                     bundleNodeByEntryIndex[i] = node;
                 }
 
-                // Wire dependency edges:
+                // Wire dependency edges AND retain non-bundle asset/scene entries (ByKey, ByGuid, SceneEntries):
                 // 1) For non-bundle asset/scene entries, depBucket[0] is the primary bundle and depBucket[1..k] are its dependency bundles.
                 // 2) For bundle entries that directly carry a dependencyKeyIndex, depBucket entries (!= i) are direct dependencies of bundle i.
+                var keysByEntryIndex = new Dictionary<int, List<string>>();
+                for (int b = 0; b < buckets.Count; b++)
+                {
+                    var bucket = buckets[b];
+                    if (string.IsNullOrWhiteSpace(bucket.KeyString) || bucket.Entries.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    for (int j = 0; j < bucket.Entries.Length; j++)
+                    {
+                        var targetIdx = bucket.Entries[j];
+                        if (targetIdx < 0 || targetIdx >= entries.Count || bundleNodeByEntryIndex[targetIdx] != null)
+                        {
+                            continue;
+                        }
+
+                        if (!keysByEntryIndex.TryGetValue(targetIdx, out var keyList))
+                        {
+                            keyList = new List<string>(2);
+                            keysByEntryIndex[targetIdx] = keyList;
+                        }
+
+                        if (!keyList.Contains(bucket.KeyString, StringComparer.OrdinalIgnoreCase))
+                        {
+                            keyList.Add(bucket.KeyString);
+                        }
+                    }
+                }
+
                 var seenAssetDepBuckets = new HashSet<int>();
                 for (int i = 0; i < entries.Count; i++)
                 {
                     var e = entries[i];
                     var depBucketIdx = e.DependencyKeyIndex;
-                    if (depBucketIdx < 0 || depBucketIdx >= buckets.Count)
-                    {
-                        continue;
-                    }
-
-                    var depEntries = buckets[depBucketIdx].Entries;
-                    if (depEntries.Length == 0)
-                    {
-                        continue;
-                    }
+                    var hasDepBucket = depBucketIdx >= 0 && depBucketIdx < buckets.Count;
+                    var depEntries = hasDepBucket ? buckets[depBucketIdx].Entries : Array.Empty<int>();
 
                     var selfBundleNode = bundleNodeByEntryIndex[i];
                     if (selfBundleNode != null)
                     {
+                        if (depEntries.Length == 0)
+                        {
+                            continue;
+                        }
+
                         int startIdx = (depEntries[0] == i) ? 1 : 0;
                         for (int j = startIdx; j < depEntries.Length; j++)
                         {
@@ -1172,33 +1322,77 @@ namespace AssetStudio
                             }
                         }
                     }
-                    else if (depEntries.Length >= 2 && seenAssetDepBuckets.Add(depBucketIdx))
+                    else
                     {
-                        var primaryIdx = depEntries[0];
-                        if (primaryIdx < 0 || primaryIdx >= entries.Count)
+                        CatalogBundleNode? primaryNode = null;
+                        var depBundleIds = new List<string>();
+                        if (depEntries.Length > 0)
                         {
-                            continue;
-                        }
-
-                        var primaryNode = bundleNodeByEntryIndex[primaryIdx];
-                        if (primaryNode == null)
-                        {
-                            continue;
-                        }
-
-                        for (int j = 1; j < depEntries.Length; j++)
-                        {
-                            var depIdx = depEntries[j];
-                            if (depIdx < 0 || depIdx >= entries.Count || depIdx == primaryIdx)
+                            var primaryIdx = depEntries[0];
+                            if (primaryIdx >= 0 && primaryIdx < entries.Count)
                             {
-                                continue;
+                                primaryNode = bundleNodeByEntryIndex[primaryIdx];
                             }
 
-                            var depNode = bundleNodeByEntryIndex[depIdx];
-                            if (depNode != null)
+                            bool wireBundleDeps = depEntries.Length >= 2 && primaryNode != null && seenAssetDepBuckets.Add(depBucketIdx);
+                            for (int j = 1; j < depEntries.Length; j++)
                             {
-                                AddDependencyEdge(primaryNode, depNode.InternalId);
+                                var depIdx = depEntries[j];
+                                if (depIdx < 0 || depIdx >= entries.Count || depIdx == primaryIdx)
+                                {
+                                    continue;
+                                }
+
+                                var depNode = bundleNodeByEntryIndex[depIdx];
+                                if (depNode != null)
+                                {
+                                    if (!depBundleIds.Contains(depNode.InternalId, StringComparer.OrdinalIgnoreCase))
+                                    {
+                                        depBundleIds.Add(depNode.InternalId);
+                                    }
+
+                                    if (wireBundleDeps && primaryNode != null)
+                                    {
+                                        AddDependencyEdge(primaryNode, depNode.InternalId);
+                                    }
+                                }
                             }
+                        }
+
+                        if (e.InternalIdIndex >= 0 && e.InternalIdIndex < expandedInternalIds.Length)
+                        {
+                            var expandedId = expandedInternalIds[e.InternalIdIndex];
+                            var isScene = IsSceneProvider(e.ProviderId)
+                                || IsScenePath(expandedId)
+                                || IsScenePath(e.PrimaryKey);
+
+                            var assetEntry = new CatalogAssetEntry
+                            {
+                                PrimaryKey = e.PrimaryKey,
+                                InternalId = expandedId,
+                                ProviderId = e.ProviderId,
+                                PrimaryBundleInternalId = primaryNode?.InternalId ?? string.Empty,
+                                PrimaryBundleFileName = primaryNode?.BundleFileName ?? string.Empty,
+                                IsScene = isScene
+                            };
+
+                            if (depBundleIds.Count > 0)
+                            {
+                                assetEntry.DependencyBundleInternalIds.AddRange(depBundleIds);
+                            }
+
+                            if (keysByEntryIndex.TryGetValue(i, out var entryKeys))
+                            {
+                                for (int k = 0; k < entryKeys.Count; k++)
+                                {
+                                    if (!assetEntry.Keys.Contains(entryKeys[k], StringComparer.OrdinalIgnoreCase))
+                                    {
+                                        assetEntry.Keys.Add(entryKeys[k]);
+                                    }
+                                }
+                            }
+
+                            parsed.IndexAssetEntry(assetEntry);
                         }
                     }
                 }
@@ -1289,19 +1483,39 @@ namespace AssetStudio
             var allLocationOffsets = new List<uint>();
             var seenLocationOffsets = new HashSet<uint>();
             var locationQueue = new Queue<uint>();
+            var keysByLocationOffset = new Dictionary<uint, List<string>>();
 
             for (int k = 0; k < keyCount; k++)
             {
                 var keyEntryOffset = (int)keysOffset + k * 8;
+                var keyObjectOffset = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(keyEntryOffset, 4));
+                var keyString = TryReadBinaryKeyString(data, keyObjectOffset);
                 var locationSetOffset = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(keyEntryOffset + 4, 4));
                 var locOffsets = ReadBinaryUInt32Array(data, locationSetOffset);
                 for (int i = 0; i < locOffsets.Length; i++)
                 {
                     var locOff = locOffsets[i];
-                    if (locOff != uint.MaxValue && (long)locOff + 28 <= data.Length && seenLocationOffsets.Add(locOff))
+                    if (locOff != uint.MaxValue && (long)locOff + 28 <= data.Length)
                     {
-                        allLocationOffsets.Add(locOff);
-                        locationQueue.Enqueue(locOff);
+                        if (seenLocationOffsets.Add(locOff))
+                        {
+                            allLocationOffsets.Add(locOff);
+                            locationQueue.Enqueue(locOff);
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(keyString))
+                        {
+                            if (!keysByLocationOffset.TryGetValue(locOff, out var locKeys))
+                            {
+                                locKeys = new List<string>(2);
+                                keysByLocationOffset[locOff] = locKeys;
+                            }
+
+                            if (!locKeys.Contains(keyString, StringComparer.OrdinalIgnoreCase))
+                            {
+                                locKeys.Add(keyString);
+                            }
+                        }
                     }
                 }
             }
@@ -1421,19 +1635,27 @@ namespace AssetStudio
                 bundleNodeByLocOffset[locOff] = node;
             }
 
-            // Wire dependency edges across locations
+            // Wire dependency edges across locations AND retain non-bundle asset/scene entries
             var processedAssetDepSets = new HashSet<uint>();
             foreach (var record in locationsByOffset.Values)
             {
-                if (record.DependencySetOffset == uint.MaxValue
-                    || !depSetsByOffset.TryGetValue(record.DependencySetOffset, out var depLocs)
-                    || depLocs.Length == 0)
+                uint[]? depLocs = null;
+                var hasDepLocs = record.DependencySetOffset != uint.MaxValue
+                    && depSetsByOffset.TryGetValue(record.DependencySetOffset, out depLocs)
+                    && depLocs != null
+                    && depLocs.Length > 0;
+                if (!hasDepLocs)
                 {
-                    continue;
+                    depLocs = Array.Empty<uint>();
                 }
 
                 if (bundleNodeByLocOffset.TryGetValue(record.Offset, out var selfBundleNode))
                 {
+                    if (depLocs!.Length == 0)
+                    {
+                        continue;
+                    }
+
                     int startIdx = (depLocs[0] == record.Offset) ? 1 : 0;
                     for (int j = startIdx; j < depLocs.Length; j++)
                     {
@@ -1444,22 +1666,64 @@ namespace AssetStudio
                         }
                     }
                 }
-                else if (depLocs.Length >= 2 && processedAssetDepSets.Add(record.DependencySetOffset))
+                else
                 {
-                    var primaryOff = depLocs[0];
-                    if (!bundleNodeByLocOffset.TryGetValue(primaryOff, out var primaryNode))
+                    CatalogBundleNode? primaryNode = null;
+                    var depBundleIds = new List<string>();
+                    if (depLocs!.Length > 0)
                     {
-                        continue;
-                    }
-
-                    for (int j = 1; j < depLocs.Length; j++)
-                    {
-                        var depOff = depLocs[j];
-                        if (depOff != primaryOff && bundleNodeByLocOffset.TryGetValue(depOff, out var depNode))
+                        var primaryOff = depLocs[0];
+                        bundleNodeByLocOffset.TryGetValue(primaryOff, out primaryNode);
+                        bool wireBundleDeps = depLocs.Length >= 2 && primaryNode != null && processedAssetDepSets.Add(record.DependencySetOffset);
+                        for (int j = 1; j < depLocs.Length; j++)
                         {
-                            AddDependencyEdge(primaryNode, depNode.InternalId);
+                            var depOff = depLocs[j];
+                            if (depOff != primaryOff && bundleNodeByLocOffset.TryGetValue(depOff, out var depNode))
+                            {
+                                if (!depBundleIds.Contains(depNode.InternalId, StringComparer.OrdinalIgnoreCase))
+                                {
+                                    depBundleIds.Add(depNode.InternalId);
+                                }
+
+                                if (wireBundleDeps && primaryNode != null)
+                                {
+                                    AddDependencyEdge(primaryNode, depNode.InternalId);
+                                }
+                            }
                         }
                     }
+
+                    var isScene = IsSceneProvider(record.ProviderId)
+                        || IsScenePath(record.InternalId)
+                        || IsScenePath(record.PrimaryKey);
+
+                    var assetEntry = new CatalogAssetEntry
+                    {
+                        PrimaryKey = record.PrimaryKey,
+                        InternalId = record.InternalId,
+                        ProviderId = record.ProviderId,
+                        PrimaryBundleInternalId = primaryNode?.InternalId ?? string.Empty,
+                        PrimaryBundleFileName = primaryNode?.BundleFileName ?? string.Empty,
+                        IsScene = isScene
+                    };
+
+                    if (depBundleIds.Count > 0)
+                    {
+                        assetEntry.DependencyBundleInternalIds.AddRange(depBundleIds);
+                    }
+
+                    if (keysByLocationOffset.TryGetValue(record.Offset, out var locKeys))
+                    {
+                        for (int k = 0; k < locKeys.Count; k++)
+                        {
+                            if (!assetEntry.Keys.Contains(locKeys[k], StringComparer.OrdinalIgnoreCase))
+                            {
+                                assetEntry.Keys.Add(locKeys[k]);
+                            }
+                        }
+                    }
+
+                    parsed.IndexAssetEntry(assetEntry);
                 }
             }
 
@@ -2224,6 +2488,167 @@ namespace AssetStudio
             }
 
             return value;
+        }
+
+        public static bool TryNormalizeAssetGuid(string? candidate, out string normalizedGuid)
+        {
+            normalizedGuid = string.Empty;
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                return false;
+            }
+
+            var trimmed = candidate.Trim();
+            if (trimmed.Length < 32 || trimmed.Length > 38)
+            {
+                return false;
+            }
+
+            Span<char> buffer = stackalloc char[32];
+            int count = 0;
+            for (int i = 0; i < trimmed.Length; i++)
+            {
+                char ch = trimmed[i];
+                if (ch is '-' or '{' or '}')
+                {
+                    continue;
+                }
+
+                if (count >= 32)
+                {
+                    return false;
+                }
+
+                if (ch is >= '0' and <= '9')
+                {
+                    buffer[count++] = ch;
+                }
+                else if (ch is >= 'a' and <= 'f')
+                {
+                    buffer[count++] = ch;
+                }
+                else if (ch is >= 'A' and <= 'F')
+                {
+                    buffer[count++] = (char)(ch + 32);
+                }
+                else
+                {
+                    return false;
+                }
+            }
+
+            if (count != 32)
+            {
+                return false;
+            }
+
+            normalizedGuid = new string(buffer);
+            return true;
+        }
+
+        public static bool TryResolveGuidToBundlePaths(
+            IEnumerable<ParsedAddressablesCatalog>? catalogs,
+            string? assetGuid,
+            out List<(CatalogAssetEntry Entry, string? PrimaryBundlePath, List<string> DependencyBundlePaths)> matches,
+            string? sourceBundleDirectory = null)
+        {
+            matches = new List<(CatalogAssetEntry, string?, List<string>)>();
+            if (catalogs == null || !TryNormalizeAssetGuid(assetGuid, out var normalizedGuid))
+            {
+                return false;
+            }
+
+            foreach (var catalog in catalogs)
+            {
+                if (catalog == null || !catalog.TryGetEntriesByGuid(normalizedGuid, out var entries))
+                {
+                    continue;
+                }
+
+                for (int i = 0; i < entries.Count; i++)
+                {
+                    var entry = entries[i];
+                    var primaryPath = !string.IsNullOrWhiteSpace(entry.PrimaryBundleInternalId)
+                        ? TryResolveLocalBundlePath(catalog, entry.PrimaryBundleInternalId, sourceBundleDirectory)
+                        : null;
+
+                    var depPaths = new List<string>();
+                    for (int d = 0; d < entry.DependencyBundleInternalIds.Count; d++)
+                    {
+                        var depPath = TryResolveLocalBundlePath(catalog, entry.DependencyBundleInternalIds[d], sourceBundleDirectory);
+                        if (!string.IsNullOrEmpty(depPath) && !depPaths.Contains(depPath, StringComparer.OrdinalIgnoreCase))
+                        {
+                            depPaths.Add(depPath);
+                        }
+                    }
+
+                    matches.Add((entry, primaryPath, depPaths));
+                }
+            }
+
+            return matches.Count > 0;
+        }
+
+        private static string? TryReadBinaryKeyString(ReadOnlySpan<byte> data, uint keyOffset)
+        {
+            if (keyOffset == uint.MaxValue)
+            {
+                return null;
+            }
+
+            // 1. Check ObjectTypeData layout: { uint32 typeId; uint32 objectId; } where typeId points to { uint32 asmId; uint32 classId; }
+            if ((keyOffset & (UnicodeStringFlag | DynamicStringFlag)) == 0 && (long)keyOffset + 8 <= data.Length)
+            {
+                var typeId = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice((int)keyOffset, 4));
+                var objectId = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice((int)keyOffset + 4, 4));
+                if (typeId != uint.MaxValue
+                    && (typeId & (UnicodeStringFlag | DynamicStringFlag)) == 0
+                    && (long)typeId + 8 <= data.Length)
+                {
+                    var classNameId = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice((int)typeId + 4, 4));
+                    var className = ReadBinaryCatalogString(data, classNameId, '.');
+                    if (!string.IsNullOrWhiteSpace(className)
+                        && IsPrintableToken(className)
+                        && (className.Contains("String", StringComparison.Ordinal) || className.Contains("Guid", StringComparison.Ordinal)))
+                    {
+                        var decodedObjectString = ReadBinaryCatalogString(data, objectId, '/');
+                        if (!string.IsNullOrWhiteSpace(decodedObjectString) && IsPrintableToken(decodedObjectString))
+                        {
+                            return decodedObjectString;
+                        }
+                    }
+                }
+            }
+
+            // 2. Direct string ID (ASCII, Unicode, or dynamic path string)
+            var direct = ReadBinaryCatalogString(data, keyOffset, '/');
+            if (!string.IsNullOrWhiteSpace(direct) && IsPrintableToken(direct))
+            {
+                return direct;
+            }
+
+            return null;
+        }
+
+        private static bool IsSceneProvider(string? providerId)
+        {
+            if (string.IsNullOrWhiteSpace(providerId))
+            {
+                return false;
+            }
+
+            return providerId.Contains("SceneProvider", StringComparison.OrdinalIgnoreCase)
+                || providerId.Contains("BundledScene", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsScenePath(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            return StripQueryString(value.Trim()).EndsWith(".unity", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsBundleProvider(string? providerId)

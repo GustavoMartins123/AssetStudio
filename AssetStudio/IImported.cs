@@ -12,6 +12,8 @@ namespace AssetStudio
         List<ImportedTexture> TextureList { get; }
         List<ImportedKeyframedAnimation> AnimationList { get; }
         List<ImportedMorph> MorphList { get; }
+        List<ImportedCamera> CameraList => new List<ImportedCamera>(0);
+        List<ImportedLight> LightList => new List<ImportedLight>(0);
     }
 
     public class ImportedWrapper : IImported
@@ -22,6 +24,8 @@ namespace AssetStudio
         public List<ImportedTexture> TextureList { get; set; }
         public List<ImportedKeyframedAnimation> AnimationList { get; set; }
         public List<ImportedMorph> MorphList { get; set; }
+        public List<ImportedCamera> CameraList { get; set; }
+        public List<ImportedLight> LightList { get; set; }
 
         public ImportedWrapper(IImported source)
         {
@@ -31,7 +35,72 @@ namespace AssetStudio
             TextureList = source.TextureList;
             AnimationList = source.AnimationList;
             MorphList = source.MorphList;
+            CameraList = source.CameraList;
+            LightList = source.LightList;
         }
+    }
+
+    public sealed class ImportedScriptSpawnMetadata
+    {
+        public string ScriptClass { get; set; } = string.Empty;
+        public string FieldPath { get; set; } = string.Empty;
+        public string SourceKind { get; set; } = string.Empty;
+        public string Confidence { get; set; } = string.Empty;
+        public long OwnerPathId { get; set; }
+        public long AnchorTransformPathId { get; set; }
+        public string TargetFileName { get; set; } = string.Empty;
+        public long TargetPathId { get; set; }
+        public string TargetGuid { get; set; } = string.Empty;
+    }
+
+    public sealed class ImportedFrameExtras
+    {
+        public long PathId { get; set; }
+        public string SourceFile { get; set; } = string.Empty;
+        public ushort Tag { get; set; }
+        public int Layer { get; set; }
+        public bool IsActive { get; set; } = true;
+        public bool IsScriptSpawned { get; set; }
+        public ImportedScriptSpawnMetadata? ScriptSpawn { get; set; }
+    }
+
+    public class ImportedCamera
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Path { get; set; } = string.Empty;
+        public ImportedFrame? TargetFrame { get; set; }
+        public bool IsOrthographic { get; set; }
+        public float FieldOfViewDegrees { get; set; } = 60f;
+        public float OrthographicSize { get; set; } = 5f;
+        public float AspectRatio { get; set; }
+        public float NearClipPlane { get; set; } = 0.3f;
+        public float FarClipPlane { get; set; } = 1000f;
+        public uint ClearFlags { get; set; } = 1;
+        public float Depth { get; set; }
+        public bool Enabled { get; set; } = true;
+    }
+
+    public enum ImportedLightType
+    {
+        Directional = 0,
+        Point = 1,
+        Spot = 2,
+        Area = 3
+    }
+
+    public class ImportedLight
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Path { get; set; } = string.Empty;
+        public ImportedFrame? TargetFrame { get; set; }
+        public ImportedLightType Type { get; set; } = ImportedLightType.Point;
+        public Color Color { get; set; } = new Color(1f, 1f, 1f, 1f);
+        public float Intensity { get; set; } = 1f;
+        public float Range { get; set; } = 10f;
+        public float SpotAngleDegrees { get; set; } = 30f;
+        public float InnerSpotAngleDegrees { get; set; }
+        public int ShadowType { get; set; }
+        public bool Enabled { get; set; } = true;
     }
 
     public class ImportedFrame
@@ -41,6 +110,7 @@ namespace AssetStudio
         public Vector3 LocalPosition { get; set; }
         public Vector3 LocalScale { get; set; }
         public ImportedFrame? Parent { get; set; }
+        public ImportedFrameExtras? Extras { get; set; }
 
         private List<ImportedFrame> children;
 

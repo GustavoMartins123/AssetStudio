@@ -24,6 +24,8 @@ namespace AssetStudio
         public int TexturesCount { get; init; }
         public int SkinsCount { get; init; }
         public int AnimationsCount { get; init; }
+        public int CamerasCount { get; init; }
+        public int LightsCount { get; init; }
         public long OutputBytes { get; init; }
 
         public double InstancingPercent =>
@@ -93,6 +95,9 @@ namespace AssetStudio
         private readonly List<GltfTexture> _textures = new List<GltfTexture>();
         private readonly List<GltfImage> _images = new List<GltfImage>();
         private readonly List<GltfAnimation> _animations = new List<GltfAnimation>();
+        private readonly List<GltfCamera> _cameras = new List<GltfCamera>();
+        private readonly List<GltfLight> _lights = new List<GltfLight>();
+        private readonly HashSet<int> _animatedNodeIndices = new HashSet<int>();
         private readonly HashSet<string> _extensionsUsed = new HashSet<string>(StringComparer.Ordinal);
 
         private readonly List<System.Numerics.Matrix4x4> _nodeGlobalRowMatrices = new List<System.Numerics.Matrix4x4>();
@@ -211,6 +216,18 @@ namespace AssetStudio
                     }
                 }
 
+                for (int a = 0; a < _animations.Count; a++)
+                {
+                    var channels = _animations[a].Channels;
+                    for (int c = 0; c < channels.Count; c++)
+                    {
+                        _animatedNodeIndices.Add(channels[c].TargetNode);
+                    }
+                }
+
+                ExportCameras(imported.CameraList);
+                ExportLights(imported.LightList);
+
                 WriteOutput(exportPath);
 
                 long outputBytes = 0;
@@ -237,6 +254,8 @@ namespace AssetStudio
                     TexturesCount = _textures.Count,
                     SkinsCount = _skins.Count,
                     AnimationsCount = _animations.Count,
+                    CamerasCount = _cameras.Count,
+                    LightsCount = _lights.Count,
                     OutputBytes = outputBytes
                 };
             }
@@ -258,6 +277,9 @@ namespace AssetStudio
             _textures.Clear();
             _images.Clear();
             _animations.Clear();
+            _cameras.Clear();
+            _lights.Clear();
+            _animatedNodeIndices.Clear();
             _extensionsUsed.Clear();
             _nodeGlobalRowMatrices.Clear();
             _nodeParentIndices.Clear();
@@ -323,7 +345,8 @@ namespace AssetStudio
                 Name = string.IsNullOrEmpty(frame.Name) ? $"Node_{nodeIdx}" : frame.Name,
                 Translation = IsNearlyZero(translation) ? null : translation,
                 Rotation = IsNearlyIdentity(rotation) ? null : rotation,
-                Scale = IsNearlyOne(scale) ? null : scale
+                Scale = IsNearlyOne(scale) ? null : scale,
+                Extras = frame.Extras
             };
             _nodes.Add(node);
             _nodeGlobalRowMatrices.Add(globalRow);
@@ -3015,6 +3038,10 @@ namespace AssetStudio
                         {
                             w.WriteNumber("skin", n.Skin.Value);
                         }
+                        if (n.Camera.HasValue)
+                        {
+                            w.WriteNumber("camera", n.Camera.Value);
+                        }
                         if (n.Children.Count > 0)
                         {
                             w.WriteStartArray("children");
@@ -3051,6 +3078,18 @@ namespace AssetStudio
                             w.WriteNumberValue(SanitizeScaleFloat(s.Y));
                             w.WriteNumberValue(SanitizeScaleFloat(s.Z));
                             w.WriteEndArray();
+                        }
+                        if (n.Light.HasValue)
+                        {
+                            w.WriteStartObject("extensions");
+                            w.WriteStartObject("KHR_lights_punctual");
+                            w.WriteNumber("light", n.Light.Value);
+                            w.WriteEndObject();
+                            w.WriteEndObject();
+                        }
+                        if (n.Extras != null)
+                        {
+                            WriteNodeExtras(w, n.Extras);
                         }
                         w.WriteEndObject();
                     }
@@ -3385,6 +3424,96 @@ namespace AssetStudio
                     w.WriteEndArray();
                 }
 
+                // cameras
+                if (_cameras.Count > 0)
+                {
+                    w.WriteStartArray("cameras");
+                    for (int i = 0; i < _cameras.Count; i++)
+                    {
+                        var cam = _cameras[i];
+                        w.WriteStartObject();
+                        if (!string.IsNullOrEmpty(cam.Name))
+                        {
+                            w.WriteString("name", cam.Name);
+                        }
+
+                        if (cam.IsOrthographic)
+                        {
+                            w.WriteString("type", "orthographic");
+                            w.WriteStartObject("orthographic");
+                            w.WriteNumber("xmag", SanitizeFloat(cam.XMag, 5f));
+                            w.WriteNumber("ymag", SanitizeFloat(cam.YMag, 5f));
+                            w.WriteNumber("zfar", SanitizeFloat(cam.ZFar, 1000f));
+                            w.WriteNumber("znear", SanitizeFloat(cam.ZNear, 0.3f));
+                            w.WriteEndObject();
+                        }
+                        else
+                        {
+                            w.WriteString("type", "perspective");
+                            w.WriteStartObject("perspective");
+                            if (cam.AspectRatio.HasValue && cam.AspectRatio.Value > 0f)
+                            {
+                                w.WriteNumber("aspectRatio", SanitizeFloat(cam.AspectRatio.Value, 1f));
+                            }
+                            w.WriteNumber("yfov", SanitizeFloat(cam.YFovRadians, 1.0471976f));
+                            if (cam.ZFar > cam.ZNear)
+                            {
+                                w.WriteNumber("zfar", SanitizeFloat(cam.ZFar, 1000f));
+                            }
+                            w.WriteNumber("znear", SanitizeFloat(cam.ZNear, 0.3f));
+                            w.WriteEndObject();
+                        }
+
+                        w.WriteEndObject();
+                    }
+                    w.WriteEndArray();
+                }
+
+                // root extensions (KHR_lights_punctual)
+                if (_lights.Count > 0)
+                {
+                    w.WriteStartObject("extensions");
+                    w.WriteStartObject("KHR_lights_punctual");
+                    w.WriteStartArray("lights");
+                    for (int i = 0; i < _lights.Count; i++)
+                    {
+                        var light = _lights[i];
+                        w.WriteStartObject();
+                        if (!string.IsNullOrEmpty(light.Name))
+                        {
+                            w.WriteString("name", light.Name);
+                        }
+                        w.WriteString("type", light.Type);
+                        w.WriteStartArray("color");
+                        w.WriteNumberValue(Clamp01(light.Color[0]));
+                        w.WriteNumberValue(Clamp01(light.Color[1]));
+                        w.WriteNumberValue(Clamp01(light.Color[2]));
+                        w.WriteEndArray();
+                        w.WriteNumber("intensity", Math.Max(0f, SanitizeFloat(light.Intensity, 1f)));
+                        if (light.Range.HasValue && light.Range.Value > 0f && !string.Equals(light.Type, "directional", StringComparison.Ordinal))
+                        {
+                            w.WriteNumber("range", SanitizeFloat(light.Range.Value));
+                        }
+                        if (string.Equals(light.Type, "spot", StringComparison.Ordinal))
+                        {
+                            w.WriteStartObject("spot");
+                            w.WriteNumber("innerConeAngle", SanitizeFloat(light.InnerConeAngleRadians));
+                            w.WriteNumber("outerConeAngle", SanitizeFloat(light.OuterConeAngleRadians, 0.2617994f));
+                            w.WriteEndObject();
+                        }
+                        if (!string.IsNullOrEmpty(light.UnityOriginalType))
+                        {
+                            w.WriteStartObject("extras");
+                            w.WriteString("unityLightType", light.UnityOriginalType);
+                            w.WriteEndObject();
+                        }
+                        w.WriteEndObject();
+                    }
+                    w.WriteEndArray();
+                    w.WriteEndObject();
+                    w.WriteEndObject();
+                }
+
                 // buffers
                 if (binByteLength > 0)
                 {
@@ -3403,6 +3532,277 @@ namespace AssetStudio
             }
 
             return ms.ToArray();
+        }
+
+        private static void WriteNodeExtras(Utf8JsonWriter w, ImportedFrameExtras extras)
+        {
+            w.WriteStartObject("extras");
+            w.WriteNumber("pathId", extras.PathId);
+            w.WriteString("sourceFile", extras.SourceFile ?? string.Empty);
+            w.WriteNumber("tag", extras.Tag);
+            w.WriteNumber("layer", extras.Layer);
+            if (!extras.IsActive)
+            {
+                w.WriteBoolean("isActive", false);
+            }
+            if (extras.IsScriptSpawned)
+            {
+                w.WriteBoolean("scriptSpawned", true);
+                if (extras.ScriptSpawn != null)
+                {
+                    var s = extras.ScriptSpawn;
+                    w.WriteStartObject("scriptSpawn");
+                    w.WriteString("scriptClass", s.ScriptClass ?? string.Empty);
+                    w.WriteString("fieldPath", s.FieldPath ?? string.Empty);
+                    w.WriteString("sourceKind", s.SourceKind ?? string.Empty);
+                    w.WriteString("confidence", s.Confidence ?? string.Empty);
+                    w.WriteNumber("ownerPathId", s.OwnerPathId);
+                    if (s.AnchorTransformPathId != 0)
+                    {
+                        w.WriteNumber("anchorTransformPathId", s.AnchorTransformPathId);
+                    }
+                    if (!string.IsNullOrEmpty(s.TargetFileName))
+                    {
+                        w.WriteString("targetFileName", s.TargetFileName);
+                    }
+                    if (s.TargetPathId != 0)
+                    {
+                        w.WriteNumber("targetPathId", s.TargetPathId);
+                    }
+                    if (!string.IsNullOrEmpty(s.TargetGuid))
+                    {
+                        w.WriteString("targetGuid", s.TargetGuid);
+                    }
+                    w.WriteEndObject();
+                }
+            }
+            w.WriteEndObject();
+        }
+
+        private void ExportCameras(List<ImportedCamera>? cameraList)
+        {
+            if (cameraList == null || cameraList.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < cameraList.Count; i++)
+            {
+                var cam = cameraList[i];
+                if (cam == null)
+                {
+                    continue;
+                }
+
+                int targetNodeIdx = ResolveComponentTargetNodeIndex(cam.TargetFrame, cam.Path, cam.Name);
+                int cameraIdx = _cameras.Count;
+
+                float nearClip = SanitizeFloat(cam.NearClipPlane, 0.3f);
+                float farClip = SanitizeFloat(cam.FarClipPlane, 1000f);
+
+                if (cam.IsOrthographic)
+                {
+                    float orthoNear = Math.Max(0f, nearClip);
+                    float orthoFar = farClip > orthoNear ? farClip : orthoNear + 1000f;
+                    float yMag = SanitizeFloat(cam.OrthographicSize, 5f);
+                    if (yMag <= 1e-4f)
+                    {
+                        yMag = 5f;
+                    }
+                    yMag *= _scaleFactor;
+                    float aspect = float.IsFinite(cam.AspectRatio) && cam.AspectRatio > 1e-4f ? cam.AspectRatio : 1f;
+                    float xMag = yMag * aspect;
+
+                    _cameras.Add(new GltfCamera
+                    {
+                        Name = string.IsNullOrWhiteSpace(cam.Name) ? $"Camera_{cameraIdx}" : cam.Name,
+                        IsOrthographic = true,
+                        XMag = xMag,
+                        YMag = yMag,
+                        ZNear = orthoNear * _scaleFactor,
+                        ZFar = orthoFar * _scaleFactor
+                    });
+                }
+                else
+                {
+                    float perspNear = Math.Max(1e-4f, nearClip) * _scaleFactor;
+                    float perspFar = farClip > nearClip && farClip > 0f ? farClip * _scaleFactor : 0f;
+                    float fovDeg = SanitizeFloat(cam.FieldOfViewDegrees, 60f);
+                    if (fovDeg <= 0f || fovDeg >= 180f)
+                    {
+                        fovDeg = 60f;
+                    }
+                    fovDeg = Math.Clamp(fovDeg, 0.1f, 179.9f);
+                    float yFovRad = DegreesToRadians(fovDeg);
+
+                    _cameras.Add(new GltfCamera
+                    {
+                        Name = string.IsNullOrWhiteSpace(cam.Name) ? $"Camera_{cameraIdx}" : cam.Name,
+                        IsOrthographic = false,
+                        AspectRatio = float.IsFinite(cam.AspectRatio) && cam.AspectRatio > 1e-4f ? cam.AspectRatio : null,
+                        YFovRadians = yFovRad,
+                        ZNear = perspNear,
+                        ZFar = perspFar
+                    });
+                }
+
+                // glTF cameras look down local -Z; Unity cameras look down local +Z (preserved after ModelConverter X-reflection).
+                // Apply a 180-degree local Y rotation either directly on an empty leaf node or via a child orientation node.
+                int attachNodeIdx = AcquireOrientedComponentNode(targetNodeIdx, needsNegativeZFlip: true, suffix: "Camera", isCamera: true);
+                _nodes[attachNodeIdx].Camera = cameraIdx;
+            }
+        }
+
+        private void ExportLights(List<ImportedLight>? lightList)
+        {
+            if (lightList == null || lightList.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < lightList.Count; i++)
+            {
+                var light = lightList[i];
+                if (light == null)
+                {
+                    continue;
+                }
+
+                int targetNodeIdx = ResolveComponentTargetNodeIndex(light.TargetFrame, light.Path, light.Name);
+                int lightIdx = _lights.Count;
+
+                string gltfLightType;
+                string? unityOriginalType = null;
+                bool needsOrientationFlip;
+                switch (light.Type)
+                {
+                    case ImportedLightType.Directional:
+                        gltfLightType = "directional";
+                        needsOrientationFlip = true;
+                        break;
+                    case ImportedLightType.Spot:
+                        gltfLightType = "spot";
+                        needsOrientationFlip = true;
+                        break;
+                    case ImportedLightType.Area:
+                        // KHR_lights_punctual supports directional, point, and spot only; degrade Area cleanly to point with metadata.
+                        gltfLightType = "point";
+                        unityOriginalType = "Area";
+                        needsOrientationFlip = false;
+                        break;
+                    default:
+                        gltfLightType = "point";
+                        needsOrientationFlip = false;
+                        break;
+                }
+
+                float intensity = Math.Max(0f, SanitizeFloat(light.Intensity, 1f));
+                float? range = null;
+                if (!string.Equals(gltfLightType, "directional", StringComparison.Ordinal))
+                {
+                    float rawRange = SanitizeFloat(light.Range, 0f);
+                    if (rawRange > 0f)
+                    {
+                        range = rawRange * _scaleFactor;
+                    }
+                }
+
+                float innerConeRad = 0f;
+                float outerConeRad = 0f;
+                if (string.Equals(gltfLightType, "spot", StringComparison.Ordinal))
+                {
+                    // Unity spotAngle / innerSpotAngle are FULL cone angles in degrees;
+                    // KHR_lights_punctual requires HALF cone angles in radians with 0 <= innerConeAngle < outerConeAngle <= PI/2.
+                    float outerDeg = SanitizeFloat(light.SpotAngleDegrees, 30f);
+                    if (outerDeg <= 0f)
+                    {
+                        outerDeg = 30f;
+                    }
+                    outerConeRad = Math.Clamp(DegreesToRadians(outerDeg * 0.5f), 0.001f, MathF.PI * 0.5f);
+
+                    float innerDeg = SanitizeFloat(light.InnerSpotAngleDegrees, 0f);
+                    if (innerDeg > 0f)
+                    {
+                        float maxInner = Math.Max(0f, outerConeRad - 1e-4f);
+                        innerConeRad = Math.Clamp(DegreesToRadians(innerDeg * 0.5f), 0f, maxInner);
+                    }
+                }
+
+                _lights.Add(new GltfLight
+                {
+                    Name = string.IsNullOrWhiteSpace(light.Name) ? $"Light_{lightIdx}" : light.Name,
+                    Type = gltfLightType,
+                    Color = new[]
+                    {
+                        Clamp01(SanitizeFloat(light.Color.R, 1f)),
+                        Clamp01(SanitizeFloat(light.Color.G, 1f)),
+                        Clamp01(SanitizeFloat(light.Color.B, 1f))
+                    },
+                    Intensity = intensity,
+                    Range = range,
+                    InnerConeAngleRadians = innerConeRad,
+                    OuterConeAngleRadians = outerConeRad,
+                    UnityOriginalType = unityOriginalType
+                });
+
+                _extensionsUsed.Add("KHR_lights_punctual");
+
+                int attachNodeIdx = AcquireOrientedComponentNode(targetNodeIdx, needsOrientationFlip, suffix: "Light", isCamera: false);
+                _nodes[attachNodeIdx].Light = lightIdx;
+            }
+        }
+
+        private int ResolveComponentTargetNodeIndex(ImportedFrame? targetFrame, string? path, string? fallbackName)
+        {
+            if (targetFrame != null && _nodeByFrame.TryGetValue(targetFrame, out int frameNodeIdx))
+            {
+                return frameNodeIdx;
+            }
+
+            if (TryResolveNodeIndex(path, out int pathNodeIdx))
+            {
+                return pathNodeIdx;
+            }
+
+            int rootParent = _sceneRootNodes.Count > 0 ? _sceneRootNodes[0] : -1;
+            return CreateExtraNode(string.IsNullOrWhiteSpace(fallbackName) ? "SceneNode" : fallbackName, rootParent);
+        }
+
+        private int AcquireOrientedComponentNode(int targetNodeIdx, bool needsNegativeZFlip, string suffix, bool isCamera)
+        {
+            var node = _nodes[targetNodeIdx];
+            bool slotTaken = isCamera ? node.Camera.HasValue : node.Light.HasValue;
+
+            if (!needsNegativeZFlip)
+            {
+                if (!slotTaken)
+                {
+                    return targetNodeIdx;
+                }
+
+                return CreateExtraNode($"{node.Name}_{suffix}", targetNodeIdx);
+            }
+
+            bool canModifyNodeRotationInPlace =
+                !slotTaken
+                && !node.Mesh.HasValue
+                && !node.Camera.HasValue
+                && !node.Light.HasValue
+                && node.Children.Count == 0
+                && !_animatedNodeIndices.Contains(targetNodeIdx);
+
+            var flipY180 = System.Numerics.Matrix4x4.CreateRotationY(MathF.PI);
+            if (canModifyNodeRotationInPlace)
+            {
+                var currentRot = node.Rotation ?? System.Numerics.Quaternion.Identity;
+                // Row-vector convention: child local R_y(180) applied before parent R maps glTF -Z -> parent +Z (Unity forward).
+                var composedMat = flipY180 * System.Numerics.Matrix4x4.CreateFromQuaternion(currentRot);
+                var composedRot = NormalizeQuaternionSafe(System.Numerics.Quaternion.CreateFromRotationMatrix(composedMat));
+                node.Rotation = IsNearlyIdentity(composedRot) ? null : composedRot;
+                return targetNodeIdx;
+            }
+
+            return CreateExtraNode($"{node.Name}_{suffix}", targetNodeIdx, localRow: flipY180);
         }
 
         private static void WriteTextureInfo(
@@ -3732,10 +4132,37 @@ namespace AssetStudio
             public string Name = string.Empty;
             public int? Mesh;
             public int? Skin;
+            public int? Camera;
+            public int? Light;
             public System.Numerics.Vector3? Translation;
             public System.Numerics.Quaternion? Rotation;
             public System.Numerics.Vector3? Scale;
             public List<int> Children = new List<int>();
+            public ImportedFrameExtras? Extras;
+        }
+
+        private sealed class GltfCamera
+        {
+            public string Name = string.Empty;
+            public bool IsOrthographic;
+            public float? AspectRatio;
+            public float YFovRadians;
+            public float XMag;
+            public float YMag;
+            public float ZNear;
+            public float ZFar;
+        }
+
+        private sealed class GltfLight
+        {
+            public string Name = string.Empty;
+            public string Type = "point";
+            public float[] Color = { 1f, 1f, 1f };
+            public float Intensity = 1f;
+            public float? Range;
+            public float InnerConeAngleRadians;
+            public float OuterConeAngleRadians;
+            public string? UnityOriginalType;
         }
 
         private sealed class GltfMesh
