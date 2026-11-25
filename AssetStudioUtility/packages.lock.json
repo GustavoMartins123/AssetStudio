@@ -43,7 +43,8 @@
       "assetstudio": {
         "type": "Project",
         "dependencies": {
-          "K4os.Compression.LZ4": "[1.2.16, )"
+          "K4os.Compression.LZ4": "[1.2.16, )",
+          "ZstdSharp.Port": "[0.8.8, )"
         }
       },
       "texture2ddecoderwrapper": {
@@ -54,6 +55,12 @@
         "requested": "[1.2.16, )",
         "resolved": "1.2.16",
         "contentHash": "XLNQWNayxeMgd1gv0s6kZywM11kww7rTzu3nPGh8fQNblHGbFt79LC1Sk1/QQ8DIJb2Qfl2p+WlLIOWCSuyi8w=="
+      },
+      "ZstdSharp.Port": {
+        "type": "CentralTransitive",
+        "requested": "[0.8.8, )",
+        "resolved": "0.8.8",
+        "contentHash": "UIDFkA5DC3en3tOJ3Mof11yBx9kUQLsaeo/oFdvN6Bbkr9E9+VCqfIadHci8cu+I51K2Sl7XYWVl2R/mA75NBQ=="
       }
     },
     "net10.0/linux-x64": {

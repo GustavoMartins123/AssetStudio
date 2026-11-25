@@ -14,7 +14,7 @@ using Xunit;
 
 namespace AssetStudio.Tests
 {
-    public sealed class FormatsAndCliTests
+    public sealed partial class FormatsAndCliTests
     {
         private delegate int CliRunDelegate(string[] args, TextWriter stdout, TextWriter stderr);
 

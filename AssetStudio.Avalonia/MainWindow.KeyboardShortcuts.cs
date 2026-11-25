@@ -65,7 +65,7 @@ public partial class MainWindow
             }
         }
 
-        if (e.KeyModifiers == KeyModifiers.Control && (currentPreviewTexture != null || currentPreviewSprite != null))
+        if (e.KeyModifiers == KeyModifiers.Control && (currentPreviewTexture != null || currentPreviewSprite != null || currentPreviewTextureArray != null))
         {
             bool handled = false;
             switch (e.Key)

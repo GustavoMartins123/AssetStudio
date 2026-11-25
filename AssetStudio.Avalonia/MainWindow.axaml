@@ -959,6 +959,17 @@
                                                   IsMaterialShaderPreview="{Binding PreviewSession.ShaderPreview.IsActive}"
                                                   MaterialShaderFrame="{Binding PreviewSession.ShaderPreview.Frame}" />
                         <local:TextureGLPreviewControl x:Name="TextureGLPreview" IsVisible="False" Focusable="True" />
+                        <Border x:Name="TextureArraySliceBar" Classes="overlay-panel" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,8,0,0" IsVisible="{Binding $parent[local:MainWindow].TextureArraySlice.IsVisible}">
+                            <StackPanel Orientation="Horizontal" Spacing="6" Margin="8,4">
+                                <Button Content="◀" Width="26" Height="24" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" Command="{Binding $parent[local:MainWindow].TextureArraySlice.PreviousSliceCommand}" ToolTip.Tip="Previous slice" />
+                                <Slider x:Name="TextureArraySliceSlider" Width="180" Minimum="0" TickFrequency="1" IsSnapToTickEnabled="True" Focusable="False" VerticalAlignment="Center"
+                                        Maximum="{Binding $parent[local:MainWindow].TextureArraySlice.MaxSliceIndex}"
+                                        IsEnabled="{Binding $parent[local:MainWindow].TextureArraySlice.HasMultipleSlices}"
+                                        Value="{Binding $parent[local:MainWindow].TextureArraySlice.SliceIndex, Mode=TwoWay}" />
+                                <Button Content="▶" Width="26" Height="24" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" Command="{Binding $parent[local:MainWindow].TextureArraySlice.NextSliceCommand}" ToolTip.Tip="Next slice" />
+                                <TextBlock x:Name="TextureArraySliceText" MinWidth="90" VerticalAlignment="Center" Foreground="{DynamicResource AppOverlayTextBrush}" FontSize="11" Text="{Binding $parent[local:MainWindow].TextureArraySlice.SliceText}" />
+                            </StackPanel>
+                        </Border>
                         <Border x:Name="PreviewInfoBorder" Classes="overlay-panel" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="{Binding PreviewSession.IsInfoOverlayVisible}">
                             <Grid RowDefinitions="Auto,*">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="8,4,8,4">

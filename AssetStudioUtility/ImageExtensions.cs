@@ -361,6 +361,19 @@ namespace AssetStudio
             }
         }
 
+        public static void WriteToStream(this SKBitmap image, Stream stream, ImageFormat imageFormat, int webpQuality, bool webpLossless)
+        {
+            if (imageFormat != ImageFormat.Webp)
+            {
+                image.WriteToStream(stream, imageFormat);
+                return;
+            }
+
+            if (image == null) throw new ArgumentNullException(nameof(image));
+            if (stream == null) throw new ArgumentNullException(nameof(stream));
+            WriteWebp(image, stream, webpQuality, webpLossless);
+        }
+
         public static MemoryStream ConvertToStream(this SKBitmap image, ImageFormat imageFormat)
         {
             var stream = new MemoryStream();

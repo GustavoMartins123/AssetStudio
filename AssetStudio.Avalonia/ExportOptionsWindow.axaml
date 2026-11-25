@@ -25,6 +25,21 @@
                           SelectedIndex="{Binding TextureFormatIndex, Mode=TwoWay}" />
             </StackPanel>
 
+            <StackPanel Spacing="6" IsVisible="{Binding IsWebpFormatSelected}">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="WebP quality" Width="130" VerticalAlignment="Center" />
+                    <Slider Width="180"
+                            Minimum="0"
+                            Maximum="100"
+                            TickFrequency="1"
+                            IsSnapToTickEnabled="True"
+                            Value="{Binding WebpQuality, Mode=TwoWay}" />
+                    <TextBlock Text="{Binding WebpQuality}" VerticalAlignment="Center" />
+                </StackPanel>
+                <CheckBox Content="Lossless WebP (exact pixels, larger files)"
+                          IsChecked="{Binding WebpLossless, Mode=TwoWay}" />
+            </StackPanel>
+
             <CheckBox Content="Convert AudioClip to WAV(PCM)"
                       IsChecked="{Binding ConvertAudio, Mode=TwoWay}" />
             <CheckBox Content="Restore extension name"

@@ -18,6 +18,8 @@ public sealed class ExportOptionsState
     public AssetGroupOption AssetGrouping { get; set; } = AssetGroupOption.TypeName;
     public bool ConvertTexture { get; set; } = true;
     public ImageFormat ConvertTextureFormat { get; set; } = ImageFormat.Png;
+    public int WebpQuality { get; set; } = 90;
+    public bool WebpLossless { get; set; }
     public bool ConvertAudio { get; set; } = true;
     public bool RestoreExtensionName { get; set; } = true;
     public bool OpenAfterExport { get; set; } = true;
@@ -51,6 +53,8 @@ public sealed class ExportOptionsState
         AssetGrouping = other.AssetGrouping;
         ConvertTexture = other.ConvertTexture;
         ConvertTextureFormat = other.ConvertTextureFormat;
+        WebpQuality = other.WebpQuality;
+        WebpLossless = other.WebpLossless;
         ConvertAudio = other.ConvertAudio;
         RestoreExtensionName = other.RestoreExtensionName;
         OpenAfterExport = other.OpenAfterExport;

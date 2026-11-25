@@ -829,6 +829,7 @@ public partial class MainWindow : Window
         currentPreviewAnimationClip = null;
         currentPreviewTexture = null;
         currentPreviewSprite = null;
+        ResetTextureArrayPreview();
         currentPreviewAudioClip = null;
         currentPreviewVideoClip = null;
 
@@ -854,6 +855,9 @@ public partial class MainWindow : Window
                     break;
                 case Texture2D m_Texture2D:
                     PreviewTexture2D(assetItem, m_Texture2D);
+                    break;
+                case Texture2DArray m_Texture2DArray:
+                    PreviewTexture2DArray(assetItem, m_Texture2DArray);
                     break;
                 case Sprite m_Sprite:
                     PreviewSprite(assetItem, m_Sprite);

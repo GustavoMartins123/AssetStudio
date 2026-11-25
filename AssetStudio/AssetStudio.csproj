@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <PackageReference Include="K4os.Compression.LZ4" />
+    <PackageReference Include="ZstdSharp.Port" />
   </ItemGroup>
 
 </Project>

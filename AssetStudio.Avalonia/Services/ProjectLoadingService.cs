@@ -34,6 +34,7 @@ namespace AssetStudio.Avalonia.Services
         {
             return type
                 is ClassIDType.Texture2D
+                or ClassIDType.Texture2DArray
                 or ClassIDType.AudioClip
                 or ClassIDType.VideoClip
                 or ClassIDType.VideoPlayer
@@ -334,6 +335,14 @@ namespace AssetStudio.Avalonia.Services
                         assetItem.FullSize = asset.byteSize + m_Texture2D.m_StreamData.size;
                     }
                     assetItem.Name = m_Texture2D.m_Name;
+                    exportable = true;
+                    break;
+                case Texture2DArray m_Texture2DArray:
+                    if (!string.IsNullOrEmpty(m_Texture2DArray.m_StreamData?.path))
+                    {
+                        assetItem.FullSize = asset.byteSize + m_Texture2DArray.m_StreamData.size;
+                    }
+                    assetItem.Name = m_Texture2DArray.m_Name;
                     exportable = true;
                     break;
                 case AudioClip m_AudioClip:
@@ -2244,11 +2253,43 @@ namespace AssetStudio.Avalonia.Services
                         lowMemoryThresholdOverride: null,
                         serializedFilesOnly: true);
 
-                    if (bundleFile.fileList != null)
+                    CollectFromBundleNodes(bundleFile);
+
+                    // Further bundles stored back to back in the same file (BUNDLE-02) belong to the same source file.
+                    foreach (var segment in BundleFile.FindFollowingSegments(reader.BaseStream, bundleFile))
                     {
-                        for (var i = 0; i < bundleFile.fileList.Length; i++)
+                        using var segmentReader = BundleFile.OpenSegmentReader(reader, segment);
+                        if (segmentReader.FileType != FileType.BundleFile)
                         {
-                            var streamFile = bundleFile.fileList[i];
+                            break;
+                        }
+
+                        using var segmentBundle = new BundleFile(
+                            segmentReader,
+                            decompressionCache: null,
+                            allowParallelDecompression: false,
+                            lowMemoryThresholdOverride: null,
+                            serializedFilesOnly: true);
+                        CollectFromBundleNodes(segmentBundle);
+                    }
+                }
+                else
+                {
+                    return;
+                }
+
+                if (externals.Count > 0 || bundleScenes.Count > 0 || heuristicScenes.Count > 0 || buildSettingsMappings.Count > 0)
+                {
+                    collector.RecordFile(filePath, externals, bundleScenes, heuristicScenes, buildSettingsMappings);
+                }
+
+                void CollectFromBundleNodes(BundleFile bundle)
+                {
+                    if (bundle.fileList != null)
+                    {
+                        for (var i = 0; i < bundle.fileList.Length; i++)
+                        {
+                            var streamFile = bundle.fileList[i];
                             if (streamFile?.stream == null || string.IsNullOrWhiteSpace(streamFile.path))
                             {
                                 continue;
@@ -2283,15 +2324,6 @@ namespace AssetStudio.Avalonia.Services
                             }
                         }
                     }
-                }
-                else
-                {
-                    return;
-                }
-
-                if (externals.Count > 0 || bundleScenes.Count > 0 || heuristicScenes.Count > 0 || buildSettingsMappings.Count > 0)
-                {
-                    collector.RecordFile(filePath, externals, bundleScenes, heuristicScenes, buildSettingsMappings);
                 }
             }
             catch (Exception ex)

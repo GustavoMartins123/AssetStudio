@@ -50,6 +50,8 @@ namespace AssetStudio.Avalonia.ViewModels
         private AssetGroupOption _assetGrouping;
         private bool _convertTexture;
         private ImageFormat _convertTextureFormat;
+        private int _webpQuality;
+        private bool _webpLossless;
         private bool _convertAudio;
         private bool _restoreExtensionName;
         private bool _openAfterExport;
@@ -141,8 +143,23 @@ namespace AssetStudio.Avalonia.ViewModels
                 {
                     OnPropertyChanged(nameof(TextureFormatIndex));
                     OnPropertyChanged(nameof(SelectedTextureFormatName));
+                    OnPropertyChanged(nameof(IsWebpFormatSelected));
                 }
             }
+        }
+
+        public bool IsWebpFormatSelected => _convertTextureFormat == ImageFormat.Webp;
+
+        public int WebpQuality
+        {
+            get => _webpQuality;
+            set => SetProperty(ref _webpQuality, Math.Clamp(value, 0, 100));
+        }
+
+        public bool WebpLossless
+        {
+            get => _webpLossless;
+            set => SetProperty(ref _webpLossless, value);
         }
 
         public int TextureFormatIndex
@@ -397,6 +414,8 @@ namespace AssetStudio.Avalonia.ViewModels
             AssetGrouping = source.AssetGrouping;
             ConvertTexture = source.ConvertTexture;
             ConvertTextureFormat = source.ConvertTextureFormat;
+            WebpQuality = source.WebpQuality;
+            WebpLossless = source.WebpLossless;
             ConvertAudio = source.ConvertAudio;
             RestoreExtensionName = source.RestoreExtensionName;
             OpenAfterExport = source.OpenAfterExport;
@@ -430,6 +449,8 @@ namespace AssetStudio.Avalonia.ViewModels
             destination.AssetGrouping = AssetGrouping;
             destination.ConvertTexture = ConvertTexture;
             destination.ConvertTextureFormat = ConvertTextureFormat;
+            destination.WebpQuality = WebpQuality;
+            destination.WebpLossless = WebpLossless;
             destination.ConvertAudio = ConvertAudio;
             destination.RestoreExtensionName = RestoreExtensionName;
             destination.OpenAfterExport = OpenAfterExport;

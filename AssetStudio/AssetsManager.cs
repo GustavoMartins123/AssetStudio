@@ -1018,6 +1018,8 @@ namespace AssetStudio
                         RegisterResourceFileReader(subReader, context, file.fileName, file.path, subReader.FullPath); //TODO
                     }
                 }
+
+                LoadFollowingBundleSegments(reader, bundleFile, context, originalPath ?? reader.FullPath);
             }
             catch (Exception e)
             {
@@ -1038,6 +1040,27 @@ namespace AssetStudio
             finally
             {
                 reader.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Loads UnityFS bundles stored back to back in one file (BUNDLE-02). Each following bundle is read
+        /// through a window over the same file under a virtual name, so it never shares a decompression cache
+        /// entry with the first bundle, while its assets keep the real file path so lazy mode can reopen them.
+        /// </summary>
+        private void LoadFollowingBundleSegments(FileReader reader, BundleFile firstBundle, LoadContext context, string physicalPath)
+        {
+            foreach (var segment in BundleFile.FindFollowingSegments(reader.BaseStream, firstBundle))
+            {
+                Logger.Info($"Found additional bundle {segment.Index} at offset 0x{segment.Offset:X} ({segment.Size} bytes) in {reader.FileName}");
+                var segmentReader = BundleFile.OpenSegmentReader(reader, segment);
+                if (segmentReader.FileType != FileType.BundleFile)
+                {
+                    segmentReader.Dispose();
+                    return;
+                }
+
+                LoadBundleFile(segmentReader, context, physicalPath);
             }
         }
 
@@ -1227,10 +1250,20 @@ namespace AssetStudio
                         }
                     }
 
-                    // load all entries
+                    // Load the entries (BUNDLE-08). Android packages keep everything Unity reads under an "assets/"
+                    // folder, so classes.dex, lib/*.so, res/ and META-INF/ are skipped instead of being decompressed
+                    // and held as resources. Entries stored without compression (how Android builds keep bundles,
+                    // serialized files and .resS) are read in place as a window over the package, with no copy.
+                    bool androidUnityPackage = IsAndroidUnityPackage(archive);
+                    var packagePath = (reader.BaseStream as FileStream)?.Name;
+                    var storedEntries = packagePath != null ? ZipStoredEntryIndex.TryCreate(reader.BaseStream) : null;
                     foreach (ZipArchiveEntry entry in archive.Entries)
                     {
                         if (string.IsNullOrEmpty(entry.Name))
+                        {
+                            continue;
+                        }
+                        if (androidUnityPackage && !IsInAndroidAssetsFolder(entry.FullName))
                         {
                             continue;
                         }
@@ -1239,9 +1272,17 @@ namespace AssetStudio
                         {
                             string dummyPath = BuildSafeContainerPath(zipEntryBaseDir, entry.FullName);
 
-                            using (Stream entryStream = entry.Open())
+                            if (storedEntries != null
+                                && storedEntries.TryGetStoredData(entry.FullName, out var dataOffset, out var dataSize))
                             {
-                                streamReader = ImportHelper.CopyDecompressedWithLimits(entryStream, dummyPath, "zipentry", Math.Max(0L, entry.Length));
+                                streamReader = new SubStream(packagePath!, dataOffset, dataSize);
+                            }
+                            else
+                            {
+                                using (Stream entryStream = entry.Open())
+                                {
+                                    streamReader = ImportHelper.CopyDecompressedWithLimits(entryStream, dummyPath, "zipentry", Math.Max(0L, entry.Length));
+                                }
                             }
 
                             FileReader entryReader = new FileReader(dummyPath, streamReader);
@@ -1272,6 +1313,27 @@ namespace AssetStudio
             {
                 reader.Dispose();
             }
+        }
+
+        private static bool IsAndroidUnityPackage(ZipArchive archive)
+        {
+            foreach (var entry in archive.Entries)
+            {
+                var name = entry.FullName;
+                if (name.StartsWith("assets/bin/Data/", StringComparison.Ordinal)
+                    || name.Contains("/assets/bin/Data/", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsInAndroidAssetsFolder(string entryFullName)
+        {
+            return entryFullName.StartsWith("assets/", StringComparison.Ordinal)
+                || entryFullName.Contains("/assets/", StringComparison.Ordinal);
         }
 
         private string GetSpecifiedUnityVersion()

@@ -877,7 +877,11 @@ namespace AssetStudio
                         }
                         break;
                     default:
-                        return false;
+                        if (!BundleFile.TryDecompressZstd(blocksInfoBytes, (int)uncompressedBlocksInfoSize, out uncompressedBytes))
+                        {
+                            return false;
+                        }
+                        break;
                 }
 
                 using var infoStream = new MemoryStream(uncompressedBytes, writable: false);

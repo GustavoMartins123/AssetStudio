@@ -437,7 +437,8 @@ namespace AssetStudio
             tempCachePath = null;
             targetCachePath = null;
             var uncompressedSizeSum = m_BlocksInfo.Sum(x => (long)x.uncompressedSize);
-            if (!string.IsNullOrEmpty(CacheDirectory) && !string.IsNullOrEmpty(path))
+            // Virtual paths (e.g. the second bundle stored inside one file) have no on-disk identity to key a cache entry on.
+            if (!string.IsNullOrEmpty(CacheDirectory) && !string.IsNullOrEmpty(path) && File.Exists(path))
             {
                 try
                 {
@@ -882,7 +883,17 @@ namespace AssetStudio
                         break;
                     }
                 default:
-                    throw new IOException($"Unsupported compression type {compressionType}");
+                    {
+                        if (!IsZstdFrame(blocksInfoBytes, blocksInfoBytes.Length))
+                        {
+                            throw new IOException($"Unsupported compression type {compressionType}");
+                        }
+
+                        var uncompressedBytes = new byte[uncompressedSize];
+                        DecompressZstdExact(null, blocksInfoBytes, blocksInfoBytes.Length, uncompressedBytes, (int)uncompressedSize);
+                        blocksInfoUncompresseddStream = new MemoryStream(uncompressedBytes);
+                        break;
+                    }
             }
             using (var blocksInfoReader = new EndianBinaryReader(blocksInfoUncompresseddStream))
             {
@@ -1657,6 +1668,7 @@ namespace AssetStudio
         {
             byte[]? compressedBuffer = null;
             byte[]? uncompressedBuffer = null;
+            ZstdSharp.Decompressor? zstdDecompressor = null;
             try
             {
                 foreach (var blockInfo in m_BlocksInfo)
@@ -1715,12 +1727,55 @@ namespace AssetStudio
                                 break;
                             }
                         default:
-                            throw new IOException($"Unsupported compression type {compressionType}");
+                            {
+                                // Custom engine builds may store Zstandard frames under a compression id Unity does not define.
+                                if (blockInfo.compressedSize < 4
+                                    || blockInfo.compressedSize > int.MaxValue
+                                    || blockInfo.uncompressedSize > int.MaxValue)
+                                {
+                                    throw new IOException($"Unsupported compression type {compressionType}");
+                                }
+
+                                var compressedSize = (int)blockInfo.compressedSize;
+                                if (compressedBuffer == null || compressedBuffer.Length < compressedSize)
+                                {
+                                    if (compressedBuffer != null)
+                                    {
+                                        var oldBuffer = compressedBuffer;
+                                        compressedBuffer = null;
+                                        BigArrayPool<byte>.Shared.Return(oldBuffer);
+                                    }
+                                    compressedBuffer = BigArrayPool<byte>.Shared.Rent(compressedSize);
+                                }
+                                ReadExact(reader, compressedBuffer, compressedSize);
+                                if (!IsZstdFrame(compressedBuffer, compressedSize))
+                                {
+                                    throw new IOException($"Unsupported compression type {compressionType}");
+                                }
+
+                                var uncompressedSize = (int)blockInfo.uncompressedSize;
+                                if (uncompressedBuffer == null || uncompressedBuffer.Length < uncompressedSize)
+                                {
+                                    if (uncompressedBuffer != null)
+                                    {
+                                        var oldBuffer = uncompressedBuffer;
+                                        uncompressedBuffer = null;
+                                        BigArrayPool<byte>.Shared.Return(oldBuffer);
+                                    }
+                                    uncompressedBuffer = BigArrayPool<byte>.Shared.Rent(uncompressedSize);
+                                }
+
+                                zstdDecompressor ??= new ZstdSharp.Decompressor();
+                                DecompressZstdExact(zstdDecompressor, compressedBuffer, compressedSize, uncompressedBuffer, uncompressedSize);
+                                blocksStream.Write(uncompressedBuffer, 0, uncompressedSize);
+                                break;
+                            }
                     }
                 }
             }
             finally
             {
+                zstdDecompressor?.Dispose();
                 if (compressedBuffer != null)
                 {
                     BigArrayPool<byte>.Shared.Return(compressedBuffer);
@@ -1731,6 +1786,203 @@ namespace AssetStudio
                 }
             }
             blocksStream.Position = 0;
+        }
+
+        public readonly record struct BundleSegment(int Index, long Offset, long Size);
+
+        private const int MaxBundleSegmentsPerFile = 4096;
+        private const int BundleSegmentSearchWindow = 64 * 1024;
+        private static readonly byte[] UnityFsSignatureBytes = "UnityFS\0"u8.ToArray();
+
+        /// <summary>
+        /// Finds UnityFS bundles stored back to back after <paramref name="firstBundle"/> in the same stream
+        /// (BUNDLE-02). A normal bundle declares its own length in the header, so nothing is read unless bytes
+        /// remain after it; only the gap right after each bundle is searched, and only bundle headers are read.
+        /// </summary>
+        public static System.Collections.Generic.IReadOnlyList<BundleSegment> FindFollowingSegments(Stream source, BundleFile firstBundle)
+        {
+            var segments = new System.Collections.Generic.List<BundleSegment>();
+            if (firstBundle.m_Header.signature != "UnityFS" || !source.CanSeek)
+            {
+                return segments;
+            }
+
+            long length = source.Length;
+            long next = firstBundle.m_Header.size;
+            long originalPosition = source.Position;
+            try
+            {
+                for (int index = 1; index <= MaxBundleSegmentsPerFile; index++)
+                {
+                    if (next <= 0 || next > length - UnityFsSignatureBytes.Length)
+                    {
+                        break;
+                    }
+
+                    long start = FindUnityFsSignature(source, next, Math.Min(length, next + BundleSegmentSearchWindow));
+                    if (start < 0
+                        || !TryReadUnityFsBundleSize(source, start, out long size)
+                        || size > length - start)
+                    {
+                        break;
+                    }
+
+                    segments.Add(new BundleSegment(index, start, size));
+                    next = start + size;
+                }
+            }
+            finally
+            {
+                source.Position = originalPosition;
+            }
+
+            return segments;
+        }
+
+        /// <summary>
+        /// Opens one bundle stored inside a larger file as a window over that file (no copy). The reader gets a
+        /// virtual path so per-file caches never confuse it with the first bundle of the same file.
+        /// </summary>
+        public static FileReader OpenSegmentReader(FileReader parent, BundleSegment segment)
+        {
+            var source = parent.BaseStream;
+            Stream view = source is FileStream fileStream
+                ? new SubStream(fileStream.Name, segment.Offset, segment.Size)
+                : source is SubStream { SharedHandle: not null } parentView
+                    ? new SubStream(parentView.SharedHandle, parentView.Offset + segment.Offset, segment.Size)
+                    : new SubStream(source, segment.Offset, segment.Size, syncRoot: source, leaveOpen: true);
+            return new FileReader($"{parent.FullPath}#bundle{segment.Index}@0x{segment.Offset:X}", view);
+        }
+
+        private static long FindUnityFsSignature(Stream source, long start, long end)
+        {
+            int windowLength = (int)Math.Max(0L, end - start);
+            if (windowLength < UnityFsSignatureBytes.Length)
+            {
+                return -1;
+            }
+
+            var buffer = ArrayPool<byte>.Shared.Rent(windowLength);
+            try
+            {
+                source.Position = start;
+                int read = 0;
+                while (read < windowLength)
+                {
+                    int n = source.Read(buffer, read, windowLength - read);
+                    if (n <= 0)
+                    {
+                        break;
+                    }
+                    read += n;
+                }
+
+                int index = buffer.AsSpan(0, read).IndexOf(UnityFsSignatureBytes);
+                return index >= 0 ? start + index : -1;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        private static bool TryReadUnityFsBundleSize(Stream source, long offset, out long size)
+        {
+            size = 0;
+            Span<byte> header = stackalloc byte[256];
+            source.Position = offset;
+            int read = source.Read(header);
+            if (read < UnityFsSignatureBytes.Length + 4)
+            {
+                return false;
+            }
+
+            var span = header.Slice(0, read);
+            int pos = UnityFsSignatureBytes.Length;
+            uint version = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(span.Slice(pos, 4));
+            pos += 4;
+            if (version < 6 || version > 16)
+            {
+                return false;
+            }
+
+            for (int field = 0; field < 2; field++)
+            {
+                int terminator = span.Slice(pos).IndexOf((byte)0);
+                if (terminator < 0)
+                {
+                    return false;
+                }
+                pos += terminator + 1;
+            }
+
+            if (pos + 8 > span.Length)
+            {
+                return false;
+            }
+
+            size = System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(span.Slice(pos, 8));
+            return size > pos;
+        }
+
+        private const uint ZstdFrameMagic = 0xFD2FB528;
+
+        /// <summary>
+        /// Recognizes a Zstandard frame by its magic number. Zstd blocks are only ever detected this way,
+        /// never from the compression id alone, because Unity does not define an id for Zstd.
+        /// </summary>
+        public static bool IsZstdFrame(byte[] data, int length)
+        {
+            return length >= 4
+                && data.Length >= 4
+                && ((uint)data[0] | ((uint)data[1] << 8) | ((uint)data[2] << 16) | ((uint)data[3] << 24)) == ZstdFrameMagic;
+        }
+
+        public static bool TryDecompressZstd(byte[] source, int uncompressedSize, out byte[] uncompressed)
+        {
+            uncompressed = Array.Empty<byte>();
+            if (uncompressedSize < 0 || !IsZstdFrame(source, source.Length))
+            {
+                return false;
+            }
+
+            try
+            {
+                var buffer = new byte[uncompressedSize];
+                DecompressZstdExact(null, source, source.Length, buffer, uncompressedSize);
+                uncompressed = buffer;
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or ZstdSharp.ZstdException or ArgumentException)
+            {
+                return false;
+            }
+        }
+
+        private static void DecompressZstdExact(ZstdSharp.Decompressor? decompressor, byte[] source, int sourceLength, byte[] destination, int destinationLength)
+        {
+            int written;
+            try
+            {
+                if (decompressor != null)
+                {
+                    written = decompressor.Unwrap(source, 0, sourceLength, destination, 0, destinationLength);
+                }
+                else
+                {
+                    using var oneShot = new ZstdSharp.Decompressor();
+                    written = oneShot.Unwrap(source, 0, sourceLength, destination, 0, destinationLength);
+                }
+            }
+            catch (ZstdSharp.ZstdException ex)
+            {
+                throw new IOException($"Zstd decompression error: {ex.Message}", ex);
+            }
+
+            if (written != destinationLength)
+            {
+                throw new IOException($"Zstd decompression error, write {written} bytes but expected {destinationLength} bytes");
+            }
         }
 
         private static void CopyExact(Stream source, Stream destination, long byteCount)

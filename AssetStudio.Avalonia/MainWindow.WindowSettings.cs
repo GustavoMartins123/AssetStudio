@@ -197,6 +197,7 @@ public partial class MainWindow
         VideoReset();
         currentPreviewTexture = null;
         currentPreviewSprite = null;
+        ResetTextureArrayPreview();
         Volatile.Write(ref _spriteDependenciesLoadedFor, null);
         currentPreviewMesh = null;
         currentPreviewAvatar = null;

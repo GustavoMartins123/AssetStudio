@@ -438,7 +438,9 @@ public partial class MainWindow
     {
         var previewTexture = currentPreviewTexture;
         var previewSprite = currentPreviewSprite;
-        if (previewTexture == null && previewSprite == null)
+        var previewTextureArray = currentPreviewTextureArray;
+        var previewTextureArraySlice = currentPreviewTextureArraySlice;
+        if (previewTexture == null && previewSprite == null && previewTextureArray == null)
             return;
 
         Interlocked.Increment(ref texturePreviewIdCounter);
@@ -481,6 +483,14 @@ public partial class MainWindow
 
                         // Perform .resS I/O, Crunch unpack, and CPU fallback decode (e.g., ASTC) strictly off the UI/GL thread.
                         preparedPayload = TextureGLPreviewControl.PrepareGpuTexturePayload(previewTexture, glCapabilities, token);
+                    }
+                    else if (previewTextureArray != null)
+                    {
+                        using var sliceImage = DecodeTextureArraySliceForPreview(previewTextureArray, previewTextureArraySlice)
+                            ?? throw new InvalidOperationException(DescribeTextureArrayFailure(previewTextureArray));
+                        token.ThrowIfCancellationRequested();
+                        infoText = BuildTextureArrayPreviewInfo(previewTextureArray, previewTextureArraySlice);
+                        preparedPayload = TextureGLPreviewControl.PrepareGpuImagePayload(sliceImage, glCapabilities, token);
                     }
                     else
                     {
@@ -586,12 +596,13 @@ public partial class MainWindow
         {
             TexturePreviewImageResult? cachedTextureResult = null;
             SKBitmap? ownedSpriteImage = null;
+            SKBitmap? ownedTextureArrayImage = null;
             try
             {
                 token.ThrowIfCancellationRequested();
                 SKBitmap? image = null;
                 string infoText = string.Empty;
-                bool isTexture = previewTexture != null;
+                bool isTexture = previewTexture != null || previewTextureArray != null;
                 bool previewFromCache = false;
                 bool previewDownscaled = false;
 
@@ -626,6 +637,22 @@ public partial class MainWindow
                         }
                     }
                 }
+                else if (previewTextureArray != null)
+                {
+                    ownedTextureArrayImage = DecodeTextureArraySliceForPreview(previewTextureArray, previewTextureArraySlice);
+                    if (ownedTextureArrayImage != null)
+                    {
+                        SKBitmap sliceImage = ownedTextureArrayImage;
+                        previewDownscaled = LimitInlinePreviewImage(ref sliceImage);
+                        ownedTextureArrayImage = sliceImage;
+                        image = sliceImage;
+                        infoText = BuildTextureArrayPreviewInfo(previewTextureArray, previewTextureArraySlice);
+                        if (previewDownscaled)
+                        {
+                            infoText += $"\nPreview texture downscaled to {image.Width}x{image.Height}";
+                        }
+                    }
+                }
                 else if (previewSprite != null)
                 {
                     EnsureSpriteDependenciesInBackground(previewSprite, token);
@@ -646,6 +673,10 @@ public partial class MainWindow
                     if (previewTexture != null)
                     {
                         failReason = $"Unsupported Texture Format: {previewTexture.m_TextureFormat}";
+                    }
+                    else if (previewTextureArray != null)
+                    {
+                        failReason = DescribeTextureArrayFailure(previewTextureArray);
                     }
                     else if (previewSprite != null)
                     {
@@ -762,6 +793,7 @@ public partial class MainWindow
             {
                 cachedTextureResult?.Dispose();
                 ownedSpriteImage?.Dispose();
+                ownedTextureArrayImage?.Dispose();
             }
         }, token);
     }

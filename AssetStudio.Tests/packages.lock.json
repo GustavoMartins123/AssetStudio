@@ -383,7 +383,8 @@
       "assetstudio": {
         "type": "Project",
         "dependencies": {
-          "K4os.Compression.LZ4": "[1.2.16, )"
+          "K4os.Compression.LZ4": "[1.2.16, )",
+          "ZstdSharp.Port": "[0.8.8, )"
         }
       },
       "assetstudio.avalonia": {
@@ -571,6 +572,12 @@
         "requested": "[1.0.99, )",
         "resolved": "1.0.99",
         "contentHash": "Z+ttnt/FdfWfJ2S/C9Uot+v3GbT2Mjs4HiTDfRGJfzC+4cgXcCWpKVFmz2BIhVFJMkfMDbQ50R3osDwNCMR3zw=="
+      },
+      "ZstdSharp.Port": {
+        "type": "CentralTransitive",
+        "requested": "[0.8.8, )",
+        "resolved": "0.8.8",
+        "contentHash": "UIDFkA5DC3en3tOJ3Mof11yBx9kUQLsaeo/oFdvN6Bbkr9E9+VCqfIadHci8cu+I51K2Sl7XYWVl2R/mA75NBQ=="
       }
     },
     "net10.0/linux-x64": {

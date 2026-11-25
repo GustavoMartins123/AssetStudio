@@ -1881,7 +1881,7 @@ namespace AssetStudio.Avalonia.Services
                     try
                     {
                         using var file = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
-                        image.WriteToStream(file, exportOptions.ConvertTextureFormat);
+                        image.WriteToStream(file, exportOptions.ConvertTextureFormat, exportOptions.WebpQuality, exportOptions.WebpLossless);
                     }
                     catch
                     {
@@ -1890,6 +1890,41 @@ namespace AssetStudio.Avalonia.Services
                     }
                     AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Texture2D, isKnownNormalMap);
                     return true;
+                }
+
+                case Texture2DArray m_Texture2DArray:
+                {
+                    if (!exportOptions.ConvertTexture)
+                    {
+                        if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".tex", item, out var rawArrayPath)) return false;
+                        WriteBytesExport(rawArrayPath, m_Texture2DArray.image_data.GetData());
+                        return true;
+                    }
+
+                    // One file per slice, decoded one at a time so only a single slice is held in memory.
+                    var arrayConverter = new Texture2DArrayConverter(m_Texture2DArray);
+                    var arrayFormat = exportOptions.ConvertTextureFormat;
+                    var arrayExtension = arrayFormat.GetFileExtension();
+                    var exportedSlices = 0;
+                    for (var slice = 0; slice < arrayConverter.SliceCount; slice++)
+                    {
+                        using var sliceImage = arrayConverter.ConvertSliceToImage(slice, flip: true);
+                        if (sliceImage == null) continue;
+                        var sliceName = $"{fileName}_slice{slice.ToString("D3", CultureInfo.InvariantCulture)}";
+                        if (!conversionContext.TryGetAssetFilePath(exportPath, sliceName, arrayExtension, item, out var slicePath)) continue;
+                        try
+                        {
+                            using var file = new FileStream(slicePath, FileMode.Create, FileAccess.Write, FileShare.None);
+                            sliceImage.WriteToStream(file, arrayFormat, exportOptions.WebpQuality, exportOptions.WebpLossless);
+                        }
+                        catch
+                        {
+                            TryDeletePartialExport(slicePath);
+                            throw;
+                        }
+                        exportedSlices++;
+                    }
+                    return exportedSlices > 0;
                 }
 
                 case AudioClip m_AudioClip:
@@ -1991,7 +2026,7 @@ namespace AssetStudio.Avalonia.Services
                     try
                     {
                         using var file = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
-                        image.WriteToStream(file, format);
+                        image.WriteToStream(file, format, exportOptions.WebpQuality, exportOptions.WebpLossless);
                     }
                     catch
                     {
@@ -3063,10 +3098,26 @@ TextureImporter:
             statusUpdate?.Invoke($"Decompressing {reader.FileName} ...");
             var fileName = FixFileName(reader.FileName);
             using var bundleFile = new BundleFile(reader);
-            if (bundleFile.fileList.Length == 0) return 0;
-
             var extractPath = Path.Combine(savePath, fileName + "_unpacked");
-            return ExtractStreamFiles(extractPath, bundleFile.fileList, reservedOutputPaths);
+            var extractedCount = bundleFile.fileList.Length == 0
+                ? 0
+                : ExtractStreamFiles(extractPath, bundleFile.fileList, reservedOutputPaths);
+
+            // Further bundles stored back to back in the same file go to the same output folder.
+            foreach (var segment in BundleFile.FindFollowingSegments(reader.BaseStream, bundleFile))
+            {
+                statusUpdate?.Invoke($"Decompressing {reader.FileName} (bundle {segment.Index + 1}) ...");
+                using var segmentReader = BundleFile.OpenSegmentReader(reader, segment);
+                if (segmentReader.FileType != FileType.BundleFile)
+                {
+                    break;
+                }
+
+                using var segmentBundle = new BundleFile(segmentReader);
+                extractedCount += ExtractStreamFiles(extractPath, segmentBundle.fileList, reservedOutputPaths);
+            }
+
+            return extractedCount;
         }
 
         private static int ExtractWebDataFile(
