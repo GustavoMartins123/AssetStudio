@@ -19,6 +19,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public string OriginalPath { get; init; } = string.Empty;
         public string ContainerKey { get; init; } = string.Empty;
         public bool IsPreselected { get; init; }
+        public int GameObjectCount { get; init; } = -1;
+        public int RendererCount { get; init; } = -1;
     }
 
     public sealed class SceneExportDialogRequest
@@ -101,6 +103,16 @@ namespace AssetStudio.Avalonia.ViewModels
                     parts.Add(sourceLeaf);
                 }
 
+                if (Candidate.GameObjectCount >= 0 || Candidate.RendererCount >= 0)
+                {
+                    var goCount = Math.Max(0, Candidate.GameObjectCount);
+                    var rendererCount = Math.Max(0, Candidate.RendererCount);
+                    var statsText = rendererCount == 0 && Candidate.GameObjectCount >= 0
+                        ? $"{goCount:N0} objects, {rendererCount:N0} renderers (logic/UI shell)"
+                        : $"{goCount:N0} objects, {rendererCount:N0} renderers";
+                    parts.Add(statsText);
+                }
+
                 return parts.Count > 0 ? string.Join("  •  ", parts) : Name;
             }
         }
@@ -167,19 +179,16 @@ namespace AssetStudio.Avalonia.ViewModels
             _writeManifest = initial.WriteManifest;
 
             _allScenes = new List<SceneSelectionItemViewModel>(request.Scenes.Count);
-            var hasExplicitPreselection = request.Scenes.Any(static s => s != null && s.IsPreselected);
+            var nonNullCandidates = request.Scenes.Where(static s => s != null).ToList();
+            var hasExplicitPreselection = nonNullCandidates.Any(static s => s.IsPreselected);
+            var autoSelectSingleScene = !hasExplicitPreselection && nonNullCandidates.Count == 1;
 
-            for (var i = 0; i < request.Scenes.Count; i++)
+            for (var i = 0; i < nonNullCandidates.Count; i++)
             {
-                var candidate = request.Scenes[i];
-                if (candidate == null)
-                {
-                    continue;
-                }
-
+                var candidate = nonNullCandidates[i];
                 var preselected = hasExplicitPreselection
                     ? candidate.IsPreselected
-                    : _allScenes.Count == 0;
+                    : autoSelectSingleScene;
                 _allScenes.Add(new SceneSelectionItemViewModel(candidate, preselected, OnItemSelectionChanged));
             }
 

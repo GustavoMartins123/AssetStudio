@@ -972,6 +972,30 @@ namespace AssetStudio
                         {
                             ProbeSingleDirectoryForCatalogs(aaDir, found, seen);
                         }
+
+                        // When opening a Unity game's root folder (parent of *_Data), also probe *_Data/StreamingAssets/aa.
+                        if (depth == 0)
+                        {
+                            try
+                            {
+                                foreach (var dataDir in Directory.EnumerateDirectories(currentDir, "*_Data", SearchOption.TopDirectoryOnly))
+                                {
+                                    if (visitedDirs.Add(dataDir))
+                                    {
+                                        ProbeSingleDirectoryForCatalogs(dataDir, found, seen);
+                                    }
+
+                                    var dataAaDir = Path.Combine(dataDir, "StreamingAssets", "aa");
+                                    if (Directory.Exists(dataAaDir) && visitedDirs.Add(dataAaDir))
+                                    {
+                                        ProbeSingleDirectoryForCatalogs(dataAaDir, found, seen);
+                                    }
+                                }
+                            }
+                            catch
+                            {
+                            }
+                        }
                     }
 
                     try

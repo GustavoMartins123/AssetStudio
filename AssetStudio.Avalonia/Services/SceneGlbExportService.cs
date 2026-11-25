@@ -1,5 +1,7 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -17,7 +19,7 @@ public sealed class SceneExportOptions
     public bool ResolveStaticScriptSpawns { get; init; }
     public bool WriteManifest { get; init; } = true;
     public int MaxExternalDependencyDepth { get; init; } = 4;
-    public int MaxExternalFilesToLoad { get; init; } = 64;
+    public int MaxExternalFilesToLoad { get; init; } = 384;
     public int MaxScriptSpawnInstances { get; init; } = SceneScriptSpawnAnalysisOptions.DefaultMaxSpawnedInstances;
 }
 
@@ -870,6 +872,14 @@ public sealed class SceneGlbExportService
         {
             localReader?.Dispose();
         }
+
+        if (objectTypes.Contains(ClassIDType.GameObject))
+        {
+            foreach (var go in SnapshotGameObjects(sourceFile))
+            {
+                EnsureGameObjectComponentsLinked(go);
+            }
+        }
     }
 
     /// <summary>
@@ -951,7 +961,9 @@ public sealed class SceneGlbExportService
         }
 
         if (go.m_Transform != null
-            && (go.m_MeshRenderer != null || go.m_SkinnedMeshRenderer != null || go.m_Components.Length <= 1))
+            && ((go.m_MeshRenderer != null && go.m_MeshFilter != null)
+                || go.m_SkinnedMeshRenderer != null
+                || go.m_Components.Length <= 1))
         {
             return;
         }
@@ -1059,13 +1071,13 @@ public sealed class SceneGlbExportService
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // 1. Optional opt-in static script-spawn resolution.
+            // 1. Optional opt-in static script-spawn resolution + pre-resolved modular stage attachments.
             SceneScriptSpawnAnalysisResult? spawnAnalysis = options.PreComputedScriptSpawnAnalysis;
             IReadOnlyList<SceneScriptSpawnAttachment>? spawnAttachments = options.PreResolvedScriptSpawnAttachments;
             if (options.ResolveStaticScriptSpawns)
             {
                 progressCallback?.Invoke(3, 100, $"Analyzing static script spawns for '{options.SceneName}'...");
-                if (spawnAnalysis == null && spawnAttachments == null)
+                if (spawnAnalysis == null)
                 {
                     var analyzer = new SceneScriptSpawnAnalyzer();
                     var analysisOptions = options.ScriptSpawnAnalysisOptions ?? new SceneScriptSpawnAnalysisOptions
@@ -1076,9 +1088,17 @@ public sealed class SceneGlbExportService
                     spawnAnalysis = analyzer.AnalyzeScene(rootGameObjects, analysisOptions, cancellationToken);
                 }
 
-                if (spawnAttachments == null && spawnAnalysis != null)
+                var analyzedAttachments = spawnAnalysis.ToModelConverterAttachments();
+                if (spawnAttachments is { Count: > 0 })
                 {
-                    spawnAttachments = spawnAnalysis.ToModelConverterAttachments();
+                    var merged = new List<SceneScriptSpawnAttachment>(spawnAttachments.Count + analyzedAttachments.Count);
+                    merged.AddRange(spawnAttachments);
+                    merged.AddRange(analyzedAttachments);
+                    spawnAttachments = merged;
+                }
+                else
+                {
+                    spawnAttachments = analyzedAttachments;
                 }
             }
 
@@ -1129,6 +1149,9 @@ public sealed class SceneGlbExportService
             };
 
             progressCallback?.Invoke(8, 100, $"Converting scene '{options.SceneName}'...");
+            var effectiveMaxSpawnInstances = spawnAttachments is { Count: > 0 }
+                ? Math.Max(options.MaxScriptSpawnInstances, spawnAttachments.Count)
+                : options.MaxScriptSpawnInstances;
             var conversionOptions = new SceneConversionOptions
             {
                 LodExportMode = options.LodMode,
@@ -1136,7 +1159,7 @@ public sealed class SceneGlbExportService
                 SkipDisabledCamerasAndLights = options.SkipDisabledRenderers,
                 IncludeNodeProvenanceExtras = true,
                 ScriptSpawnAttachments = spawnAttachments,
-                MaxScriptSpawnInstances = options.MaxScriptSpawnInstances
+                MaxScriptSpawnInstances = effectiveMaxSpawnInstances
             };
 
             var converted = ModelConverter.CreateForScene(
@@ -1917,6 +1940,568 @@ public sealed class SceneGlbExportService
             || !father.m_GameObject.TryGet(out var parentGo)
             || parentGo == null
             || !fileGameObjects.Contains(parentGo);
+    }
+
+    public static int ScoreStagePresetName(string? nameOrSuffix)
+    {
+        if (string.IsNullOrWhiteSpace(nameOrSuffix))
+        {
+            return 0;
+        }
+
+        var tokens = nameOrSuffix.Split(new[] { '_', '-', ' ', '.' }, StringSplitOptions.RemoveEmptyEntries);
+        var score = 0;
+        for (var i = 0; i < tokens.Length; i++)
+        {
+            var token = tokens[i];
+            if (token.StartsWith("SPECIAL", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("EVENT", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("DESTROY", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("BROKEN", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("RUIN", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("BATTLE", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("BOSS", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("DEBUG", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("TEST", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("TEMP", StringComparison.OrdinalIgnoreCase)
+                || token.StartsWith("DUMMY", StringComparison.OrdinalIgnoreCase))
+            {
+                score -= 100;
+                continue;
+            }
+
+            if (string.Equals(token, "DEFAULT", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "NORMAL", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "STANDARD", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "COMMON", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "BASE", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "MAIN", StringComparison.OrdinalIgnoreCase))
+            {
+                score += 40;
+            }
+            else if (string.Equals(token, "NOON", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "DAY", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "DAYTIME", StringComparison.OrdinalIgnoreCase))
+            {
+                score += 35;
+            }
+            else if (string.Equals(token, "MORNING", StringComparison.OrdinalIgnoreCase))
+            {
+                score += 25;
+            }
+            else if (string.Equals(token, "EVENING", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "SUNSET", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "DUSK", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "TWILIGHT", StringComparison.OrdinalIgnoreCase))
+            {
+                score -= 5;
+            }
+            else if (string.Equals(token, "NIGHT", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "MIDNIGHT", StringComparison.OrdinalIgnoreCase))
+            {
+                score -= 20;
+            }
+            else if (string.Equals(token, "CLEAR", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "SUNNY", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "FINE", StringComparison.OrdinalIgnoreCase))
+            {
+                score += 25;
+            }
+            else if (string.Equals(token, "CLOUD", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "CLOUDY", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "OVERCAST", StringComparison.OrdinalIgnoreCase))
+            {
+                score -= 10;
+            }
+            else if (string.Equals(token, "RAIN", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "RAINY", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "STORM", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "THUNDER", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "SNOW", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(token, "FOG", StringComparison.OrdinalIgnoreCase))
+            {
+                score -= 20;
+            }
+        }
+
+        return score;
+    }
+
+    public static List<SceneScriptSpawnAttachment> ResolveCompanionStagePresetAttachments(
+        IReadOnlyList<GameObject> sceneRootGameObjects,
+        IReadOnlyList<(string StageStem, IReadOnlyList<SerializedFile> CompanionFiles)> stageCompanionGroups,
+        AssemblyLoader? assemblyLoader = null,
+        CancellationToken cancellationToken = default,
+        Func<MonoBehaviour, OrderedDictionary?>? customFieldProvider = null)
+    {
+        var attachments = new List<SceneScriptSpawnAttachment>();
+        if (sceneRootGameObjects == null || sceneRootGameObjects.Count == 0 || stageCompanionGroups == null || stageCompanionGroups.Count == 0)
+        {
+            return attachments;
+        }
+
+        // Discover active scene root & optional structural category anchor Transforms in the base scene.
+        Transform? defaultAnchor = null;
+        var categoryAnchors = new Dictionary<string, Transform>(StringComparer.OrdinalIgnoreCase);
+
+        static bool IsUsableAnchorTransform(GameObject? go, Transform? tr)
+        {
+            if (go == null || tr == null || !go.m_IsActive)
+            {
+                return false;
+            }
+
+            return MathF.Abs(tr.m_LocalScale.X) > 1e-5f
+                && MathF.Abs(tr.m_LocalScale.Y) > 1e-5f
+                && MathF.Abs(tr.m_LocalScale.Z) > 1e-5f;
+        }
+
+        static string ClassifyStageCategory(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return "Model";
+            }
+
+            if (name.Contains("SKYDOME", StringComparison.OrdinalIgnoreCase) || name.Equals("Sky", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Skydome";
+            }
+
+            if (name.Contains("VARIANT", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Variant";
+            }
+
+            if (name.EndsWith("_Light", StringComparison.OrdinalIgnoreCase)
+                || name.Contains("_Light_", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Light", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Lights", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Light";
+            }
+
+            if (name.EndsWith("_Effect", StringComparison.OrdinalIgnoreCase)
+                || name.Contains("_Effect_", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Effect", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Effects", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Effect";
+            }
+
+            return "Model";
+        }
+
+        for (var i = 0; i < sceneRootGameObjects.Count; i++)
+        {
+            var rootGo = sceneRootGameObjects[i];
+            if (rootGo == null)
+            {
+                continue;
+            }
+
+            EnsureGameObjectComponentsLinked(rootGo);
+            if (defaultAnchor == null && IsUsableAnchorTransform(rootGo, rootGo.m_Transform))
+            {
+                defaultAnchor = rootGo.m_Transform;
+            }
+
+            if (string.Equals(rootGo.m_Name, "SceneRoot", StringComparison.OrdinalIgnoreCase)
+                && IsUsableAnchorTransform(rootGo, rootGo.m_Transform))
+            {
+                defaultAnchor = rootGo.m_Transform;
+            }
+
+            if (rootGo.m_Transform?.m_Children != null && IsUsableAnchorTransform(rootGo, rootGo.m_Transform))
+            {
+                foreach (var childPtr in rootGo.m_Transform.m_Children)
+                {
+                    if (childPtr == null || childPtr.IsNull || !childPtr.TryGet(out var childTr) || childTr == null)
+                    {
+                        continue;
+                    }
+
+                    if (!childTr.m_GameObject.TryGet(out var childGo) || childGo == null)
+                    {
+                        continue;
+                    }
+
+                    EnsureGameObjectComponentsLinked(childGo);
+                    if (!IsUsableAnchorTransform(childGo, childTr))
+                    {
+                        continue;
+                    }
+
+                    var cname = childGo.m_Name ?? string.Empty;
+                    if (cname.Equals("StageModel", StringComparison.OrdinalIgnoreCase) || cname.Equals("Model", StringComparison.OrdinalIgnoreCase))
+                    {
+                        categoryAnchors.TryAdd("Model", childTr);
+                    }
+                    else if (cname.Equals("Variant", StringComparison.OrdinalIgnoreCase) || cname.Equals("Variants", StringComparison.OrdinalIgnoreCase))
+                    {
+                        categoryAnchors.TryAdd("Variant", childTr);
+                    }
+                    else if (cname.Equals("Skydome", StringComparison.OrdinalIgnoreCase))
+                    {
+                        categoryAnchors.TryAdd("Skydome", childTr);
+                    }
+                    else if (cname.Equals("Light", StringComparison.OrdinalIgnoreCase) || cname.Equals("Lights", StringComparison.OrdinalIgnoreCase))
+                    {
+                        categoryAnchors.TryAdd("Light", childTr);
+                    }
+                    else if (cname.Equals("Effect", StringComparison.OrdinalIgnoreCase) || cname.Equals("Effects", StringComparison.OrdinalIgnoreCase))
+                    {
+                        categoryAnchors.TryAdd("Effect", childTr);
+                    }
+                }
+            }
+        }
+
+        defaultAnchor ??= sceneRootGameObjects.FirstOrDefault(static g => g?.m_Transform != null)?.m_Transform;
+
+        var seenAttachedPrefabs = new HashSet<(string FileName, long PathId)>();
+
+        static GameObject ClimbToLocalPrefabRoot(GameObject go)
+        {
+            EnsureGameObjectComponentsLinked(go);
+            var currentGo = go;
+            var currentTr = go.m_Transform;
+            var visited = new HashSet<Transform>();
+            while (currentTr != null && visited.Add(currentTr))
+            {
+                var fatherPtr = currentTr.m_Father;
+                if (fatherPtr == null || fatherPtr.IsNull || !fatherPtr.TryGet(out var fatherTr) || fatherTr == null)
+                {
+                    break;
+                }
+
+                if (!fatherTr.m_GameObject.TryGet(out var fatherGo) || fatherGo == null || !ReferenceEquals(fatherGo.assetsFile, go.assetsFile))
+                {
+                    break;
+                }
+
+                EnsureGameObjectComponentsLinked(fatherGo);
+                currentGo = fatherGo;
+                currentTr = fatherTr;
+            }
+
+            return currentGo;
+        }
+
+        static void EnsurePrefabSubtreeComponentsLinked(GameObject rootGo)
+        {
+            EnsureGameObjectComponentsLinked(rootGo);
+            if (rootGo.m_Transform == null)
+            {
+                return;
+            }
+
+            var stack = new Stack<Transform>();
+            var visited = new HashSet<Transform>();
+            stack.Push(rootGo.m_Transform);
+            while (stack.Count > 0)
+            {
+                var tr = stack.Pop();
+                if (tr == null || !visited.Add(tr))
+                {
+                    continue;
+                }
+
+                if (tr.m_GameObject != null && !tr.m_GameObject.IsNull && tr.m_GameObject.TryGet(out var go) && go != null)
+                {
+                    EnsureGameObjectComponentsLinked(go);
+                }
+
+                if (tr.m_Children != null)
+                {
+                    for (var i = 0; i < tr.m_Children.Length; i++)
+                    {
+                        var childPtr = tr.m_Children[i];
+                        if (childPtr != null && !childPtr.IsNull && childPtr.TryGet(out var childTr) && childTr != null)
+                        {
+                            stack.Push(childTr);
+                        }
+                    }
+                }
+            }
+        }
+
+        OrderedDictionary? ReadScriptableObjectFields(MonoBehaviour mb)
+        {
+            if (customFieldProvider != null)
+            {
+                try
+                {
+                    var custom = customFieldProvider(mb);
+                    if (custom != null)
+                    {
+                        return custom;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            if (mb.serializedType?.m_Type?.m_Nodes is { Count: > 0 } _)
+            {
+                try
+                {
+                    return mb.ToType(mb.serializedType.m_Type);
+                }
+                catch
+                {
+                }
+            }
+
+            if (assemblyLoader != null)
+            {
+                try
+                {
+                    var converted = mb.ConvertToTypeTree(assemblyLoader);
+                    if (converted?.m_Nodes is { Count: > 0 })
+                    {
+                        return mb.ToType(converted);
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return null;
+        }
+
+        void CollectPrefabsFromPresetFields(
+            MonoBehaviour ownerSo,
+            IDictionary dict,
+            int fieldDepth,
+            int soDepth,
+            HashSet<(string FileName, long PathId)> visitedSo,
+            List<(GameObject PrefabRoot, string PresetName)> collected)
+        {
+            if (fieldDepth > 8)
+            {
+                return;
+            }
+
+            if (dict.Contains("m_FileID") && dict.Contains("m_PathID"))
+            {
+                try
+                {
+                    var fileId = Convert.ToInt32(dict["m_FileID"], CultureInfo.InvariantCulture);
+                    var pathId = Convert.ToInt64(dict["m_PathID"], CultureInfo.InvariantCulture);
+                    if (pathId != 0 && ownerSo.assetsFile != null)
+                    {
+                        var pptr = new PPtr<AssetStudio.Object>(fileId, pathId, ownerSo.assetsFile);
+                        if (pptr.TryGet(out var targetObj) && targetObj != null)
+                        {
+                            if (targetObj is GameObject targetGo)
+                            {
+                                collected.Add((ClimbToLocalPrefabRoot(targetGo), ownerSo.m_Name ?? string.Empty));
+                            }
+                            else if (targetObj is Component targetComp
+                                && targetComp.m_GameObject != null
+                                && !targetComp.m_GameObject.IsNull
+                                && targetComp.m_GameObject.TryGet(out var compGo)
+                                && compGo != null)
+                            {
+                                collected.Add((ClimbToLocalPrefabRoot(compGo), ownerSo.m_Name ?? string.Empty));
+                            }
+                            else if (soDepth < 2
+                                && targetObj is MonoBehaviour nestedSo
+                                && (nestedSo.m_GameObject == null || nestedSo.m_GameObject.IsNull)
+                                && visitedSo.Add((nestedSo.assetsFile?.fileName ?? string.Empty, nestedSo.m_PathID)))
+                            {
+                                var nestedFields = ReadScriptableObjectFields(nestedSo);
+                                if (nestedFields != null)
+                                {
+                                    CollectPrefabsFromPresetFields(nestedSo, nestedFields, 0, soDepth + 1, visitedSo, collected);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                }
+                return;
+            }
+
+            foreach (DictionaryEntry entry in dict)
+            {
+                var key = entry.Key?.ToString() ?? string.Empty;
+                if (key == "m_GameObject" || key == "m_Enabled" || key == "m_Script" || key == "m_Name")
+                {
+                    continue;
+                }
+
+                var val = entry.Value;
+                if (val is IDictionary subDict)
+                {
+                    CollectPrefabsFromPresetFields(ownerSo, subDict, fieldDepth + 1, soDepth, visitedSo, collected);
+                }
+                else if (val is IEnumerable list && val is not string && val is not byte[])
+                {
+                    foreach (var item in list)
+                    {
+                        if (item is IDictionary itemDict)
+                        {
+                            CollectPrefabsFromPresetFields(ownerSo, itemDict, fieldDepth + 1, soDepth, visitedSo, collected);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (var g = 0; g < stageCompanionGroups.Count; g++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var (stageStem, companionFiles) = stageCompanionGroups[g];
+            if (string.IsNullOrWhiteSpace(stageStem) || stageStem.Length < 6 || companionFiles == null)
+            {
+                continue;
+            }
+
+            var prefix = stageStem + "_";
+            for (var f = 0; f < companionFiles.Count; f++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var companionSf = companionFiles[f];
+                if (companionSf == null)
+                {
+                    continue;
+                }
+
+                foreach (var go in SnapshotGameObjects(companionSf))
+                {
+                    EnsureGameObjectComponentsLinked(go);
+                }
+
+                AssetStudio.Object[] objsSnapshot;
+                lock (companionSf)
+                {
+                    objsSnapshot = companionSf.Objects != null ? companionSf.Objects.ToArray() : Array.Empty<AssetStudio.Object>();
+                }
+
+                var candidatePresets = new List<(MonoBehaviour Preset, int Score)>();
+                for (var o = 0; o < objsSnapshot.Length; o++)
+                {
+                    if (objsSnapshot[o] is MonoBehaviour mb
+                        && (mb.m_GameObject == null || mb.m_GameObject.IsNull)
+                        && !string.IsNullOrWhiteSpace(mb.m_Name)
+                        && mb.m_Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var suffix = mb.m_Name.Substring(prefix.Length);
+                        candidatePresets.Add((mb, ScoreStagePresetName(suffix)));
+                    }
+                }
+
+                candidatePresets.Sort(static (a, b) =>
+                {
+                    var cmp = b.Score.CompareTo(a.Score);
+                    return cmp != 0 ? cmp : string.Compare(a.Preset.m_Name, b.Preset.m_Name, StringComparison.OrdinalIgnoreCase);
+                });
+
+                var resolvedForFile = new List<(GameObject PrefabRoot, string PresetName)>();
+                for (var p = 0; p < candidatePresets.Count; p++)
+                {
+                    var preset = candidatePresets[p].Preset;
+                    var fields = ReadScriptableObjectFields(preset);
+                    if (fields == null || fields.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var visitedSo = new HashSet<(string, long)>
+                    {
+                        (preset.assetsFile?.fileName ?? string.Empty, preset.m_PathID)
+                    };
+                    CollectPrefabsFromPresetFields(preset, fields, 0, 0, visitedSo, resolvedForFile);
+                    if (resolvedForFile.Count > 0)
+                    {
+                        break;
+                    }
+                }
+
+                // Fallback when TypeTree is stripped and IL2CPP/Mono assemblies were not loaded:
+                // select at most one highest-scored root prefab per structural category to prevent stacking variants.
+                if (resolvedForFile.Count == 0)
+                {
+                    var fileRoots = CollectRootGameObjectsWithInactiveFallback(new[] { companionSf }, out _);
+                    var bestByCategory = new Dictionary<string, (GameObject Root, int Score)>(StringComparer.OrdinalIgnoreCase);
+                    for (var r = 0; r < fileRoots.Count; r++)
+                    {
+                        var root = fileRoots[r];
+                        if (root == null)
+                        {
+                            continue;
+                        }
+
+                        var rName = root.m_Name ?? string.Empty;
+                        var suffix = rName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                            ? rName.Substring(prefix.Length)
+                            : rName;
+                        var score = ScoreStagePresetName(suffix);
+                        if (score < -50)
+                        {
+                            continue;
+                        }
+
+                        var cat = ClassifyStageCategory(rName);
+                        if (!bestByCategory.TryGetValue(cat, out var prev)
+                            || score > prev.Score
+                            || (score == prev.Score && string.Compare(rName, prev.Root.m_Name, StringComparison.OrdinalIgnoreCase) < 0))
+                        {
+                            bestByCategory[cat] = (root, score);
+                        }
+                    }
+
+                    foreach (var kvp in bestByCategory.OrderBy(static k => k.Key, StringComparer.Ordinal))
+                    {
+                        resolvedForFile.Add((kvp.Value.Root, "FallbackCategoryPreset"));
+                    }
+                }
+
+                for (var r = 0; r < resolvedForFile.Count; r++)
+                {
+                    var (prefabRoot, presetName) = resolvedForFile[r];
+                    if (prefabRoot == null)
+                    {
+                        continue;
+                    }
+
+                    var dedupKey = (prefabRoot.assetsFile?.fileName ?? string.Empty, prefabRoot.m_PathID);
+                    if (!seenAttachedPrefabs.Add(dedupKey))
+                    {
+                        continue;
+                    }
+
+                    EnsurePrefabSubtreeComponentsLinked(prefabRoot);
+                    var category = ClassifyStageCategory(prefabRoot.m_Name);
+                    var anchor = categoryAnchors.TryGetValue(category, out var catAnchor) ? catAnchor : defaultAnchor;
+
+                    attachments.Add(new SceneScriptSpawnAttachment
+                    {
+                        AnchorTransform = anchor,
+                        AnchorTransformPathId = anchor?.m_PathID ?? 0,
+                        PrefabRoot = prefabRoot,
+                        LocalPositionOffset = Vector3.Zero,
+                        LocalRotationOffset = new Quaternion(0f, 0f, 0f, 1f),
+                        LocalScaleMultiplier = Vector3.One,
+                        ScriptClass = "StagePresetScriptableObject",
+                        FieldPath = presetName,
+                        SourceKind = "StagePresetBundle",
+                        Confidence = "High",
+                        TargetFileName = dedupKey.Item1,
+                        TargetPathId = prefabRoot.m_PathID,
+                        PreservePrefabRootName = true
+                    });
+                }
+            }
+        }
+
+        return attachments;
     }
 
     private static void TryDeletePartialFile(string path)

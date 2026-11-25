@@ -723,7 +723,7 @@ namespace AssetStudio
                 }
             }
 
-            if (occlusionTex != null && TryRegisterTexture(occlusionTex.Name, out int occTexIdx))
+            if (occlusionTex != null && TryRegisterOcclusionTexture(matName, occlusionTex.Name, out int occTexIdx))
             {
                 gltfMat.OcclusionTexture = CreateTextureInfo(occTexIdx, occlusionTex);
                 if (mat.OcclusionStrength.HasValue && float.IsFinite(mat.OcclusionStrength.Value))
@@ -1098,6 +1098,91 @@ namespace AssetStudio
             using var ms = packedBitmap.ConvertToStream(ImageFormat.Png);
             textureIndex = RegisterEncodedTexture(cacheKey, $"{matName}_roughness", ms.ToArray(), "image/png", ".png");
             return true;
+        }
+
+        private bool TryRegisterOcclusionTexture(string matName, string textureName, out int textureIndex)
+        {
+            textureIndex = -1;
+            var source = FindSourceTexture(textureName);
+            if (source == null || source.Data == null || source.Data.Length == 0)
+            {
+                return false;
+            }
+
+            string packedCacheKey = $"occg:{source.Name}";
+            if (_textureIndexByKey.TryGetValue(packedCacheKey, out textureIndex))
+            {
+                return textureIndex >= 0;
+            }
+
+            using var bmp = DecodeAnyToBgra(source.Data);
+            if (bmp != null && bmp.Width > 0 && bmp.Height > 0)
+            {
+                int width = bmp.Width;
+                int height = bmp.Height;
+                int pixelCount = checked(width * height);
+                var pixels = new byte[checked(pixelCount * 4)];
+                bmp.CopyBgraPixelsTo(pixels);
+
+                long sumR = 0;
+                long sumG = 0;
+                int nonGrayCount = 0;
+                byte minG = 255;
+
+                for (int p = 0; p < pixelCount; p++)
+                {
+                    int off = p * 4;
+                    byte b = pixels[off + 0];
+                    byte g = pixels[off + 1];
+                    byte r = pixels[off + 2];
+
+                    sumR += r;
+                    sumG += g;
+                    if (g < minG)
+                    {
+                        minG = g;
+                    }
+
+                    if (Math.Abs(r - g) > 4 || Math.Abs(g - b) > 4)
+                    {
+                        nonGrayCount++;
+                    }
+                }
+
+                double meanR = (double)sumR / pixelCount;
+                double meanG = (double)sumG / pixelCount;
+                double nonGrayRatio = (double)nonGrayCount / pixelCount;
+
+                // Unity shaders (URP/HDRP/custom MaskMaps) frequently store Ambient Occlusion in channel G
+                // while channel R holds dark Metallic/Specular (~0). glTF 2.0 samples occlusion strictly from R,
+                // which would multiply lit albedo by ~0 (pitch black). Repack channel G -> grayscale R/G/B when detected.
+                if (nonGrayRatio >= 0.10 && meanG >= 140.0 && (meanG - meanR) >= 50.0)
+                {
+                    if (minG >= 250)
+                    {
+                        _textureIndexByKey[packedCacheKey] = -1;
+                        return false;
+                    }
+
+                    var packedBgra = new byte[checked(pixelCount * 4)];
+                    for (int p = 0; p < pixelCount; p++)
+                    {
+                        int off = p * 4;
+                        byte ao = pixels[off + 1];
+                        packedBgra[off + 0] = ao;
+                        packedBgra[off + 1] = ao;
+                        packedBgra[off + 2] = ao;
+                        packedBgra[off + 3] = 255;
+                    }
+
+                    using var packedBitmap = ImageExtensions.CreateBgraUnpremulBitmap(packedBgra, width, height, flipVertical: false);
+                    using var ms = packedBitmap.ConvertToStream(ImageFormat.Png);
+                    textureIndex = RegisterEncodedTexture(packedCacheKey, $"{matName}_occlusion", ms.ToArray(), "image/png", ".png");
+                    return true;
+                }
+            }
+
+            return TryRegisterTexture(textureName, out textureIndex);
         }
 
         private static bool TrySanitizeImageBytes(byte[] rawBytes, out byte[] encodedBytes, out string mimeType, out string extension)

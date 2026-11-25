@@ -29,7 +29,7 @@ public partial class MainWindow
         public required SceneExportCandidate Candidate { get; init; }
         public GameObjectNode? LoadedSceneRootNode { get; init; }
         public SerializedFile? LoadedSerializedFile { get; init; }
-        public AssetItem? SelectedItem { get; init; }
+        public IReadOnlyList<(string SerializedFileName, string OriginalPath)>? CompanionStageFiles { get; init; }
     }
 
     private async Task ExportSceneGlbCommandHandlerAsync()
@@ -44,8 +44,8 @@ public partial class MainWindow
         {
             await ViewModel.DialogService.ShowMessageAsync(
                 "Export Scene to .glb",
-                "No loaded Scene Hierarchy, BuildSettings scene, .unity scene bundle, or Addressables SceneProvider entry was detected.\n\n" +
-                "Load a Unity game folder or scene file (such as level0 or a scene bundle) first, or select an asset from a scene/prefab bundle in the Asset List.");
+                "No loaded Scene Hierarchy, BuildSettings scene, .unity scene bundle, streamed scene bundle, or Addressables SceneProvider entry was detected.\n\n" +
+                "Load a Unity game folder or scene file (such as level0 or a scene bundle) first.");
             return;
         }
 
@@ -171,14 +171,65 @@ public partial class MainWindow
                     }
                 }
 
+                // Step 1b: Resolve modular companion stage preset bundles (if any) BEFORE dependency closure
+                // so cross-bundle Mesh/Material/Texture2D dependencies of companion stage prefabs are also loaded!
+                var companionGroups = new List<(string StageStem, IReadOnlyList<SerializedFile> CompanionFiles)>();
+                var companionSerializedFilesSet = new HashSet<SerializedFile>();
+                for (var i = 0; i < selectedBindings.Count; i++)
+                {
+                    ctsToken.ThrowIfCancellationRequested();
+                    var binding = selectedBindings[i];
+                    var stageStem = ProjectLoadingService.ExtractSceneStageStem(binding.Candidate.Name, binding.Candidate.ScenePath);
+                    if (stageStem.Length < 6 || binding.CompanionStageFiles == null || binding.CompanionStageFiles.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var groupFiles = new List<SerializedFile>();
+                    foreach (var (compSfName, compOrigPath) in binding.CompanionStageFiles)
+                    {
+                        var compDiskPath = TryResolveExistingPath(compOrigPath) ?? ResolveSceneDependencyDiskPath(compSfName);
+                        if (!string.IsNullOrWhiteSpace(compDiskPath) && File.Exists(compDiskPath))
+                        {
+                            if (!assetsManager.TryFindSerializedFile(compSfName, null, out var existingComp) || existingComp?.reader == null)
+                            {
+                                RemovePendingFileFromProgressiveQueue(compDiskPath);
+                                assetsManager.LoadFilesForPreview(compDiskPath);
+                                if (!string.IsNullOrWhiteSpace(compSfName))
+                                {
+                                    assetsManager.WaitForAssetsFileLoaded(compSfName, 5000);
+                                }
+                            }
+                        }
+
+                        if (assetsManager.TryFindSerializedFile(compSfName, null, out var loadedComp) && loadedComp?.reader != null)
+                        {
+                            if (!groupFiles.Contains(loadedComp))
+                            {
+                                groupFiles.Add(loadedComp);
+                            }
+                            companionSerializedFilesSet.Add(loadedComp);
+                        }
+                    }
+
+                    if (groupFiles.Count > 0)
+                    {
+                        companionGroups.Add((stageStem, groupFiles));
+                    }
+                }
+
                 // Step 2: Transitive cross-bundle dependency closure (SQLite SourceFileExternals BFS + levelN<->sharedassetsN + Addressables).
+                var closureSeeds = companionSerializedFilesSet.Count > 0
+                    ? seedSerializedFiles.Concat(companionSerializedFilesSet).Distinct().ToList()
+                    : seedSerializedFiles;
+
                 SceneDependencyClosureResult? dependencyClosure = null;
-                if (seedSerializedFiles.Count > 0)
+                if (closureSeeds.Count > 0)
                 {
                     ReportSceneExportProgress(10, $"Resolving cross-bundle dependencies for '{displaySceneName}'...");
                     dependencyClosure = SceneGlbExportService.ResolveAndLoadSceneDependencies(
                         assetsManager: assetsManager,
-                        seedFiles: seedSerializedFiles,
+                        seedFiles: closureSeeds,
                         sqliteCache: _sqliteCache,
                         cacheFolderPath: cacheFolder,
                         cacheSignature: cacheSignature,
@@ -189,11 +240,24 @@ public partial class MainWindow
                         maxAdditionalFiles: sceneExportOptions.MaxExternalFilesToLoad,
                         cancellationToken: ctsToken);
 
-                    // Materialize scene + dependency objects (including LODGroup, Camera, Light, and opt-in MonoBehaviour).
+                    HashSet<ClassIDType>? companionObjectTypes = null;
+                    if (companionSerializedFilesSet.Count > 0)
+                    {
+                        companionObjectTypes = new HashSet<ClassIDType>(requiredObjectTypes)
+                        {
+                            ClassIDType.MonoBehaviour,
+                            ClassIDType.MonoScript
+                        };
+                    }
+
+                    // Materialize scene + companion + dependency objects.
                     ReportSceneExportProgress(16, $"Materializing hierarchy & components ({dependencyClosure.AllLoadedFiles.Count} file(s))...");
                     foreach (var sf in dependencyClosure.AllLoadedFiles)
                     {
-                        MaterializeSceneObjectsForSerializedFile(sf, requiredObjectTypes, ctsToken);
+                        var typesForSf = companionObjectTypes != null && companionSerializedFilesSet.Contains(sf)
+                            ? companionObjectTypes
+                            : requiredObjectTypes;
+                        MaterializeSceneObjectsForSerializedFile(sf, typesForSf, ctsToken);
                     }
                 }
 
@@ -209,17 +273,22 @@ public partial class MainWindow
                         ? lazySeedFiles.SelectMany(sf => SceneGlbExportService.CollectRootGameObjectsFromSerializedFile(sf, includeInactive: true)).ToList()
                         : SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(lazySeedFiles, out usedInactiveFallback);
 
-                    // Fallback to sibling CABs in the same bundle or semantic owner if a mesh-only CAB was selected.
-                    if (collectedLazyRoots.Count == 0 && selectedBindings.Count == 1)
+                    // Fallback to sibling CABs in the same scene bundle(s) if a metadata-only CAB (e.g. *.sharedAssets)
+                    // had no GameObjects of its own. Works for both single-scene and additive multi-scene exports.
+                    if (collectedLazyRoots.Count == 0)
                     {
-                        var primaryBinding = selectedBindings[0];
-                        var srcPath = primaryBinding.Candidate.OriginalPath;
-                        if (!string.IsNullOrWhiteSpace(srcPath))
+                        var candidatePaths = selectedBindings
+                            .Select(static b => b.Candidate.OriginalPath)
+                            .Where(static p => !string.IsNullOrWhiteSpace(p))
+                            .Distinct(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase)
+                            .ToList();
+
+                        if (candidatePaths.Count > 0)
                         {
                             var siblingFiles = GetLoadedFilesSnapshot()
                                 .Where(sf => sf?.reader != null
                                     && !seenSeedFiles.Contains(sf)
-                                    && (IsSameLazySource(sf.originalPath, srcPath) || IsSameLazySource(sf.fullName, srcPath)))
+                                    && candidatePaths.Any(srcPath => IsSameLazySource(sf.originalPath, srcPath) || IsSameLazySource(sf.fullName, srcPath)))
                                 .ToList();
                             foreach (var sf in siblingFiles)
                             {
@@ -228,18 +297,6 @@ public partial class MainWindow
                             if (siblingFiles.Count > 0)
                             {
                                 collectedLazyRoots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(siblingFiles, out usedInactiveFallback);
-                            }
-                        }
-
-                        if (collectedLazyRoots.Count == 0 && primaryBinding.SelectedItem != null)
-                        {
-                            var semanticOwnerFile = TryResolveSemanticSceneFileForSelectedAsset(primaryBinding.SelectedItem, ctsToken);
-                            if (semanticOwnerFile != null)
-                            {
-                                MaterializeSceneObjectsForSerializedFile(semanticOwnerFile, requiredObjectTypes, ctsToken);
-                                collectedLazyRoots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(
-                                    new[] { semanticOwnerFile },
-                                    out usedInactiveFallback);
                             }
                         }
                     }
@@ -265,7 +322,17 @@ public partial class MainWindow
                     return;
                 }
 
-                // Step 4: Configure opt-in SceneScriptSpawnAnalyzer (bounded external prefab + Addressables ByGuid loading).
+                // Step 4: Resolve modular stage preset attachments (if any) + optional SceneScriptSpawnAnalyzer.
+                List<SceneScriptSpawnAttachment>? companionAttachments = null;
+                if (companionGroups.Count > 0)
+                {
+                    companionAttachments = SceneGlbExportService.ResolveCompanionStagePresetAttachments(
+                        rootGameObjects,
+                        companionGroups,
+                        assemblyLoader,
+                        ctsToken);
+                }
+
                 SceneScriptSpawnAnalysisOptions? scriptSpawnOptions = null;
                 if (sceneExportOptions.ResolveStaticScriptSpawns)
                 {
@@ -304,8 +371,9 @@ public partial class MainWindow
                     Binary = !saveFile.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase),
                     ResolvedDependencies = dependencyClosure?.ResolvedDependencies,
                     MissingDependencies = dependencyClosure?.MissingDependencies,
-                    SceneSerializedFiles = seedSerializedFiles,
-                    ScriptSpawnAnalysisOptions = scriptSpawnOptions
+                    SceneSerializedFiles = closureSeeds,
+                    ScriptSpawnAnalysisOptions = scriptSpawnOptions,
+                    PreResolvedScriptSpawnAttachments = companionAttachments
                 };
 
                 var resolverContext = new SceneExportResolverContext();
@@ -435,7 +503,8 @@ public partial class MainWindow
         var bindings = new Dictionary<string, SceneCandidateBinding>(StringComparer.Ordinal);
         var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // Determine currently selected scene root or selected AssetItem file for pre-selection.
+        // Pre-select ONLY if the user explicitly selected a scene root in Scene Hierarchy.
+        // Never bind or pre-select unrelated items highlighted in Asset List (meshes, textures, prefabs, etc.).
         GameObjectNode? activeSceneRoot = null;
         if (SceneTreeView?.SelectedItem is GameObjectNode selectedNode)
         {
@@ -450,10 +519,6 @@ public partial class MainWindow
             }
         }
 
-        var selectedAssetItem = AssetListDataGrid?.SelectedItem as AssetItem;
-        var selectedAssetSfName = selectedAssetItem?.SourceFile?.fileName
-            ?? selectedAssetItem?.Handle?.SerializedFileName;
-
         // Fetch indexed scenes from SQLite v16 cache (if available) + live discovery.
         var indexedScenes = new List<IndexedSceneRecord>();
         var cacheFolder = GetCurrentCacheFolderPath();
@@ -467,9 +532,13 @@ public partial class MainWindow
             assetsManager,
             !string.IsNullOrWhiteSpace(cacheFolder) ? cacheFolder : assetsManager.ProjectRoot);
 
+        // Prefer live discovered metadata (which includes fresh multi-CAB resolution and streamed RenderSettings scenes),
+        // then fill any persisted SQLite entries not re-discovered live.
+        var combinedIndexed = discovered.Scenes.Concat(indexedScenes).ToList();
+
         // Build lookup from SerializedFileName -> richer BuildSettings/Bundle metadata.
         var richByFileName = new Dictionary<string, IndexedSceneRecord>(StringComparer.OrdinalIgnoreCase);
-        foreach (var rec in indexedScenes.Concat(discovered.Scenes))
+        foreach (var rec in combinedIndexed)
         {
             if (rec != null && !string.IsNullOrWhiteSpace(rec.EntrySerializedFileName))
             {
@@ -477,7 +546,41 @@ public partial class MainWindow
             }
         }
 
-        void AddCandidate(SceneExportCandidate candidate, GameObjectNode? rootNode = null, SerializedFile? loadedFile = null, AssetItem? selectedItem = null)
+        (int GoCount, int RendererCount) LookupSceneStats(string? sfName, SerializedFile? loadedSf = null)
+        {
+            if (!string.IsNullOrWhiteSpace(sfName) && discovered.SceneFileStats.TryGetValue(sfName, out var stats))
+            {
+                return stats;
+            }
+
+            if (loadedSf != null)
+            {
+                var goCount = 0;
+                var rendererCount = 0;
+                if (loadedSf.m_Objects != null && loadedSf.m_Objects.Count > 0)
+                {
+                    for (var i = 0; i < loadedSf.m_Objects.Count; i++)
+                    {
+                        var info = loadedSf.m_Objects[i];
+                        if (info == null) continue;
+                        if (info.classID == (int)ClassIDType.GameObject) goCount++;
+                        else if (info.classID == (int)ClassIDType.MeshRenderer || info.classID == (int)ClassIDType.SkinnedMeshRenderer) rendererCount++;
+                    }
+                    return (goCount, rendererCount);
+                }
+
+                foreach (var obj in loadedSf.Objects)
+                {
+                    if (obj is GameObject) goCount++;
+                    else if (obj is MeshRenderer || obj is SkinnedMeshRenderer) rendererCount++;
+                }
+                return (goCount, rendererCount);
+            }
+
+            return (-1, -1);
+        }
+
+        void AddCandidate(SceneExportCandidate candidate, GameObjectNode? rootNode = null, SerializedFile? loadedFile = null)
         {
             var dedupKey = !string.IsNullOrWhiteSpace(candidate.ScenePath)
                 ? $"path:{candidate.ScenePath}"
@@ -495,12 +598,19 @@ public partial class MainWindow
             }
 
             candidates.Add(candidate);
+            IReadOnlyList<(string SerializedFileName, string OriginalPath)>? companionFiles = null;
+            if (!string.IsNullOrWhiteSpace(candidate.SerializedFileName)
+                && discovered.CompanionStageFilesBySceneSf.TryGetValue(candidate.SerializedFileName, out var foundCompanions))
+            {
+                companionFiles = foundCompanions;
+            }
+
             bindings[candidate.Id] = new SceneCandidateBinding
             {
                 Candidate = candidate,
                 LoadedSceneRootNode = rootNode,
                 LoadedSerializedFile = loadedFile,
-                SelectedItem = selectedItem
+                CompanionStageFiles = companionFiles
             };
         }
 
@@ -520,8 +630,8 @@ public partial class MainWindow
             richByFileName.TryGetValue(sfName, out var rich);
 
             var displayName = rich != null && !string.IsNullOrWhiteSpace(rich.Name) ? rich.Name : rawName;
-            var isPreselected = ReferenceEquals(rootNode, activeSceneRoot)
-                || (activeSceneRoot == null && !string.IsNullOrEmpty(selectedAssetSfName) && string.Equals(sfName, selectedAssetSfName, StringComparison.OrdinalIgnoreCase));
+            var isPreselected = ReferenceEquals(rootNode, activeSceneRoot);
+            var (goCount, rendererCount) = LookupSceneStats(sfName, sf);
 
             AddCandidate(new SceneExportCandidate
             {
@@ -533,12 +643,13 @@ public partial class MainWindow
                 SerializedFileName = sfName,
                 OriginalPath = sf?.originalPath ?? rich?.EntryOriginalPath ?? string.Empty,
                 ContainerKey = rich?.ContainerKey ?? string.Empty,
-                IsPreselected = isPreselected
+                IsPreselected = isPreselected,
+                GameObjectCount = goCount,
+                RendererCount = rendererCount
             }, rootNode: rootNode, loadedFile: sf);
         }
 
-        // 2. Persisted SQLite v16 Scenes + Live Discovered Scenes (BuildSettings, AssetBundle .unity, Addressables SceneProvider, Heuristic).
-        var combinedIndexed = indexedScenes.Concat(discovered.Scenes).ToList();
+        // 2. Live Discovered + Persisted SQLite v16 Scenes (BuildSettings, AssetBundle .unity, Addressables SceneProvider, Streamed SceneBundle, Heuristic).
         for (var i = 0; i < combinedIndexed.Count; i++)
         {
             var rec = combinedIndexed[i];
@@ -547,9 +658,7 @@ public partial class MainWindow
                 continue;
             }
 
-            var isPreselected = activeSceneRoot == null
-                && !string.IsNullOrEmpty(selectedAssetSfName)
-                && string.Equals(rec.EntrySerializedFileName, selectedAssetSfName, StringComparison.OrdinalIgnoreCase);
+            var (goCount, rendererCount) = LookupSceneStats(rec.EntrySerializedFileName);
 
             AddCandidate(new SceneExportCandidate
             {
@@ -561,53 +670,18 @@ public partial class MainWindow
                 SerializedFileName = rec.EntrySerializedFileName,
                 OriginalPath = rec.EntryOriginalPath,
                 ContainerKey = rec.ContainerKey,
-                IsPreselected = isPreselected
+                IsPreselected = false,
+                GameObjectCount = goCount,
+                RendererCount = rendererCount
             });
         }
 
-        // 3. Fallback to selected AssetItem's source bundle/file if no dedicated scene matched it.
-        if (selectedAssetItem != null)
-        {
-            var loadedSf = selectedAssetItem.SourceFile?.reader != null
-                ? selectedAssetItem.SourceFile
-                : (selectedAssetItem.Handle?.SourceFile?.reader != null ? selectedAssetItem.Handle.SourceFile : null);
-            var sfName = loadedSf?.fileName
-                ?? selectedAssetItem.SourceFile?.fileName
-                ?? selectedAssetItem.Handle?.SerializedFileName
-                ?? string.Empty;
-            var srcPath = (selectedAssetItem.Handle != null ? ResolveLazyHandleSourcePath(selectedAssetItem.Handle) : null)
-                ?? TryResolveExistingPath(selectedAssetItem.SourceFile?.originalPath)
-                ?? TryResolveExistingPath(selectedAssetItem.SourceFile?.fullName)
-                ?? TryResolveExistingPath(selectedAssetItem.Handle?.OriginalPath)
-                ?? string.Empty;
-
-            if (loadedSf != null || (!string.IsNullOrWhiteSpace(srcPath) && File.Exists(srcPath)))
-            {
-                var name = selectedAssetItem.Type == ClassIDType.SceneAsset && !string.IsNullOrWhiteSpace(selectedAssetItem.Name)
-                    ? selectedAssetItem.Name
-                    : (!string.IsNullOrWhiteSpace(sfName) ? sfName : Path.GetFileNameWithoutExtension(srcPath));
-
-                AddCandidate(new SceneExportCandidate
-                {
-                    Id = $"selected:{sfName}:{srcPath}",
-                    Name = string.IsNullOrWhiteSpace(name) ? "Selected Scene" : name,
-                    ScenePath = selectedAssetItem.Container ?? sfName,
-                    BuildIndex = -1,
-                    SourceKind = "Selected",
-                    SerializedFileName = sfName,
-                    OriginalPath = srcPath,
-                    ContainerKey = selectedAssetItem.Container ?? string.Empty,
-                    IsPreselected = candidates.Count == 0 || !candidates.Any(static c => c.IsPreselected)
-                }, loadedFile: loadedSf, selectedItem: selectedAssetItem);
-            }
-        }
-
-        // 4. Final fallback: any loaded SerializedFile containing GameObjects.
+        // 3. Final fallback ONLY when no real Unity scenes exist anywhere (e.g. user directly loaded a single standalone .assets/bundle file).
         if (candidates.Count == 0)
         {
             foreach (var sf in GetLoadedFilesSnapshot())
             {
-                if (sf == null)
+                if (sf == null || ProjectLoadingService.IsSharedAssetsCompanionName(sf.fileName))
                 {
                     continue;
                 }
@@ -619,9 +693,8 @@ public partial class MainWindow
                     continue;
                 }
 
-                var hasGo = sf.m_Objects.Any(static info => info != null && info.classID == (int)ClassIDType.GameObject)
-                    || sf.Objects.Any(static o => o is GameObject);
-                if (!hasGo)
+                var (goCount, rendererCount) = LookupSceneStats(sf.fileName, sf);
+                if (goCount <= 0)
                 {
                     continue;
                 }
@@ -636,10 +709,45 @@ public partial class MainWindow
                     SourceKind = "Loaded",
                     SerializedFileName = sf.fileName ?? string.Empty,
                     OriginalPath = existingPath ?? string.Empty,
-                    IsPreselected = candidates.Count == 0
+                    IsPreselected = false,
+                    GameObjectCount = goCount,
+                    RendererCount = rendererCount
                 }, loadedFile: hasReader ? sf : null);
             }
         }
+
+        // Sort candidates so explicitly preselected Scene Hierarchy roots appear first, followed by scenes with
+        // real 3D geometry (RendererCount > 0), unknown (-1), and 0-renderer bootstrap/controller shells at the bottom.
+        candidates.Sort(static (a, b) =>
+        {
+            var pre = (a.IsPreselected ? 0 : 1).CompareTo(b.IsPreselected ? 0 : 1);
+            if (pre != 0) return pre;
+
+            static int RankRenderers(int rendererCount) => rendererCount > 0 ? 0 : (rendererCount < 0 ? 1 : 2);
+            var rendRank = RankRenderers(a.RendererCount).CompareTo(RankRenderers(b.RendererCount));
+            if (rendRank != 0) return rendRank;
+
+            static int RankDebugScene(SceneExportCandidate c)
+            {
+                var n = c.Name ?? string.Empty;
+                var p = c.ScenePath ?? string.Empty;
+                return (n.StartsWith("Debug", StringComparison.OrdinalIgnoreCase)
+                    || p.Contains("/Debug/", StringComparison.OrdinalIgnoreCase)) ? 1 : 0;
+            }
+            var debugRank = RankDebugScene(a).CompareTo(RankDebugScene(b));
+            if (debugRank != 0) return debugRank;
+
+            var hasBuild = (a.BuildIndex >= 0 ? 0 : 1).CompareTo(b.BuildIndex >= 0 ? 0 : 1);
+            if (hasBuild != 0) return hasBuild;
+
+            if (a.BuildIndex >= 0 && b.BuildIndex >= 0)
+            {
+                var buildCmp = a.BuildIndex.CompareTo(b.BuildIndex);
+                if (buildCmp != 0) return buildCmp;
+            }
+
+            return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+        });
 
         return (candidates, bindings);
     }
@@ -895,13 +1003,8 @@ public partial class MainWindow
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (binding.SelectedItem?.Handle != null)
-        {
-            TryAttachLoadedSourceFile(binding.SelectedItem.Handle);
-        }
-
         var loaded = FindMatchingLoadedSerializedFiles(binding);
-        if (loaded.Count > 0)
+        if (loaded.Count > 0 && loaded.Any(SerializedFileContainsGameObjects))
         {
             return loaded;
         }
@@ -918,15 +1021,51 @@ public partial class MainWindow
                 assetsManager.WaitForAssetsFileLoaded(binding.Candidate.SerializedFileName, 5000);
             }
 
-            if (binding.SelectedItem?.Handle != null)
-            {
-                TryAttachLoadedSourceFile(binding.SelectedItem.Handle);
-            }
-
             loaded = FindMatchingLoadedSerializedFiles(binding, resolvedDiskPath: srcPath);
         }
 
         return loaded;
+    }
+
+    private static bool SerializedFileContainsGameObjects(SerializedFile? sf)
+    {
+        if (sf == null)
+        {
+            return false;
+        }
+
+        if (sf.m_Objects != null)
+        {
+            for (var i = 0; i < sf.m_Objects.Count; i++)
+            {
+                var info = sf.m_Objects[i];
+                if (info != null && info.classID == (int)ClassIDType.GameObject)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return sf.Objects != null && sf.Objects.Any(static o => o is GameObject);
+    }
+
+    private static bool SerializedFileContainsRenderSettings(SerializedFile? sf)
+    {
+        if (sf?.m_Objects == null)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < sf.m_Objects.Count; i++)
+        {
+            var info = sf.m_Objects[i];
+            if (info != null && info.classID == (int)ClassIDType.RenderSettings)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private List<SerializedFile> FindMatchingLoadedSerializedFiles(SceneCandidateBinding binding, string? resolvedDiskPath = null)
@@ -936,19 +1075,117 @@ public partial class MainWindow
             return new List<SerializedFile> { binding.LoadedSerializedFile };
         }
 
-        if (binding.SelectedItem?.Handle?.SourceFile?.reader != null)
-        {
-            return new List<SerializedFile> { binding.SelectedItem.Handle.SourceFile };
-        }
-
-        if (binding.SelectedItem?.SourceFile?.reader != null)
-        {
-            return new List<SerializedFile> { binding.SelectedItem.SourceFile };
-        }
-
         var sourcePath = !string.IsNullOrWhiteSpace(resolvedDiskPath) ? resolvedDiskPath : binding.Candidate.OriginalPath;
         var sfName = binding.Candidate.SerializedFileName;
         var snapshot = GetLoadedFilesSnapshot();
+
+        SerializedFile? TryMatchExactSceneCabFromAssetBundle(IReadOnlyList<SerializedFile> bundleFiles)
+        {
+            if (bundleFiles.Count <= 1)
+            {
+                return null;
+            }
+
+            var wantedPath = binding.Candidate.ScenePath?.Trim().Replace('\\', '/') ?? string.Empty;
+            var wantedKey = binding.Candidate.ContainerKey?.Trim().Replace('\\', '/') ?? string.Empty;
+            var wantedLeaf = BuildSettings.ExtractSceneDisplayName(!string.IsNullOrEmpty(wantedPath) ? wantedPath : wantedKey);
+            if (wantedPath.Length == 0 && wantedKey.Length == 0 && string.IsNullOrWhiteSpace(wantedLeaf))
+            {
+                return null;
+            }
+
+            var abTypeSet = new HashSet<ClassIDType> { ClassIDType.AssetBundle };
+            for (var i = 0; i < bundleFiles.Count; i++)
+            {
+                var bsf = bundleFiles[i];
+                if (bsf?.reader == null)
+                {
+                    continue;
+                }
+
+                SceneGlbExportService.MaterializeSceneObjectsForFile(assetsManager, bsf, abTypeSet);
+                AssetStudio.Object[] objs;
+                lock (bsf)
+                {
+                    objs = bsf.Objects != null ? bsf.Objects.ToArray() : Array.Empty<AssetStudio.Object>();
+                }
+
+                for (var o = 0; o < objs.Length; o++)
+                {
+                    if (objs[o] is not AssetBundle ab || ab.m_SceneHashes == null || ab.m_SceneHashes.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    for (var h = 0; h < ab.m_SceneHashes.Length; h++)
+                    {
+                        var hashKey = ab.m_SceneHashes[h].Key?.Trim().Replace('\\', '/') ?? string.Empty;
+                        var cabName = ab.m_SceneHashes[h].Value;
+                        if (string.IsNullOrWhiteSpace(hashKey) || string.IsNullOrWhiteSpace(cabName))
+                        {
+                            continue;
+                        }
+
+                        var hashLeaf = BuildSettings.ExtractSceneDisplayName(hashKey);
+                        if ((wantedPath.Length > 0 && string.Equals(hashKey, wantedPath, StringComparison.OrdinalIgnoreCase))
+                            || (wantedKey.Length > 0 && string.Equals(hashKey, wantedKey, StringComparison.OrdinalIgnoreCase))
+                            || (!string.IsNullOrWhiteSpace(wantedLeaf) && string.Equals(hashLeaf, wantedLeaf, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            var exactCab = bundleFiles.FirstOrDefault(sf =>
+                                sf?.reader != null && string.Equals(sf.fileName, cabName, StringComparison.OrdinalIgnoreCase));
+                            if (exactCab != null)
+                            {
+                                return exactCab;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        List<SerializedFile> PreferSceneFilesInSameBundle(SerializedFile matched)
+        {
+            var bundlePath = !string.IsNullOrWhiteSpace(sourcePath)
+                ? sourcePath
+                : (!string.IsNullOrWhiteSpace(matched.originalPath) ? matched.originalPath : matched.fullName);
+
+            if (!string.IsNullOrWhiteSpace(bundlePath)
+                && (ProjectLoadingService.IsSharedAssetsCompanionName(matched.fileName) || !SerializedFileContainsGameObjects(matched)))
+            {
+                var allInBundle = snapshot
+                    .Where(sf => sf?.reader != null
+                        && (IsSameLazySource(sf.originalPath, bundlePath) || IsSameLazySource(sf.fullName, bundlePath)))
+                    .ToList();
+
+                var exactFromHashes = TryMatchExactSceneCabFromAssetBundle(allInBundle);
+                if (exactFromHashes != null)
+                {
+                    return new List<SerializedFile> { exactFromHashes };
+                }
+
+                var siblings = allInBundle.Where(sf => !ReferenceEquals(sf, matched)).ToList();
+
+                var renderSettingsSiblings = siblings
+                    .Where(static sf => SerializedFileContainsRenderSettings(sf) && !ProjectLoadingService.IsSharedAssetsCompanionName(sf.fileName))
+                    .ToList();
+                if (renderSettingsSiblings.Count > 0)
+                {
+                    return renderSettingsSiblings;
+                }
+
+                var goSiblings = siblings
+                    .Where(static sf => SerializedFileContainsGameObjects(sf) && !ProjectLoadingService.IsSharedAssetsCompanionName(sf.fileName))
+                    .ToList();
+                if (goSiblings.Count > 0)
+                {
+                    return goSiblings;
+                }
+            }
+
+            return new List<SerializedFile> { matched };
+        }
 
         if (!string.IsNullOrWhiteSpace(sfName))
         {
@@ -960,7 +1197,7 @@ public partial class MainWindow
                     || IsSameLazySource(sf.fullName, sourcePath)));
             if (exactMatch != null)
             {
-                return new List<SerializedFile> { exactMatch };
+                return PreferSceneFilesInSameBundle(exactMatch);
             }
 
             var nameMatch = snapshot.FirstOrDefault(sf =>
@@ -968,17 +1205,41 @@ public partial class MainWindow
                 && string.Equals(sf.fileName, sfName, StringComparison.OrdinalIgnoreCase));
             if (nameMatch != null)
             {
-                return new List<SerializedFile> { nameMatch };
+                return PreferSceneFilesInSameBundle(nameMatch);
             }
         }
 
         if (!string.IsNullOrWhiteSpace(sourcePath))
         {
-            return snapshot
+            var byPath = snapshot
                 .Where(sf => sf?.reader != null
                     && (IsSameLazySource(sf.originalPath, sourcePath)
                         || IsSameLazySource(sf.fullName, sourcePath)))
                 .ToList();
+
+            var exactFromHashes = TryMatchExactSceneCabFromAssetBundle(byPath);
+            if (exactFromHashes != null)
+            {
+                return new List<SerializedFile> { exactFromHashes };
+            }
+
+            var withRenderSettings = byPath
+                .Where(static sf => SerializedFileContainsRenderSettings(sf) && !ProjectLoadingService.IsSharedAssetsCompanionName(sf.fileName))
+                .ToList();
+            if (withRenderSettings.Count > 0)
+            {
+                return withRenderSettings;
+            }
+
+            var withGameObjects = byPath
+                .Where(static sf => SerializedFileContainsGameObjects(sf) && !ProjectLoadingService.IsSharedAssetsCompanionName(sf.fileName))
+                .ToList();
+            if (withGameObjects.Count > 0)
+            {
+                return withGameObjects;
+            }
+
+            return byPath;
         }
 
         return new List<SerializedFile>();
@@ -1025,54 +1286,6 @@ public partial class MainWindow
         }
 
         SceneGlbExportService.MaterializeSceneObjectsForFile(assetsManager, sourceFile, objectTypes, cancellationToken);
-    }
-
-    private SerializedFile? TryResolveSemanticSceneFileForSelectedAsset(AssetItem selectedItem, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        AssetStudio.Object? asset = selectedItem.Asset;
-        if (asset == null && selectedItem.Handle != null)
-        {
-            asset = ResolveSemanticRelationHandleForPreview(selectedItem.Handle);
-        }
-
-        if (asset is Mesh mesh)
-        {
-            var renderer = TryFindRendererForMeshFromSemanticCache(mesh);
-            if (renderer?.assetsFile != null)
-            {
-                return renderer.assetsFile;
-            }
-
-            if (TryFindModelGroupForMesh(mesh, out var group, out var parts) && group != null)
-            {
-                if (!string.IsNullOrWhiteSpace(group.RootGameObjectAssetId))
-                {
-                    var rootGo = ResolvePreviewCandidateAsset(group.RootGameObjectAssetId) as GameObject;
-                    if (rootGo?.assetsFile != null)
-                    {
-                        return rootGo.assetsFile;
-                    }
-                }
-
-                var firstRendererId = parts.FirstOrDefault(static p => !string.IsNullOrWhiteSpace(p.RendererAssetId))?.RendererAssetId;
-                if (!string.IsNullOrWhiteSpace(firstRendererId))
-                {
-                    var partRenderer = ResolvePreviewCandidateAsset(firstRendererId) as Renderer;
-                    if (partRenderer?.assetsFile != null)
-                    {
-                        return partRenderer.assetsFile;
-                    }
-                }
-            }
-        }
-        else if (asset is Animator animator && animator.m_GameObject != null && animator.m_GameObject.TryGet(out var animGo) && animGo?.assetsFile != null)
-        {
-            return animGo.assetsFile;
-        }
-
-        return null;
     }
 
     private Mesh? ResolveSceneMeshForRenderer(Renderer renderer, SceneExportResolverContext context)

@@ -32,6 +32,7 @@ namespace AssetStudio
         public string TargetFileName { get; init; } = string.Empty;
         public long TargetPathId { get; init; }
         public string TargetGuid { get; init; } = string.Empty;
+        public bool PreservePrefabRootName { get; init; }
     }
 
     public sealed class SceneConversionOptions
@@ -1018,7 +1019,7 @@ namespace AssetStudio
             var rawName = go != null && !string.IsNullOrWhiteSpace(go.m_Name)
                 ? go.m_Name
                 : $"GameObject_{trans.m_GameObject.m_PathID}";
-            var frameName = isPrefabRoot ? $"[ScriptSpawned] {rawName}" : rawName;
+            var frameName = isPrefabRoot && !attachment.PreservePrefabRootName ? $"[ScriptSpawned] {rawName}" : rawName;
 
             var pos = trans.m_LocalPosition;
             var rot = trans.m_LocalRotation;

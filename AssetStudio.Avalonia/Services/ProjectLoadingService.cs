@@ -1948,6 +1948,8 @@ namespace AssetStudio.Avalonia.Services
         {
             public List<SourceFileExternalRecord> Externals { get; } = new();
             public List<IndexedSceneRecord> Scenes { get; } = new();
+            public Dictionary<string, (int GameObjectCount, int RendererCount)> SceneFileStats { get; } = new(StringComparer.OrdinalIgnoreCase);
+            public Dictionary<string, List<(string SerializedFileName, string OriginalPath)>> CompanionStageFilesBySceneSf { get; } = new(StringComparer.OrdinalIgnoreCase);
         }
 
         public sealed class SceneIndexingMetadataCollector
@@ -2108,7 +2110,9 @@ namespace AssetStudio.Avalonia.Services
             }
 
             List<IndexedSceneRecord>? bundleScenes = null;
-            if (bundle?.m_Container != null && bundle.m_Container.Length > 0)
+            if (bundle != null
+                && ((bundle.m_Container != null && bundle.m_Container.Length > 0)
+                    || (bundle.m_SceneHashes != null && bundle.m_SceneHashes.Length > 0)))
             {
                 bundleScenes = new List<IndexedSceneRecord>();
                 ExtractAssetBundleUnityScenes(bundle, sf.fileName, origPath, bundleScenes);
@@ -2128,21 +2132,41 @@ namespace AssetStudio.Avalonia.Services
             }
 
             List<IndexedSceneRecord>? heuristicScenes = null;
-            if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, origPath))
+            var hasRenderSettings = HasRenderSettingsObject(sf);
+            if (!IsSharedAssetsCompanionName(sf.fileName))
             {
-                heuristicScenes = new List<IndexedSceneRecord>(1)
+                if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, origPath))
                 {
-                    new IndexedSceneRecord
+                    heuristicScenes = new List<IndexedSceneRecord>(1)
                     {
-                        Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(origPath),
-                        ScenePath = sf.fileName ?? string.Empty,
-                        BuildIndex = TryParseLevelBuildIndex(sf.fileName),
-                        EntrySerializedFileName = sf.fileName ?? string.Empty,
-                        EntryOriginalPath = origPath,
-                        ContainerKey = string.Empty,
-                        SourceKind = "Heuristic"
-                    }
-                };
+                        new IndexedSceneRecord
+                        {
+                            Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(origPath),
+                            ScenePath = sf.fileName ?? string.Empty,
+                            BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                            EntrySerializedFileName = sf.fileName ?? string.Empty,
+                            EntryOriginalPath = origPath,
+                            ContainerKey = string.Empty,
+                            SourceKind = "Heuristic"
+                        }
+                    };
+                }
+                else if (hasRenderSettings)
+                {
+                    heuristicScenes = new List<IndexedSceneRecord>(1)
+                    {
+                        new IndexedSceneRecord
+                        {
+                            Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(origPath),
+                            ScenePath = sf.fileName ?? string.Empty,
+                            BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                            EntrySerializedFileName = sf.fileName ?? string.Empty,
+                            EntryOriginalPath = origPath,
+                            ContainerKey = string.Empty,
+                            SourceKind = "SceneBundle"
+                        }
+                    };
+                }
             }
 
             if ((externals != null && externals.Count > 0)
@@ -2277,6 +2301,32 @@ namespace AssetStudio.Avalonia.Services
             collector?.CopyTo(externalsRaw, bundleScenesRaw, heuristicScenesRaw, buildSettingsMappings);
 
             // 2. Harvest any currently loaded SerializedFiles in AssetsManager (Eager mode or loaded files).
+            var loadedFileStats = new Dictionary<string, (int GameObjectCount, int RendererCount, bool HasRenderSettings, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
+            var mbNamesBySfName = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+            static void RecordCandidatePresetMonoBehaviourName(Dictionary<string, HashSet<string>> targetMap, string? sfName, string? mbName)
+            {
+                if (string.IsNullOrWhiteSpace(sfName)
+                    || string.IsNullOrWhiteSpace(mbName)
+                    || mbName.Length < 7
+                    || mbName.StartsWith("Unnamed_", StringComparison.OrdinalIgnoreCase)
+                    || mbName.IndexOf('_') < 0)
+                {
+                    return;
+                }
+
+                if (!targetMap.TryGetValue(sfName, out var set))
+                {
+                    set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    targetMap[sfName] = set;
+                }
+
+                if (set.Count < 128)
+                {
+                    set.Add(mbName);
+                }
+            }
+
             if (assetsManager != null)
             {
                 SerializedFile[] loadedSnapshot;
@@ -2294,24 +2344,150 @@ namespace AssetStudio.Avalonia.Services
                     }
 
                     CollectFromLoadedSerializedFile(sf, externalsRaw, bundleScenesRaw, heuristicScenesRaw, buildSettingsMappings);
+
+                    if (!string.IsNullOrWhiteSpace(sf.fileName))
+                    {
+                        var (goCount, rendererCount, hasRs) = CountSceneObjectsInSerializedFile(sf);
+                        var orig = !string.IsNullOrWhiteSpace(sf.originalPath) ? sf.originalPath : (sf.fullName ?? string.Empty);
+                        loadedFileStats[sf.fileName] = (goCount, rendererCount, hasRs, orig);
+
+                        if (!hasRs && rendererCount > 0 && sf.Objects != null)
+                        {
+                            AssetStudio.Object[] objs;
+                            lock (sf)
+                            {
+                                objs = sf.Objects.ToArray();
+                            }
+
+                            for (var o = 0; o < objs.Length; o++)
+                            {
+                                if (objs[o] is MonoBehaviour mb && (mb.m_GameObject == null || mb.m_GameObject.IsNull))
+                                {
+                                    RecordCandidatePresetMonoBehaviourName(mbNamesBySfName, sf.fileName, mb.m_Name);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
-            // 3. Inspect handles (BuildSettings handles not yet parsed, .unity containers, and fallback level*/mainData/*scene*).
+            // 3. Inspect handles (BuildSettings handles not yet parsed, .unity containers, RenderSettings streamed scenes, and fallback level*/mainData/*scene*).
             var pathComparer = OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
             var sourceByFileName = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
             var sourceFilesWithGameObjects = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
+            var sourceFilesWithRenderSettings = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
             var buildSettingsFilesToProbe = new HashSet<string>(pathComparer);
             var bundleContainerFilesByPath = new Dictionary<string, (string SerializedFileName, string OriginalPath)>(StringComparer.OrdinalIgnoreCase);
             var sourceByOrigPath = new Dictionary<string, string>(pathComparer);
+            var scenePrimaryFileByOrigPath = new Dictionary<string, (string SerializedFileName, int Priority)>(pathComparer);
+            var fileStatsBySfName = new Dictionary<string, (int GameObjectCount, int RendererCount, bool HasRenderSettings, string OriginalPath, string BestGoName, int BestGoScore)>(StringComparer.OrdinalIgnoreCase);
             var seenRawOrigPaths = new HashSet<string>(pathComparer);
+
+            void UpdateScenePrimaryForOrigPath(string origPath, string sfName, int goCount, bool hasRenderSettings)
+            {
+                if (string.IsNullOrWhiteSpace(origPath) || string.IsNullOrWhiteSpace(sfName))
+                {
+                    return;
+                }
+
+                var isShared = IsSharedAssetsCompanionName(sfName);
+                var priority = (hasRenderSettings && !isShared) ? 4
+                    : (goCount > 0 && !isShared) ? 3
+                    : hasRenderSettings ? 2
+                    : goCount > 0 ? 1
+                    : 0;
+                var normalizedOrig = SafeNormalizePath(origPath);
+                if (!scenePrimaryFileByOrigPath.TryGetValue(normalizedOrig, out var existing) || priority > existing.Priority)
+                {
+                    scenePrimaryFileByOrigPath[normalizedOrig] = (sfName, priority);
+                }
+            }
+
+            foreach (var kvp in loadedFileStats)
+            {
+                fileStatsBySfName[kvp.Key] = (kvp.Value.GameObjectCount, kvp.Value.RendererCount, kvp.Value.HasRenderSettings, kvp.Value.OriginalPath, string.Empty, 0);
+                UpdateScenePrimaryForOrigPath(kvp.Value.OriginalPath, kvp.Key, kvp.Value.GameObjectCount, kvp.Value.HasRenderSettings);
+                if (kvp.Value.HasRenderSettings && !IsSharedAssetsCompanionName(kvp.Key))
+                {
+                    sourceFilesWithRenderSettings.TryAdd(kvp.Key, (kvp.Key, kvp.Value.OriginalPath));
+                }
+            }
 
             var handleSource = handles ?? (assetsManager?.ProjectIndex?.Count > 0 ? assetsManager.ProjectIndex.GetHandles().ToList() : null);
             if (handleSource != null)
             {
                 string? lastSfName = null;
                 string? lastOrigPath = null;
-                string? lastGameObjectSourceKey = null;
+                var runGoCount = 0;
+                var runRendererCount = 0;
+                var runHasRenderSettings = false;
+                var runHasSceneAsset = false;
+                string? runBestGoName = null;
+                var runBestGoScore = 0;
+                var runBestGoPathRank = ulong.MaxValue;
+
+                static ulong ComputeSceneObjectPathRank(long pathId)
+                {
+                    if (pathId == 0)
+                    {
+                        return ulong.MaxValue;
+                    }
+
+                    // Unity scene-authored top-level objects use small positive sequential PathIDs,
+                    // while nested prefab instances use large 64-bit hashed PathIDs (often negative as signed Int64).
+                    return pathId > 0 ? (ulong)pathId : ulong.MaxValue - 1UL;
+                }
+
+                void FlushCurrentSfRun()
+                {
+                    if (string.IsNullOrEmpty(lastSfName))
+                    {
+                        return;
+                    }
+
+                    var orig = lastOrigPath ?? string.Empty;
+                    if (fileStatsBySfName.TryGetValue(lastSfName, out var prev))
+                    {
+                        var totalGo = prev.GameObjectCount + runGoCount;
+                        var totalRend = prev.RendererCount + runRendererCount;
+                        var totalRs = prev.HasRenderSettings || runHasRenderSettings;
+                        var bestName = runBestGoScore > prev.BestGoScore ? (runBestGoName ?? string.Empty) : prev.BestGoName;
+                        var bestScore = Math.Max(prev.BestGoScore, runBestGoScore);
+                        var bestOrig = !string.IsNullOrEmpty(prev.OriginalPath) ? prev.OriginalPath : orig;
+                        fileStatsBySfName[lastSfName] = (totalGo, totalRend, totalRs, bestOrig, bestName, bestScore);
+                        UpdateScenePrimaryForOrigPath(bestOrig, lastSfName, totalGo, totalRs);
+                        if (totalRs && !IsSharedAssetsCompanionName(lastSfName))
+                        {
+                            sourceFilesWithRenderSettings.TryAdd(lastSfName, (lastSfName, bestOrig));
+                        }
+                        if (totalGo > 0 || runHasSceneAsset)
+                        {
+                            sourceFilesWithGameObjects.TryAdd(lastSfName, (lastSfName, bestOrig));
+                        }
+                    }
+                    else
+                    {
+                        fileStatsBySfName[lastSfName] = (runGoCount, runRendererCount, runHasRenderSettings, orig, runBestGoName ?? string.Empty, runBestGoScore);
+                        UpdateScenePrimaryForOrigPath(orig, lastSfName, runGoCount, runHasRenderSettings);
+                        if (runHasRenderSettings && !IsSharedAssetsCompanionName(lastSfName))
+                        {
+                            sourceFilesWithRenderSettings.TryAdd(lastSfName, (lastSfName, orig));
+                        }
+                        if (runGoCount > 0 || runHasSceneAsset)
+                        {
+                            sourceFilesWithGameObjects.TryAdd(lastSfName, (lastSfName, orig));
+                        }
+                    }
+
+                    runGoCount = 0;
+                    runRendererCount = 0;
+                    runHasRenderSettings = false;
+                    runHasSceneAsset = false;
+                    runBestGoName = null;
+                    runBestGoScore = 0;
+                    runBestGoPathRank = ulong.MaxValue;
+                }
+
                 for (var i = 0; i < handleSource.Count; i++)
                 {
                     var h = handleSource[i];
@@ -2324,6 +2500,11 @@ namespace AssetStudio.Avalonia.Services
                     var origPath = h.OriginalPath ?? string.Empty;
                     if (!ReferenceEquals(sfName, lastSfName) || !ReferenceEquals(origPath, lastOrigPath))
                     {
+                        if (!string.Equals(sfName, lastSfName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            FlushCurrentSfRun();
+                        }
+
                         lastSfName = sfName;
                         lastOrigPath = origPath;
                         if (sfName.Length > 0 && sourceByFileName.TryAdd(sfName, (sfName, origPath)) && origPath.Length > 0)
@@ -2342,14 +2523,43 @@ namespace AssetStudio.Avalonia.Services
                     }
 
                     var handleType = h.Type;
-                    if (handleType == ClassIDType.GameObject || handleType == ClassIDType.SceneAsset)
+                    if (handleType == ClassIDType.GameObject)
                     {
-                        var key = sfName.Length > 0 ? sfName : origPath;
-                        if (key.Length > 0 && !ReferenceEquals(key, lastGameObjectSourceKey))
+                        runGoCount++;
+                        var pathRank = ComputeSceneObjectPathRank(h.PathID);
+                        // Prefer scene-authored small positive PathIDs and higher naming scores.
+                        var candidateScore = ScoreSceneGameObjectName(h.Name);
+                        if (candidateScore > 0)
                         {
-                            lastGameObjectSourceKey = key;
-                            sourceFilesWithGameObjects.TryAdd(key, (sfName, origPath));
+                            if (pathRank < 1_000_000UL)
+                            {
+                                candidateScore += 20;
+                            }
+
+                            if (candidateScore > runBestGoScore
+                                || (candidateScore == runBestGoScore && pathRank < runBestGoPathRank))
+                            {
+                                runBestGoScore = candidateScore;
+                                runBestGoPathRank = pathRank;
+                                runBestGoName = h.Name;
+                            }
                         }
+                    }
+                    else if (handleType == ClassIDType.MeshRenderer || handleType == ClassIDType.SkinnedMeshRenderer)
+                    {
+                        runRendererCount++;
+                    }
+                    else if (handleType == ClassIDType.RenderSettings)
+                    {
+                        runHasRenderSettings = true;
+                    }
+                    else if (handleType == ClassIDType.SceneAsset)
+                    {
+                        runHasSceneAsset = true;
+                    }
+                    else if (handleType == ClassIDType.MonoBehaviour)
+                    {
+                        RecordCandidatePresetMonoBehaviourName(mbNamesBySfName, sfName, h.Name);
                     }
                     else if (handleType == ClassIDType.BuildSettings && origPath.Length > 0 && !buildSettingsFilesToProbe.Contains(origPath) && File.Exists(origPath))
                     {
@@ -2366,6 +2576,13 @@ namespace AssetStudio.Avalonia.Services
                         bundleContainerFilesByPath.TryAdd(normalizedContainer, (sfName, origPath));
                     }
                 }
+
+                FlushCurrentSfRun();
+            }
+
+            foreach (var kvp in fileStatsBySfName)
+            {
+                result.SceneFileStats[kvp.Key] = (kvp.Value.GameObjectCount, kvp.Value.RendererCount);
             }
 
             // If BuildSettings wasn't captured yet (e.g. direct SaveIndexCache or warm cache without collector), probe just that tiny file!
@@ -2381,6 +2598,65 @@ namespace AssetStudio.Avalonia.Services
                         tempCollector);
                 }
                 tempCollector.CopyTo(externalsRaw, bundleScenesRaw, heuristicScenesRaw, buildSettingsMappings);
+            }
+
+            // Load Addressables catalogs ahead of merge so multi-scene bundles can probe AssetBundle.m_SceneHashes when needed.
+            var catalogs = catalogsOverride
+                ?? (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath)
+                    ? AddressablesCatalogDependencyResolver.LoadCatalogsForFiles(Array.Empty<string>(), folderPath)
+                    : (IReadOnlyList<ParsedAddressablesCatalog>)Array.Empty<ParsedAddressablesCatalog>());
+
+            if (catalogs.Count > 0)
+            {
+                var addressablesScenesPerBundle = new Dictionary<string, int>(pathComparer);
+                var existingBundleScenePaths = new HashSet<string>(
+                    bundleScenesRaw.Select(static s => NormalizeScenePath(s.ScenePath)).Where(static p => p.Length > 0),
+                    StringComparer.OrdinalIgnoreCase);
+                var multiSceneBundlesToProbe = new HashSet<string>(pathComparer);
+
+                for (var c = 0; c < catalogs.Count; c++)
+                {
+                    var cat = catalogs[c];
+                    if (cat?.SceneEntries == null) continue;
+                    for (var s = 0; s < cat.SceneEntries.Count; s++)
+                    {
+                        var entry = cat.SceneEntries[s];
+                        if (entry == null) continue;
+                        var resolvedBundle = !string.IsNullOrWhiteSpace(entry.PrimaryBundleInternalId)
+                            ? AddressablesCatalogDependencyResolver.TryResolveLocalBundlePath(cat, entry.PrimaryBundleInternalId, folderPath)
+                            : null;
+                        if (string.IsNullOrEmpty(resolvedBundle) && !string.IsNullOrWhiteSpace(entry.PrimaryBundleFileName))
+                        {
+                            resolvedBundle = AddressablesCatalogDependencyResolver.TryResolveLocalBundlePath(cat, entry.PrimaryBundleFileName, folderPath);
+                        }
+
+                        if (!string.IsNullOrEmpty(resolvedBundle) && File.Exists(resolvedBundle))
+                        {
+                            var normScene = NormalizeScenePath(!string.IsNullOrWhiteSpace(entry.InternalId) ? entry.InternalId : entry.PrimaryKey);
+                            addressablesScenesPerBundle.TryGetValue(resolvedBundle, out var prevCount);
+                            var nextCount = prevCount + 1;
+                            addressablesScenesPerBundle[resolvedBundle] = nextCount;
+                            if (nextCount > 1 && !existingBundleScenePaths.Contains(normScene))
+                            {
+                                multiSceneBundlesToProbe.Add(resolvedBundle);
+                            }
+                        }
+                    }
+                }
+
+                if (multiSceneBundlesToProbe.Count > 0)
+                {
+                    var multiSceneCollector = new SceneIndexingMetadataCollector();
+                    foreach (var multiBundlePath in multiSceneBundlesToProbe)
+                    {
+                        TryCollectHeaderExternalsAndScenesFromFile(
+                            multiBundlePath,
+                            assetsManager?.DecompressionCache,
+                            assetsManager?.SpecifyUnityVersion,
+                            multiSceneCollector);
+                    }
+                    multiSceneCollector.CopyTo(externalsRaw, bundleScenesRaw, heuristicScenesRaw, buildSettingsMappings);
+                }
             }
 
             // Also include any .unity container paths found on AssetHandles.
@@ -2417,10 +2693,56 @@ namespace AssetStudio.Avalonia.Services
                 }
             }
 
-            // Merge & deduplicate discovered scenes by priority: (a) BuildSettings -> (b) AssetBundle -> (c) Addressables -> (d) Heuristic.
+            // Merge & deduplicate discovered scenes by priority: (a) BuildSettings -> (b) AssetBundle -> (c) Addressables -> (d) Streamed SceneBundle (RenderSettings) -> (e) Heuristic.
             var mergedScenes = new List<IndexedSceneRecord>();
             var coveredFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var coveredScenePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var coveredOrigPaths = new HashSet<string>(pathComparer);
+
+            string ResolveBestSceneSerializedFileName(string? candidateSfName, string? originalPath)
+            {
+                var current = candidateSfName ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(originalPath))
+                {
+                    return current;
+                }
+
+                var normalizedOrig = SafeNormalizePath(originalPath);
+                if (!scenePrimaryFileByOrigPath.TryGetValue(normalizedOrig, out var preferred) || preferred.Priority <= 0)
+                {
+                    return current;
+                }
+
+                // Retarget empty names, .sharedAssets metadata companions, or 0-GameObject metadata CABs
+                // to the sibling scene SerializedFile in the same bundle (e.g. CAB-<hash> instead of CAB-<hash>.sharedAssets).
+                var shouldRetarget = string.IsNullOrWhiteSpace(current)
+                    || IsSharedAssetsCompanionName(current)
+                    || (fileStatsBySfName.TryGetValue(current, out var curStats)
+                        && curStats.GameObjectCount == 0
+                        && !curStats.HasRenderSettings);
+
+                return shouldRetarget ? preferred.SerializedFileName : current;
+            }
+
+            void MarkSceneCovered(string? rawSfName, string? resolvedSfName, string? scenePath, string? origPath)
+            {
+                if (!string.IsNullOrEmpty(rawSfName))
+                {
+                    coveredFileNames.Add(rawSfName);
+                }
+                if (!string.IsNullOrEmpty(resolvedSfName))
+                {
+                    coveredFileNames.Add(resolvedSfName);
+                }
+                if (!string.IsNullOrEmpty(scenePath))
+                {
+                    coveredScenePaths.Add(scenePath);
+                }
+                if (!string.IsNullOrWhiteSpace(origPath))
+                {
+                    coveredOrigPaths.Add(SafeNormalizePath(origPath));
+                }
+            }
 
             // (a) BuildSettings scenes
             var seenBuildIndices = new HashSet<int>();
@@ -2469,11 +2791,7 @@ namespace AssetStudio.Avalonia.Services
                     SourceKind = "BuildSettings"
                 });
 
-                if (!string.IsNullOrEmpty(entrySfName))
-                {
-                    coveredFileNames.Add(entrySfName);
-                }
-                coveredScenePaths.Add(normalizedPath);
+                MarkSceneCovered(mapping.LevelFileName, entrySfName, normalizedPath, entryOrigPath);
             }
 
             // (b) AssetBundle .unity container entries
@@ -2491,6 +2809,7 @@ namespace AssetStudio.Avalonia.Services
                     continue;
                 }
 
+                var resolvedSfName = ResolveBestSceneSerializedFileName(scene.EntrySerializedFileName, scene.EntryOriginalPath);
                 mergedScenes.Add(new IndexedSceneRecord
                 {
                     Name = string.IsNullOrWhiteSpace(scene.Name)
@@ -2498,28 +2817,16 @@ namespace AssetStudio.Avalonia.Services
                         : scene.Name,
                     ScenePath = normalizedPath,
                     BuildIndex = scene.BuildIndex,
-                    EntrySerializedFileName = scene.EntrySerializedFileName,
+                    EntrySerializedFileName = resolvedSfName,
                     EntryOriginalPath = scene.EntryOriginalPath,
                     ContainerKey = string.IsNullOrWhiteSpace(scene.ContainerKey) ? normalizedPath : scene.ContainerKey,
                     SourceKind = "AssetBundle"
                 });
 
-                if (!string.IsNullOrEmpty(scene.EntrySerializedFileName))
-                {
-                    coveredFileNames.Add(scene.EntrySerializedFileName);
-                }
-                if (!string.IsNullOrEmpty(normalizedPath))
-                {
-                    coveredScenePaths.Add(normalizedPath);
-                }
+                MarkSceneCovered(scene.EntrySerializedFileName, resolvedSfName, normalizedPath, scene.EntryOriginalPath);
             }
 
             // (c) Addressables SceneEntries (SceneProvider)
-            var catalogs = catalogsOverride
-                ?? (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath)
-                    ? AddressablesCatalogDependencyResolver.LoadCatalogsForFiles(Array.Empty<string>(), folderPath)
-                    : (IReadOnlyList<ParsedAddressablesCatalog>)Array.Empty<ParsedAddressablesCatalog>());
-
             for (var c = 0; c < catalogs.Count; c++)
             {
                 var catalog = catalogs[c];
@@ -2552,12 +2859,20 @@ namespace AssetStudio.Avalonia.Services
                     }
 
                     var entrySfName = string.Empty;
-                    if (!string.IsNullOrEmpty(resolvedBundlePath)
-                        && sourceByOrigPath.TryGetValue(SafeNormalizePath(resolvedBundlePath), out var mappedSf))
+                    if (!string.IsNullOrEmpty(resolvedBundlePath))
                     {
-                        entrySfName = mappedSf;
+                        var normBundlePath = SafeNormalizePath(resolvedBundlePath);
+                        if (scenePrimaryFileByOrigPath.TryGetValue(normBundlePath, out var preferredSf) && preferredSf.Priority > 0)
+                        {
+                            entrySfName = preferredSf.SerializedFileName;
+                        }
+                        else if (sourceByOrigPath.TryGetValue(normBundlePath, out var mappedSf))
+                        {
+                            entrySfName = mappedSf;
+                        }
                     }
-                    else if (!string.IsNullOrWhiteSpace(entry.PrimaryBundleFileName))
+
+                    if (string.IsNullOrEmpty(entrySfName) && !string.IsNullOrWhiteSpace(entry.PrimaryBundleFileName))
                     {
                         entrySfName = entry.PrimaryBundleFileName;
                     }
@@ -2579,18 +2894,65 @@ namespace AssetStudio.Avalonia.Services
                         SourceKind = "Addressables"
                     });
 
-                    if (!string.IsNullOrEmpty(entrySfName))
-                    {
-                        coveredFileNames.Add(entrySfName);
-                    }
-                    if (!string.IsNullOrEmpty(normalizedPath))
-                    {
-                        coveredScenePaths.Add(normalizedPath);
-                    }
+                    MarkSceneCovered(entry.PrimaryBundleFileName, entrySfName, normalizedPath, resolvedBundlePath);
                 }
             }
 
-            // (d) Fallback level* / mainData / *scene* serialized files not already covered by (a)-(c)
+            // (d) Streamed Unity Scene AssetBundles detected via engine-native RenderSettings (ClassID 104)
+            // — catches obfuscated/hashed-key streamed scene bundles that have no .unity suffix or SceneProvider.
+            var renderSettingsCountByOrigPath = new Dictionary<string, int>(pathComparer);
+            foreach (var kvp in sourceFilesWithRenderSettings)
+            {
+                var (_, origPath) = kvp.Value;
+                if (!string.IsNullOrWhiteSpace(origPath))
+                {
+                    var normOrig = SafeNormalizePath(origPath);
+                    renderSettingsCountByOrigPath.TryGetValue(normOrig, out var c);
+                    renderSettingsCountByOrigPath[normOrig] = c + 1;
+                }
+            }
+
+            foreach (var kvp in sourceFilesWithRenderSettings)
+            {
+                var (sfName, origPath) = kvp.Value;
+                if (string.IsNullOrWhiteSpace(sfName) || IsSharedAssetsCompanionName(sfName))
+                {
+                    continue;
+                }
+
+                var normOrig = !string.IsNullOrWhiteSpace(origPath) ? SafeNormalizePath(origPath) : string.Empty;
+                var hasMultipleScenesInSameBundle = normOrig.Length > 0
+                    && renderSettingsCountByOrigPath.TryGetValue(normOrig, out var rsCount)
+                    && rsCount > 1;
+
+                if (coveredFileNames.Contains(sfName)
+                    || (!hasMultipleScenesInSameBundle && normOrig.Length > 0 && coveredOrigPaths.Contains(normOrig)))
+                {
+                    continue;
+                }
+
+                var bestGoName = fileStatsBySfName.TryGetValue(sfName, out var stats) ? stats.BestGoName : string.Empty;
+                var buildIdx = TryParseLevelBuildIndex(sfName);
+                var isLevelFile = buildIdx >= 0 || string.Equals(sfName, "mainData", StringComparison.OrdinalIgnoreCase);
+                var displayName = isLevelFile
+                    ? sfName
+                    : BuildStreamedSceneDisplayName(sfName, origPath, bestGoName);
+
+                mergedScenes.Add(new IndexedSceneRecord
+                {
+                    Name = displayName,
+                    ScenePath = sfName,
+                    BuildIndex = buildIdx,
+                    EntrySerializedFileName = sfName,
+                    EntryOriginalPath = origPath,
+                    ContainerKey = string.Empty,
+                    SourceKind = isLevelFile ? "Heuristic" : "SceneBundle"
+                });
+
+                MarkSceneCovered(sfName, sfName, sfName, origPath);
+            }
+
+            // (e) Fallback level* / mainData / *scene* serialized files not already covered by (a)-(d)
             foreach (var heuristic in heuristicScenesRaw)
             {
                 if (heuristic == null)
@@ -2599,7 +2961,18 @@ namespace AssetStudio.Avalonia.Services
                 }
 
                 var sfName = heuristic.EntrySerializedFileName;
+                if (IsSharedAssetsCompanionName(sfName))
+                {
+                    continue;
+                }
+
                 if (!string.IsNullOrEmpty(sfName) && coveredFileNames.Contains(sfName))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(heuristic.EntryOriginalPath)
+                    && coveredOrigPaths.Contains(SafeNormalizePath(heuristic.EntryOriginalPath)))
                 {
                     continue;
                 }
@@ -2610,26 +2983,43 @@ namespace AssetStudio.Avalonia.Services
                     continue;
                 }
 
-                mergedScenes.Add(heuristic);
-                if (!string.IsNullOrEmpty(sfName))
+                var finalRecord = heuristic;
+                if (string.Equals(heuristic.SourceKind, "SceneBundle", StringComparison.OrdinalIgnoreCase)
+                    && !string.IsNullOrEmpty(sfName)
+                    && string.Equals(heuristic.Name, sfName, StringComparison.OrdinalIgnoreCase)
+                    && fileStatsBySfName.TryGetValue(sfName, out var hStats)
+                    && !string.IsNullOrWhiteSpace(hStats.BestGoName))
                 {
-                    coveredFileNames.Add(sfName);
+                    finalRecord = new IndexedSceneRecord
+                    {
+                        Name = BuildStreamedSceneDisplayName(sfName, heuristic.EntryOriginalPath, hStats.BestGoName),
+                        ScenePath = heuristic.ScenePath,
+                        BuildIndex = heuristic.BuildIndex,
+                        EntrySerializedFileName = heuristic.EntrySerializedFileName,
+                        EntryOriginalPath = heuristic.EntryOriginalPath,
+                        ContainerKey = heuristic.ContainerKey,
+                        SourceKind = heuristic.SourceKind
+                    };
                 }
-                if (!string.IsNullOrEmpty(normalizedPath))
-                {
-                    coveredScenePaths.Add(normalizedPath);
-                }
+
+                mergedScenes.Add(finalRecord);
+                MarkSceneCovered(sfName, sfName, normalizedPath, heuristic.EntryOriginalPath);
             }
 
             foreach (var kvp in sourceFilesWithGameObjects)
             {
                 var (sfName, origPath) = kvp.Value;
-                if (!IsFallbackSceneSourceName(sfName, origPath))
+                if (IsSharedAssetsCompanionName(sfName) || !IsFallbackSceneSourceName(sfName, origPath))
                 {
                     continue;
                 }
 
                 if (!string.IsNullOrEmpty(sfName) && coveredFileNames.Contains(sfName))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(origPath) && coveredOrigPaths.Contains(SafeNormalizePath(origPath)))
                 {
                     continue;
                 }
@@ -2648,10 +3038,7 @@ namespace AssetStudio.Avalonia.Services
                     SourceKind = "Heuristic"
                 });
 
-                if (!string.IsNullOrEmpty(sfName))
-                {
-                    coveredFileNames.Add(sfName);
-                }
+                MarkSceneCovered(sfName, sfName, sfName, origPath);
             }
 
             // Assign deterministic SceneIds (1..N)
@@ -2677,6 +3064,109 @@ namespace AssetStudio.Avalonia.Services
                     ContainerKey = s.ContainerKey,
                     SourceKind = s.SourceKind
                 });
+            }
+
+            // Match modular companion stage preset bundles (non-scene SerializedFiles with ScriptableObject presets
+            // named "<StageStem>_*" and 3D renderers) in O(N) so modular scenes report complete geometry counts and bind their stage prefabs.
+            if (result.Scenes.Count > 0 && mbNamesBySfName.Count > 0)
+            {
+                var scenesByStageStem = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                for (var i = 0; i < result.Scenes.Count; i++)
+                {
+                    var scene = result.Scenes[i];
+                    if (string.IsNullOrWhiteSpace(scene.EntrySerializedFileName))
+                    {
+                        continue;
+                    }
+
+                    var bestGo = fileStatsBySfName.TryGetValue(scene.EntrySerializedFileName, out var st) ? st.BestGoName : null;
+                    var stem = ExtractSceneStageStem(scene.Name, bestGo);
+                    if (stem.Length < 6)
+                    {
+                        continue;
+                    }
+
+                    if (!scenesByStageStem.TryGetValue(stem, out var sfList))
+                    {
+                        sfList = new List<string>(1);
+                        scenesByStageStem[stem] = sfList;
+                    }
+
+                    if (!sfList.Contains(scene.EntrySerializedFileName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        sfList.Add(scene.EntrySerializedFileName);
+                    }
+                }
+
+                if (scenesByStageStem.Count > 0)
+                {
+                    var matchedCountPerStemInComp = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var (compSfName, mbNames) in mbNamesBySfName)
+                    {
+                        if (IsSharedAssetsCompanionName(compSfName)
+                            || coveredFileNames.Contains(compSfName)
+                            || !fileStatsBySfName.TryGetValue(compSfName, out var compStats)
+                            || compStats.HasRenderSettings
+                            || compStats.RendererCount <= 0)
+                        {
+                            continue;
+                        }
+
+                        matchedCountPerStemInComp.Clear();
+                        foreach (var mbName in mbNames)
+                        {
+                            for (var u = 6; u < mbName.Length - 1; u++)
+                            {
+                                if (mbName[u] != '_')
+                                {
+                                    continue;
+                                }
+
+                                var candidateStem = mbName.Substring(0, u);
+                                if (scenesByStageStem.ContainsKey(candidateStem))
+                                {
+                                    matchedCountPerStemInComp.TryGetValue(candidateStem, out var prevCnt);
+                                    matchedCountPerStemInComp[candidateStem] = prevCnt + 1;
+                                }
+                            }
+                        }
+
+                        foreach (var (matchedStem, presetCount) in matchedCountPerStemInComp)
+                        {
+                            var estGo = Math.Max(1, compStats.GameObjectCount / Math.Max(1, presetCount));
+                            var estRend = Math.Max(1, compStats.RendererCount / Math.Max(1, presetCount));
+
+                            foreach (var sceneSfName in scenesByStageStem[matchedStem])
+                            {
+                                if (string.Equals(sceneSfName, compSfName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    continue;
+                                }
+
+                                if (!result.CompanionStageFilesBySceneSf.TryGetValue(sceneSfName, out var compList))
+                                {
+                                    compList = new List<(string, string)>();
+                                    result.CompanionStageFilesBySceneSf[sceneSfName] = compList;
+                                }
+
+                                if (!compList.Any(x => string.Equals(x.SerializedFileName, compSfName, StringComparison.OrdinalIgnoreCase)))
+                                {
+                                    compList.Add((compSfName, compStats.OriginalPath));
+                                    if (result.SceneFileStats.TryGetValue(sceneSfName, out var curSceneStats))
+                                    {
+                                        result.SceneFileStats[sceneSfName] = (
+                                            Math.Max(0, curSceneStats.GameObjectCount) + estGo,
+                                            Math.Max(0, curSceneStats.RendererCount) + estRend);
+                                    }
+                                    else
+                                    {
+                                        result.SceneFileStats[sceneSfName] = (estGo, estRend);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             return result;
@@ -2734,6 +3224,7 @@ namespace AssetStudio.Avalonia.Services
             RecordSerializedFileExternals(sf, originalPath, externals);
 
             var hasGameObjects = false;
+            var hasRenderSettings = false;
             if (sf.m_Objects != null)
             {
                 for (var i = 0; i < sf.m_Objects.Count; i++)
@@ -2747,6 +3238,10 @@ namespace AssetStudio.Avalonia.Services
                     if (objInfo.classID == (int)ClassIDType.GameObject || objInfo.classID == (int)ClassIDType.SceneAsset)
                     {
                         hasGameObjects = true;
+                    }
+                    else if (objInfo.classID == (int)ClassIDType.RenderSettings)
+                    {
+                        hasRenderSettings = true;
                     }
                     else if (objInfo.classID == (int)ClassIDType.BuildSettings)
                     {
@@ -2783,18 +3278,34 @@ namespace AssetStudio.Avalonia.Services
                 }
             }
 
-            if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, originalPath))
+            if (!IsSharedAssetsCompanionName(sf.fileName))
             {
-                heuristicScenes.Add(new IndexedSceneRecord
+                if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, originalPath))
                 {
-                    Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(originalPath),
-                    ScenePath = sf.fileName ?? string.Empty,
-                    BuildIndex = TryParseLevelBuildIndex(sf.fileName),
-                    EntrySerializedFileName = sf.fileName ?? string.Empty,
-                    EntryOriginalPath = originalPath,
-                    ContainerKey = string.Empty,
-                    SourceKind = "Heuristic"
-                });
+                    heuristicScenes.Add(new IndexedSceneRecord
+                    {
+                        Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(originalPath),
+                        ScenePath = sf.fileName ?? string.Empty,
+                        BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                        EntrySerializedFileName = sf.fileName ?? string.Empty,
+                        EntryOriginalPath = originalPath,
+                        ContainerKey = string.Empty,
+                        SourceKind = "Heuristic"
+                    });
+                }
+                else if (hasRenderSettings)
+                {
+                    heuristicScenes.Add(new IndexedSceneRecord
+                    {
+                        Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(originalPath),
+                        ScenePath = sf.fileName ?? string.Empty,
+                        BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                        EntrySerializedFileName = sf.fileName ?? string.Empty,
+                        EntryOriginalPath = originalPath,
+                        ContainerKey = string.Empty,
+                        SourceKind = "SceneBundle"
+                    });
+                }
             }
         }
 
@@ -2809,6 +3320,7 @@ namespace AssetStudio.Avalonia.Services
             RecordSerializedFileExternals(sf, origPath, externals);
 
             var hasGameObjects = false;
+            var hasRenderSettings = false;
             AssetStudio.Object[] objectsSnapshot;
             lock (sf)
             {
@@ -2817,7 +3329,8 @@ namespace AssetStudio.Avalonia.Services
 
             for (var i = 0; i < objectsSnapshot.Length; i++)
             {
-                switch (objectsSnapshot[i])
+                var obj = objectsSnapshot[i];
+                switch (obj)
                 {
                     case BuildSettings bs:
                         foreach (var (levelName, buildIdx, scenePath) in bs.GetLevelSceneMappings())
@@ -2834,34 +3347,69 @@ namespace AssetStudio.Avalonia.Services
                     case GameObject:
                         hasGameObjects = true;
                         break;
+                    default:
+                        if (obj != null && obj.type == ClassIDType.RenderSettings)
+                        {
+                            hasRenderSettings = true;
+                        }
+                        break;
                 }
             }
 
-            if (!hasGameObjects && sf.m_Objects != null)
+            if ((!hasGameObjects || !hasRenderSettings) && sf.m_Objects != null)
             {
                 for (var i = 0; i < sf.m_Objects.Count; i++)
                 {
                     var info = sf.m_Objects[i];
-                    if (info != null && (info.classID == (int)ClassIDType.GameObject || info.classID == (int)ClassIDType.SceneAsset))
+                    if (info == null)
+                    {
+                        continue;
+                    }
+
+                    if (info.classID == (int)ClassIDType.GameObject || info.classID == (int)ClassIDType.SceneAsset)
                     {
                         hasGameObjects = true;
+                    }
+                    else if (info.classID == (int)ClassIDType.RenderSettings)
+                    {
+                        hasRenderSettings = true;
+                    }
+
+                    if (hasGameObjects && hasRenderSettings)
+                    {
                         break;
                     }
                 }
             }
 
-            if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, origPath))
+            if (!IsSharedAssetsCompanionName(sf.fileName))
             {
-                heuristicScenes.Add(new IndexedSceneRecord
+                if (hasGameObjects && IsFallbackSceneSourceName(sf.fileName, origPath))
                 {
-                    Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(origPath),
-                    ScenePath = sf.fileName ?? string.Empty,
-                    BuildIndex = TryParseLevelBuildIndex(sf.fileName),
-                    EntrySerializedFileName = sf.fileName ?? string.Empty,
-                    EntryOriginalPath = origPath,
-                    ContainerKey = string.Empty,
-                    SourceKind = "Heuristic"
-                });
+                    heuristicScenes.Add(new IndexedSceneRecord
+                    {
+                        Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(origPath),
+                        ScenePath = sf.fileName ?? string.Empty,
+                        BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                        EntrySerializedFileName = sf.fileName ?? string.Empty,
+                        EntryOriginalPath = origPath,
+                        ContainerKey = string.Empty,
+                        SourceKind = "Heuristic"
+                    });
+                }
+                else if (hasRenderSettings)
+                {
+                    heuristicScenes.Add(new IndexedSceneRecord
+                    {
+                        Name = !string.IsNullOrWhiteSpace(sf.fileName) ? sf.fileName : Path.GetFileNameWithoutExtension(origPath),
+                        ScenePath = sf.fileName ?? string.Empty,
+                        BuildIndex = TryParseLevelBuildIndex(sf.fileName),
+                        EntrySerializedFileName = sf.fileName ?? string.Empty,
+                        EntryOriginalPath = origPath,
+                        ContainerKey = string.Empty,
+                        SourceKind = "SceneBundle"
+                    });
+                }
             }
         }
 
@@ -2904,37 +3452,159 @@ namespace AssetStudio.Avalonia.Services
             }
         }
 
+        public static string ExtractSceneStageStem(string? sceneName, string? fallbackGoName = null)
+        {
+            static string CleanCandidateStem(string? raw)
+            {
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    return string.Empty;
+                }
+
+                var clean = raw.Trim();
+                var parenIdx = clean.IndexOf(" (", StringComparison.Ordinal);
+                if (parenIdx > 0)
+                {
+                    clean = clean.Substring(0, parenIdx).Trim();
+                }
+
+                if (clean.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                {
+                    clean = Path.GetFileNameWithoutExtension(clean);
+                }
+                else if (clean.IndexOf('/') >= 0 || clean.IndexOf('\\') >= 0)
+                {
+                    clean = Path.GetFileNameWithoutExtension(clean);
+                }
+
+                foreach (var suffix in new[] { "_Model", "_Light", "_Effect", "_Scene", "_Stage" })
+                {
+                    if (clean.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) && clean.Length >= suffix.Length + 6)
+                    {
+                        clean = clean.Substring(0, clean.Length - suffix.Length);
+                        break;
+                    }
+                }
+
+                return clean.Length >= 6 && clean.IndexOf('_') > 0 && !clean.StartsWith("CAB-", StringComparison.OrdinalIgnoreCase)
+                    ? clean
+                    : string.Empty;
+            }
+
+            var fromScene = CleanCandidateStem(sceneName);
+            return fromScene.Length > 0 ? fromScene : CleanCandidateStem(fallbackGoName);
+        }
+
         private static void ExtractAssetBundleUnityScenes(
             AssetBundle bundle,
             string serializedFileName,
             string originalPath,
             List<IndexedSceneRecord> bundleScenes)
         {
-            if (bundle?.m_Container == null || bundle.m_Container.Length == 0)
+            if (bundle == null)
             {
                 return;
             }
 
-            for (var i = 0; i < bundle.m_Container.Length; i++)
+            var cabByNormalizedPath = new Dictionary<string, (string OriginalScenePath, string CabName)>(StringComparer.OrdinalIgnoreCase);
+            var cabByLeafName = new Dictionary<string, (string OriginalScenePath, string CabName)>(StringComparer.OrdinalIgnoreCase);
+            if (bundle.m_SceneHashes != null && bundle.m_SceneHashes.Length > 0)
             {
-                var key = bundle.m_Container[i].Key;
-                if (string.IsNullOrWhiteSpace(key) || !key.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                for (var i = 0; i < bundle.m_SceneHashes.Length; i++)
                 {
-                    continue;
-                }
+                    var (hashKey, cabName) = (bundle.m_SceneHashes[i].Key, bundle.m_SceneHashes[i].Value);
+                    if (string.IsNullOrWhiteSpace(hashKey) || string.IsNullOrWhiteSpace(cabName))
+                    {
+                        continue;
+                    }
 
-                var normalizedPath = NormalizeScenePath(key);
-                var displayName = BuildSettings.ExtractSceneDisplayName(normalizedPath);
-                bundleScenes.Add(new IndexedSceneRecord
+                    var normHashKey = NormalizeScenePath(hashKey);
+                    cabByNormalizedPath.TryAdd(normHashKey, (normHashKey, cabName));
+                    var leaf = BuildSettings.ExtractSceneDisplayName(normHashKey);
+                    if (!string.IsNullOrWhiteSpace(leaf))
+                    {
+                        cabByLeafName.TryAdd(leaf, (normHashKey, cabName));
+                    }
+                }
+            }
+
+            var addedScenePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (bundle.m_Container != null && bundle.m_Container.Length > 0)
+            {
+                for (var i = 0; i < bundle.m_Container.Length; i++)
                 {
-                    Name = string.IsNullOrWhiteSpace(displayName) ? (serializedFileName ?? string.Empty) : displayName,
-                    ScenePath = normalizedPath,
-                    BuildIndex = -1,
-                    EntrySerializedFileName = serializedFileName ?? string.Empty,
-                    EntryOriginalPath = originalPath ?? string.Empty,
-                    ContainerKey = key,
-                    SourceKind = "AssetBundle"
-                });
+                    var key = bundle.m_Container[i].Key;
+                    if (string.IsNullOrWhiteSpace(key) || !key.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var normalizedPath = NormalizeScenePath(key);
+                    var displayName = BuildSettings.ExtractSceneDisplayName(normalizedPath);
+                    var targetSfName = serializedFileName ?? string.Empty;
+                    if (cabByNormalizedPath.TryGetValue(normalizedPath, out var exactMatch))
+                    {
+                        targetSfName = exactMatch.CabName;
+                        if (exactMatch.OriginalScenePath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                        {
+                            normalizedPath = exactMatch.OriginalScenePath;
+                            displayName = BuildSettings.ExtractSceneDisplayName(normalizedPath);
+                        }
+                    }
+                    else if (!string.IsNullOrWhiteSpace(displayName) && cabByLeafName.TryGetValue(displayName, out var leafMatch))
+                    {
+                        targetSfName = leafMatch.CabName;
+                        if (leafMatch.OriginalScenePath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                        {
+                            normalizedPath = leafMatch.OriginalScenePath;
+                            displayName = BuildSettings.ExtractSceneDisplayName(normalizedPath);
+                        }
+                    }
+
+                    addedScenePaths.Add(normalizedPath);
+                    bundleScenes.Add(new IndexedSceneRecord
+                    {
+                        Name = string.IsNullOrWhiteSpace(displayName) ? targetSfName : displayName,
+                        ScenePath = normalizedPath,
+                        BuildIndex = -1,
+                        EntrySerializedFileName = targetSfName,
+                        EntryOriginalPath = originalPath ?? string.Empty,
+                        ContainerKey = key,
+                        SourceKind = "AssetBundle"
+                    });
+                }
+            }
+
+            if (bundle.m_SceneHashes != null && bundle.m_SceneHashes.Length > 0)
+            {
+                for (var i = 0; i < bundle.m_SceneHashes.Length; i++)
+                {
+                    var (hashKey, cabName) = (bundle.m_SceneHashes[i].Key, bundle.m_SceneHashes[i].Value);
+                    if (string.IsNullOrWhiteSpace(hashKey)
+                        || string.IsNullOrWhiteSpace(cabName)
+                        || !hashKey.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var normalizedPath = NormalizeScenePath(hashKey);
+                    if (!addedScenePaths.Add(normalizedPath))
+                    {
+                        continue;
+                    }
+
+                    var displayName = BuildSettings.ExtractSceneDisplayName(normalizedPath);
+                    bundleScenes.Add(new IndexedSceneRecord
+                    {
+                        Name = string.IsNullOrWhiteSpace(displayName) ? cabName : displayName,
+                        ScenePath = normalizedPath,
+                        BuildIndex = -1,
+                        EntrySerializedFileName = cabName,
+                        EntryOriginalPath = originalPath ?? string.Empty,
+                        ContainerKey = hashKey,
+                        SourceKind = "AssetBundle"
+                    });
+                }
             }
         }
 
@@ -2975,6 +3645,209 @@ namespace AssetStudio.Avalonia.Services
             {
                 return false;
             }
+        }
+
+        private static readonly HashSet<string> GenericSceneGameObjectNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "SceneRoot", "Root", "Scene", "SceneOnly", "Main Camera", "MainCamera", "Camera", "Cameras",
+            "Directional Light", "DirectionalLight", "Light", "Lights", "Lighting", "Point Light", "Spot Light",
+            "Area Light", "Reflection Probe", "ReflectionProbe", "Light Probe Group", "LightProbeGroup",
+            "EventSystem", "Canvas", "UI", "HUD", "Effect", "Effects", "VFX", "FX", "PostProcess",
+            "PostProcessVolume", "Global Volume", "Volume", "Skydome", "SkyDome", "Sky", "Skybox",
+            "Terrain", "Ground", "Floor", "Water", "River", "Sea", "Ocean", "Wind", "Fog", "Cloud", "Clouds",
+            "Navigation", "NavMesh", "NAVIMESH", "Variant", "Model", "Models", "StageModel", "Stage",
+            "Sound", "Sounds", "Audio", "BGM", "SE", "Shadow", "Shadows", "AirWall", "Airwall", "Wall",
+            "Collision", "Collider", "Colliders", "Trigger", "Triggers", "Cube", "Plane", "Sphere", "Quad",
+            "Capsule", "Cylinder", "Empty", "GameObject", "Object", "Objects", "Props", "Environment",
+            "Static", "Dynamic", "DungeonObject", "Spline", "SPLINE", "Rock", "Tree", "Grass", "Plant",
+            "Ruin", "Cliff", "Temple", "Flag", "Goods", "Far", "Near", "Walk", "Dead", "DeadLeaf", "CLT"
+        };
+
+        internal static bool IsSharedAssetsCompanionName(string? fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName))
+            {
+                return false;
+            }
+
+            return fileName.EndsWith(".sharedAssets", StringComparison.OrdinalIgnoreCase)
+                || (fileName.StartsWith("sharedassets", StringComparison.OrdinalIgnoreCase)
+                    && fileName.EndsWith(".assets", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool HasRenderSettingsObject(SerializedFile sf)
+        {
+            if (sf?.m_Objects == null)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < sf.m_Objects.Count; i++)
+            {
+                var info = sf.m_Objects[i];
+                if (info != null && info.classID == (int)ClassIDType.RenderSettings)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static (int GameObjectCount, int RendererCount, bool HasRenderSettings) CountSceneObjectsInSerializedFile(SerializedFile sf)
+        {
+            var goCount = 0;
+            var rendererCount = 0;
+            var hasRenderSettings = false;
+
+            if (sf.m_Objects != null && sf.m_Objects.Count > 0)
+            {
+                for (var i = 0; i < sf.m_Objects.Count; i++)
+                {
+                    var info = sf.m_Objects[i];
+                    if (info == null)
+                    {
+                        continue;
+                    }
+
+                    var cid = info.classID;
+                    if (cid == (int)ClassIDType.GameObject)
+                    {
+                        goCount++;
+                    }
+                    else if (cid == (int)ClassIDType.MeshRenderer || cid == (int)ClassIDType.SkinnedMeshRenderer)
+                    {
+                        rendererCount++;
+                    }
+                    else if (cid == (int)ClassIDType.RenderSettings)
+                    {
+                        hasRenderSettings = true;
+                    }
+                }
+
+                return (goCount, rendererCount, hasRenderSettings);
+            }
+
+            AssetStudio.Object[] objs;
+            lock (sf)
+            {
+                objs = sf.Objects != null ? sf.Objects.ToArray() : Array.Empty<AssetStudio.Object>();
+            }
+
+            for (var i = 0; i < objs.Length; i++)
+            {
+                var obj = objs[i];
+                if (obj == null)
+                {
+                    continue;
+                }
+
+                if (obj.type == ClassIDType.GameObject)
+                {
+                    goCount++;
+                }
+                else if (obj.type == ClassIDType.MeshRenderer || obj.type == ClassIDType.SkinnedMeshRenderer)
+                {
+                    rendererCount++;
+                }
+                else if (obj.type == ClassIDType.RenderSettings)
+                {
+                    hasRenderSettings = true;
+                }
+            }
+
+            return (goCount, rendererCount, hasRenderSettings);
+        }
+
+        private static int ScoreSceneGameObjectName(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return 0;
+            }
+
+            var trimmed = name.Trim();
+            if (trimmed.Length < 4 || trimmed.Length > 64)
+            {
+                return 0;
+            }
+
+            if (trimmed.StartsWith("Unnamed_", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("LOD", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("Spot Light", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("Point Light", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("Area Light", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("Reflection Probe", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("Cube", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("Plane", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("Cell (", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("STGCollision", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("AirWall", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("AmbientZone", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("set_", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("PrefabSet_", StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+
+            if (GenericSceneGameObjectNames.Contains(trimmed))
+            {
+                return 0;
+            }
+
+            // Highest preference: explicit stage/scene root naming conventions (e.g. *_Model, *_Light, *_Effect, *_Scene, *_Stage).
+            if (trimmed.EndsWith("_Model", StringComparison.OrdinalIgnoreCase)
+                || trimmed.EndsWith("_Scene", StringComparison.OrdinalIgnoreCase)
+                || trimmed.EndsWith("_Stage", StringComparison.OrdinalIgnoreCase))
+            {
+                return 100;
+            }
+
+            if (trimmed.EndsWith("_Light", StringComparison.OrdinalIgnoreCase)
+                || trimmed.EndsWith("_Effect", StringComparison.OrdinalIgnoreCase))
+            {
+                return 80;
+            }
+
+            // Medium preference: multi-token identifiers without instance numbering like " (1)".
+            if (!trimmed.Contains('(') && trimmed.Contains('_') && trimmed.Length >= 8)
+            {
+                return 40;
+            }
+
+            if (!trimmed.Contains('('))
+            {
+                return 20;
+            }
+
+            return 5;
+        }
+
+        private static string BuildStreamedSceneDisplayName(string sfName, string? origPath, string? bestGoName)
+        {
+            var shortId = !string.IsNullOrWhiteSpace(sfName)
+                ? (sfName.Length > 12 ? sfName.Substring(0, 12) : sfName)
+                : (!string.IsNullOrWhiteSpace(origPath) ? Path.GetFileNameWithoutExtension(origPath) : "Scene");
+
+            if (!string.IsNullOrWhiteSpace(bestGoName))
+            {
+                var clean = bestGoName.Trim();
+                foreach (var suffix in new[] { "_Model", "_Light", "_Effect" })
+                {
+                    if (clean.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) && clean.Length > suffix.Length + 2)
+                    {
+                        clean = clean.Substring(0, clean.Length - suffix.Length);
+                        break;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(clean) && !string.Equals(clean, shortId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return $"{clean} ({shortId})";
+                }
+            }
+
+            return !string.IsNullOrWhiteSpace(sfName) ? sfName : shortId;
         }
 
         private static bool IsFallbackSceneSourceName(string? serializedFileName, string? originalPath)

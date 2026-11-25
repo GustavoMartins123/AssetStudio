@@ -1018,6 +1018,534 @@ namespace AssetStudio.Tests
             Assert.Null(vm.Result);
         }
 
+        [Fact]
+        public void SceneExportDialogViewModel_MultiSceneWithoutExplicitPreselection_StartsUncheckedAndFormatsObjectStats()
+        {
+            var multipleCandidates = new[]
+            {
+                new SceneExportCandidate
+                {
+                    Id = "s0",
+                    Name = "Bootstrap",
+                    ScenePath = "Assets/Scenes/Bootstrap.unity",
+                    BuildIndex = 0,
+                    SourceKind = "BuildSettings",
+                    SerializedFileName = "level0",
+                    GameObjectCount = 9,
+                    RendererCount = 0
+                },
+                new SceneExportCandidate
+                {
+                    Id = "s1",
+                    Name = "CastleHall (CAB-castle01)",
+                    ScenePath = "CAB-castle01",
+                    BuildIndex = -1,
+                    SourceKind = "SceneBundle",
+                    SerializedFileName = "CAB-castle01",
+                    GameObjectCount = 386,
+                    RendererCount = 165
+                }
+            };
+
+            // Multiple scenes with no explicit Scene Hierarchy preselection must start at 0 selected
+            // so checking one scene never silently produces a _Combined merge with scene #0.
+            var multiVm = new SceneExportDialogViewModel(new SceneExportDialogRequest(multipleCandidates));
+            Assert.Equal(0, multiVm.SelectedCount);
+            Assert.False(multiVm.HasSelection);
+            Assert.False(multiVm.ConfirmCommand.CanExecute());
+            Assert.Contains("9 objects, 0 renderers", multiVm.AllScenes[0].SubtitleDisplay);
+            Assert.Contains("386 objects, 165 renderers", multiVm.AllScenes[1].SubtitleDisplay);
+
+            multiVm.AllScenes[1].IsSelected = true;
+            Assert.Equal(1, multiVm.SelectedCount);
+            Assert.Equal("CastleHall (CAB-castle01)", multiVm.GetSelectedCandidates().Single().Name);
+
+            // Single-scene list still auto-selects that 1 scene for convenience.
+            var singleVm = new SceneExportDialogViewModel(new SceneExportDialogRequest(new[] { multipleCandidates[1] }));
+            Assert.Equal(1, singleVm.SelectedCount);
+            Assert.True(singleVm.ConfirmCommand.CanExecute());
+        }
+
+        [Fact]
+        public void SceneDiscovery_StreamedSceneBundleWithRenderSettingsAndMultiCabSharedAssets_RetargetsToSceneCabAndExcludesPrefabs()
+        {
+            var tempRoot = CreateTempDirectory("scene_discovery_streamed");
+            try
+            {
+                var projectDir = Path.Combine(tempRoot, "SampleGame");
+                var dataDir = Path.Combine(projectDir, "SampleGame_Data");
+                var aaDir = Path.Combine(dataDir, "StreamingAssets", "aa");
+                Directory.CreateDirectory(aaDir);
+
+                var streamedBundlePath = Path.Combine(dataDir, "hashed_stage.bundle");
+                var unitySceneBundlePath = Path.Combine(dataDir, "named_stage.bundle");
+                var prefabBundlePath = Path.Combine(dataDir, "character_prefab.bundle");
+                File.WriteAllBytes(streamedBundlePath, new byte[] { 1, 2, 3 });
+                File.WriteAllBytes(unitySceneBundlePath, new byte[] { 4, 5, 6 });
+                File.WriteAllBytes(prefabBundlePath, new byte[] { 7, 8, 9 });
+
+                using var am = new AssetsManager();
+
+                // Named AssetBundle scene whose AssetBundle lives in .sharedAssets (0 GOs) while scene objects live in sibling CAB.
+                var sharedSf = CreateSyntheticSerializedFile(am, "CAB-namedstage.sharedAssets", "2022.3.20f1");
+                sharedSf.originalPath = unitySceneBundlePath;
+                var info = (AssetInfo)RuntimeHelpers.GetUninitializedObject(typeof(AssetInfo));
+                info.preloadIndex = 0;
+                info.preloadSize = 0;
+                info.asset = CreatePPtr<AssetStudio.Object>(sharedSf, 0, 1);
+                sharedSf.AddObject(CreateSyntheticAssetBundle(
+                    sharedSf,
+                    pathId: 1,
+                    name: "named_stage",
+                    preloadTable: Array.Empty<PPtr<AssetStudio.Object>>(),
+                    containerEntries: new[] { new KeyValuePair<string, AssetInfo>("assets/scenes/castle_courtyard.unity", info) }));
+
+                var handles = new List<AssetHandle>
+                {
+                    // 1) Hashed streamed scene bundle: CAB-hashedstage01.sharedAssets (AssetBundle only) + CAB-hashedstage01 (RenderSettings + GOs + MRs)
+                    CreateHandle("CAB-hashedstage01.sharedAssets", streamedBundlePath, 1, "hashed_stage.bundle", ClassIDType.AssetBundle),
+                    CreateHandle("CAB-hashedstage01", streamedBundlePath, 10, "SceneRoot", ClassIDType.GameObject),
+                    CreateHandle("CAB-hashedstage01", streamedBundlePath, 11, "Stage_TownGuild_Model", ClassIDType.GameObject),
+                    CreateHandle("CAB-hashedstage01", streamedBundlePath, 12, "Unnamed_MeshRenderer_12", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-hashedstage01", streamedBundlePath, 13, "Unnamed_MeshRenderer_13", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-hashedstage01", streamedBundlePath, 14, "Unnamed_RenderSettings_14", ClassIDType.RenderSettings),
+
+                    // 2) Named .unity streamed scene bundle (multi-CAB): AssetBundle in .sharedAssets, actual scene in CAB-namedstage
+                    CreateHandle("CAB-namedstage.sharedAssets", unitySceneBundlePath, 1, "named_stage.bundle", ClassIDType.AssetBundle),
+                    CreateHandle("CAB-namedstage", unitySceneBundlePath, 20, "CourtyardRoot", ClassIDType.GameObject),
+                    CreateHandle("CAB-namedstage", unitySceneBundlePath, 21, "Unnamed_MeshRenderer_21", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-namedstage", unitySceneBundlePath, 22, "Unnamed_RenderSettings_22", ClassIDType.RenderSettings),
+
+                    // 3) Regular character prefab bundle (NO RenderSettings, NO .unity) — MUST NOT appear as a scene!
+                    CreateHandle("CAB-charprefab01", prefabBundlePath, 1, "character_prefab.bundle", ClassIDType.AssetBundle),
+                    CreateHandle("CAB-charprefab01", prefabBundlePath, 30, "HeroCharacter", ClassIDType.GameObject),
+                    CreateHandle("CAB-charprefab01", prefabBundlePath, 31, "HeroMesh_Combined", ClassIDType.Mesh),
+                    CreateHandle("CAB-charprefab01", prefabBundlePath, 32, "Unnamed_SkinnedMeshRenderer_32", ClassIDType.SkinnedMeshRenderer)
+                };
+
+                var discovered = ProjectLoadingService.DiscoverScenesAndExternals(
+                    am,
+                    projectDir,
+                    handles: handles,
+                    catalogsOverride: Array.Empty<ParsedAddressablesCatalog>());
+
+                // Exactly 2 real scenes discovered; the character prefab bundle MUST be excluded!
+                Assert.Equal(2, discovered.Scenes.Count);
+                Assert.DoesNotContain(discovered.Scenes, s => s.EntrySerializedFileName == "CAB-charprefab01");
+
+                // Named .unity bundle must retarget from CAB-namedstage.sharedAssets -> CAB-namedstage!
+                var courtyard = discovered.Scenes.Single(s => s.Name == "castle_courtyard");
+                Assert.Equal("AssetBundle", courtyard.SourceKind);
+                Assert.Equal("CAB-namedstage", courtyard.EntrySerializedFileName);
+                Assert.Equal((1, 1), discovered.SceneFileStats["CAB-namedstage"]);
+
+                // Hashed streamed scene bundle must be discovered via RenderSettings with clean descriptive name!
+                var streamed = discovered.Scenes.Single(s => s.SourceKind == "SceneBundle");
+                Assert.Equal("CAB-hashedstage01", streamed.EntrySerializedFileName);
+                Assert.StartsWith("Stage_TownGuild (", streamed.Name, StringComparison.Ordinal);
+                Assert.Equal((2, 2), discovered.SceneFileStats["CAB-hashedstage01"]);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void AddressablesCatalog_FindCatalogPathsForFiles_DiscoversCatalogInsideDataSubdirectoryFromGameRoot()
+        {
+            var tempRoot = CreateTempDirectory("catalog_from_game_root");
+            try
+            {
+                var gameRoot = Path.Combine(tempRoot, "MyUnityGame");
+                var aaDir = Path.Combine(gameRoot, "MyUnityGame_Data", "StreamingAssets", "aa");
+                Directory.CreateDirectory(aaDir);
+
+                var catalogPath = Path.Combine(aaDir, "catalog.json");
+                File.WriteAllText(catalogPath, "{}");
+
+                var found = AddressablesCatalogDependencyResolver.FindCatalogPathsForFiles(Array.Empty<string>(), gameRoot);
+                Assert.Contains(catalogPath, found, OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void AssetBundle_SceneHashes_MultiSceneBundleMapsEachSceneToExactCab()
+        {
+            var tempRoot = CreateTempDirectory("multi_scene_hashes");
+            try
+            {
+                var multiBundlePath = Path.Combine(tempRoot, "forest_multi.bundle");
+                File.WriteAllBytes(multiBundlePath, new byte[] { 1, 2, 3, 4 });
+
+                using var am = new AssetsManager();
+                var metaSf = CreateSyntheticSerializedFile(am, "CAB-forestmain01.sharedAssets", "2022.3.20f1");
+                metaSf.originalPath = multiBundlePath;
+
+                using var payloadStream = new MemoryStream();
+                using (var bw = new BinaryWriter(payloadStream, Encoding.UTF8, leaveOpen: true))
+                {
+                    WriteAlignedString(bw, "forest_multi.bundle"); // m_Name
+                    bw.Write(0); // m_PreloadTableSize
+                    bw.Write(2); // m_ContainerSize
+                    WriteAlignedString(bw, "assets/dynamicload/scenes/forest_main.unity");
+                    bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0L);
+                    WriteAlignedString(bw, "assets/dynamicload/scenes/forest_gameplay.unity");
+                    bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0L);
+
+                    // m_MainAsset (AssetInfo)
+                    bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0L);
+                    // m_RuntimeCompatibility
+                    bw.Write(1u);
+                    // m_AssetBundleName
+                    WriteAlignedString(bw, "forest_multi.bundle");
+                    // m_Dependencies
+                    bw.Write(0);
+                    // m_IsStreamedSceneAssetBundle + Align(4)
+                    bw.Write((byte)1);
+                    bw.Write(new byte[3]);
+                    // m_ExplicitDataLayout + m_PathFlags
+                    bw.Write(1);
+                    bw.Write(0);
+                    // m_SceneHashes (2 entries)
+                    bw.Write(2);
+                    WriteAlignedString(bw, "Assets/DynamicLoad/Scenes/Forest_Main.unity");
+                    WriteAlignedString(bw, "CAB-forestmain01");
+                    WriteAlignedString(bw, "Assets/DynamicLoad/Scenes/Forest_Gameplay.unity");
+                    WriteAlignedString(bw, "CAB-forestgame02");
+                }
+
+                var parsedBundle = Assert.IsType<AssetBundle>(
+                    CreateObjectViaAssetsManager(metaSf, ClassIDType.AssetBundle, pathId: 1, payloadStream.ToArray()));
+                Assert.True(parsedBundle.m_IsStreamedSceneAssetBundle);
+                Assert.Equal(2, parsedBundle.m_SceneHashes.Length);
+                metaSf.AddObject(parsedBundle);
+
+                var handles = new List<AssetHandle>
+                {
+                    CreateHandle("CAB-forestmain01.sharedAssets", multiBundlePath, 1, "forest_multi.bundle", ClassIDType.AssetBundle),
+                    CreateHandle("CAB-forestmain01", multiBundlePath, 10, "MainRoot", ClassIDType.GameObject),
+                    CreateHandle("CAB-forestmain01", multiBundlePath, 11, "Unnamed_MeshRenderer_11", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-forestmain01", multiBundlePath, 12, "Unnamed_RenderSettings_12", ClassIDType.RenderSettings),
+                    CreateHandle("CAB-forestgame02", multiBundlePath, 20, "GameplayRootA", ClassIDType.GameObject),
+                    CreateHandle("CAB-forestgame02", multiBundlePath, 21, "GameplayRootB", ClassIDType.GameObject),
+                    CreateHandle("CAB-forestgame02", multiBundlePath, 22, "Unnamed_MeshRenderer_22", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-forestgame02", multiBundlePath, 23, "Unnamed_MeshRenderer_23", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-forestgame02", multiBundlePath, 24, "Unnamed_RenderSettings_24", ClassIDType.RenderSettings)
+                };
+
+                var discovered = ProjectLoadingService.DiscoverScenesAndExternals(
+                    am,
+                    tempRoot,
+                    handles: handles,
+                    catalogsOverride: Array.Empty<ParsedAddressablesCatalog>());
+
+                Assert.Equal(2, discovered.Scenes.Count);
+                var mainScene = discovered.Scenes.Single(s => s.Name == "Forest_Main");
+                var gameplayScene = discovered.Scenes.Single(s => s.Name == "Forest_Gameplay");
+                Assert.Equal("CAB-forestmain01", mainScene.EntrySerializedFileName);
+                Assert.Equal("CAB-forestgame02", gameplayScene.EntrySerializedFileName);
+                Assert.Equal((1, 1), discovered.SceneFileStats["CAB-forestmain01"]);
+                Assert.Equal((2, 2), discovered.SceneFileStats["CAB-forestgame02"]);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void ModularStageCompanionPresetBundle_SelectsSingleDaytimePresetAndExportsCompleteStageHierarchy()
+        {
+            var tempRoot = CreateTempDirectory("modular_stage_preset");
+            try
+            {
+                var baseBundlePath = Path.Combine(tempRoot, "town_base.bundle");
+                var presetBundlePath = Path.Combine(tempRoot, "town_presets.bundle");
+                File.WriteAllBytes(baseBundlePath, new byte[] { 1, 2, 3 });
+                File.WriteAllBytes(presetBundlePath, new byte[] { 4, 5, 6 });
+
+                using var am = new AssetsManager();
+                var baseSf = CreateSyntheticSerializedFile(am, "CAB-townbase01", "2022.3.20f1");
+                baseSf.originalPath = baseBundlePath;
+                var presetSf = CreateSyntheticSerializedFile(am, "CAB-townpresets01", "2022.3.20f1");
+                presetSf.originalPath = presetBundlePath;
+
+                // Base scene: SceneRoot -> StageModel (empty anchor), Variant (empty anchor), BaseGround (1 mesh)
+                var sceneRootGo = CreateSyntheticGameObject(baseSf, 1, "SceneRoot", isActive: true);
+                var sceneRootTr = CreateSyntheticTransform(baseSf, 2, sceneRootGo, null, Vector3.Zero);
+                AttachComponents(sceneRootGo, sceneRootTr);
+
+                var stageModelGo = CreateSyntheticGameObject(baseSf, 3, "StageModel", isActive: true);
+                var stageModelTr = CreateSyntheticTransform(baseSf, 4, stageModelGo, sceneRootTr, Vector3.Zero);
+                AttachComponents(stageModelGo, stageModelTr);
+
+                var variantGo = CreateSyntheticGameObject(baseSf, 5, "Variant", isActive: true);
+                var variantTr = CreateSyntheticTransform(baseSf, 6, variantGo, sceneRootTr, Vector3.Zero);
+                AttachComponents(variantGo, variantTr);
+
+                var baseGroundGo = CreateSyntheticGameObject(baseSf, 7, "Stage_TownSquare_Model", isActive: true);
+                var baseGroundTr = CreateSyntheticTransform(baseSf, 8, baseGroundGo, sceneRootTr, Vector3.Zero);
+                var baseMesh = CreateSyntheticBoxMesh(baseSf, 9, "TownBaseGroundMesh");
+                var baseMat = CreateSyntheticMaterial(baseSf, 10, "TownBaseGroundMat");
+                var baseMf = CreateSyntheticMeshFilter(baseSf, 11, baseGroundGo, 0, baseMesh.m_PathID);
+                var baseMr = CreateSyntheticMeshRenderer(baseSf, 12, baseGroundGo, enabled: true, new[] { CreatePPtr<Material>(baseSf, 0, baseMat.m_PathID) });
+                AttachComponents(baseGroundGo, baseGroundTr, baseMf, baseMr);
+                sceneRootTr.m_Children = new[]
+                {
+                    CreatePPtr<Transform>(baseSf, 0, stageModelTr.m_PathID),
+                    CreatePPtr<Transform>(baseSf, 0, variantTr.m_PathID),
+                    CreatePPtr<Transform>(baseSf, 0, baseGroundTr.m_PathID)
+                };
+
+                var renderSettings = CreateSyntheticObject<AssetStudio.Object>(baseSf, 13, ClassIDType.RenderSettings);
+                _ = renderSettings;
+
+                // Companion preset bundle: 3 mutually exclusive ScriptableObject presets + prefabs
+                GameObject BuildCompanionPrefab(long idBase, string rootName, string meshName)
+                {
+                    var go = CreateSyntheticGameObject(presetSf, idBase, rootName, isActive: true);
+                    var tr = CreateSyntheticTransform(presetSf, idBase + 1, go, null, new Vector3(2f, 0f, 0f));
+                    var mesh = CreateSyntheticBoxMesh(presetSf, idBase + 2, meshName);
+                    var mat = CreateSyntheticMaterial(presetSf, idBase + 3, meshName + "_Mat");
+                    var mf = CreateSyntheticMeshFilter(presetSf, idBase + 4, go, 0, mesh.m_PathID);
+                    var mr = CreateSyntheticMeshRenderer(presetSf, idBase + 5, go, enabled: true, new[] { CreatePPtr<Material>(presetSf, 0, mat.m_PathID) });
+                    AttachComponents(go, tr, mf, mr);
+                    return go;
+                }
+
+                var dayBuildingsGo = BuildCompanionPrefab(100, "Stage_TownSquare_Model_SUNNY", "DayBuildingsMesh");
+                var dayVariantGo = BuildCompanionPrefab(110, "Stage_TownSquare_NOON_SUNNY_NORMAL_VARIANT", "DayPropsVariantMesh");
+                var nightBuildingsGo = BuildCompanionPrefab(120, "Stage_TownSquare_Model_NIGHT", "NightBuildingsMesh");
+                var specialBrokenGo = BuildCompanionPrefab(130, "Stage_TownSquare_SPECIAL1_VARIANT", "SpecialBrokenMesh");
+
+                var presetScript = CreateSyntheticMonoScript(presetSf, 200, "Game.Stage", "StagePresetAsset", "Assembly-CSharp.dll");
+                MonoBehaviour CreatePresetSo(long pathId, string soName)
+                {
+                    var mb = CreateSyntheticObject<MonoBehaviour>(presetSf, pathId, ClassIDType.MonoBehaviour);
+                    mb.m_GameObject = CreatePPtr<GameObject>(presetSf, 0, 0);
+                    mb.m_Enabled = 1;
+                    mb.m_Script = CreatePPtr<MonoScript>(presetSf, 0, presetScript.m_PathID);
+                    mb.m_Name = soName;
+                    return mb;
+                }
+
+                var nightSo = CreatePresetSo(201, "Stage_TownSquare_NIGHT_CLOUDY");
+                var noonSunnySo = CreatePresetSo(202, "Stage_TownSquare_NOON_SUNNY_NORMAL");
+                var specialSo = CreatePresetSo(203, "Stage_TownSquare_SPECIAL1");
+
+                // 1. Verify SceneDiscovery matches companion preset bundle and aggregates estimated renderer stats.
+                var handles = new List<AssetHandle>
+                {
+                    CreateHandle("CAB-townbase01", baseBundlePath, 1, "SceneRoot", ClassIDType.GameObject),
+                    CreateHandle("CAB-townbase01", baseBundlePath, 7, "Stage_TownSquare_Model", ClassIDType.GameObject),
+                    CreateHandle("CAB-townbase01", baseBundlePath, 12, "Unnamed_MeshRenderer_12", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-townbase01", baseBundlePath, 13, "Unnamed_RenderSettings_13", ClassIDType.RenderSettings),
+
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 100, dayBuildingsGo.m_Name, ClassIDType.GameObject),
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 105, "Unnamed_MeshRenderer_105", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 110, dayVariantGo.m_Name, ClassIDType.GameObject),
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 115, "Unnamed_MeshRenderer_115", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 120, nightBuildingsGo.m_Name, ClassIDType.GameObject),
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 125, "Unnamed_MeshRenderer_125", ClassIDType.MeshRenderer),
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 201, nightSo.m_Name, ClassIDType.MonoBehaviour),
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 202, noonSunnySo.m_Name, ClassIDType.MonoBehaviour),
+                    CreateHandle("CAB-townpresets01", presetBundlePath, 203, specialSo.m_Name, ClassIDType.MonoBehaviour)
+                };
+
+                var discovered = ProjectLoadingService.DiscoverScenesAndExternals(
+                    am,
+                    tempRoot,
+                    handles: handles,
+                    catalogsOverride: Array.Empty<ParsedAddressablesCatalog>());
+
+                var townScene = Assert.Single(discovered.Scenes);
+                Assert.True(discovered.CompanionStageFilesBySceneSf.TryGetValue("CAB-townbase01", out var matchedCompanions));
+                Assert.Contains(matchedCompanions!, c => c.SerializedFileName == "CAB-townpresets01");
+                Assert.True(discovered.SceneFileStats["CAB-townbase01"].RendererCount >= 2);
+
+                // 2. Verify ResolveCompanionStagePresetAttachments picks ONLY NOON_SUNNY_NORMAL and exports with ResolveStaticScriptSpawns=false!
+                static System.Collections.Specialized.OrderedDictionary MakePPtrDict(long pathId)
+                {
+                    return new System.Collections.Specialized.OrderedDictionary
+                    {
+                        ["m_FileID"] = 0,
+                        ["m_PathID"] = pathId
+                    };
+                }
+
+                var attachments = SceneGlbExportService.ResolveCompanionStagePresetAttachments(
+                    new[] { sceneRootGo },
+                    new[] { ("Stage_TownSquare", (IReadOnlyList<SerializedFile>)new[] { presetSf }) },
+                    customFieldProvider: mb =>
+                    {
+                        if (mb.m_PathID == noonSunnySo.m_PathID)
+                        {
+                            return new System.Collections.Specialized.OrderedDictionary
+                            {
+                                ["modelPrefab"] = MakePPtrDict(dayBuildingsGo.m_PathID),
+                                ["variantPrefab"] = MakePPtrDict(dayVariantGo.m_PathID)
+                            };
+                        }
+                        if (mb.m_PathID == nightSo.m_PathID)
+                        {
+                            return new System.Collections.Specialized.OrderedDictionary
+                            {
+                                ["modelPrefab"] = MakePPtrDict(nightBuildingsGo.m_PathID)
+                            };
+                        }
+                        if (mb.m_PathID == specialSo.m_PathID)
+                        {
+                            return new System.Collections.Specialized.OrderedDictionary
+                            {
+                                ["variantPrefab"] = MakePPtrDict(specialBrokenGo.m_PathID)
+                            };
+                        }
+                        return null;
+                    });
+
+                Assert.Equal(2, attachments.Count);
+                Assert.All(attachments, a => Assert.True(a.PreservePrefabRootName));
+
+                var outGlb = Path.Combine(tempRoot, "TownSquare.glb");
+                var exportSvc = new SceneGlbExportService();
+                var exportResult = exportSvc.ExportScene(
+                    new[] { sceneRootGo },
+                    new SceneGlbExportOptions
+                    {
+                        OutputPath = outGlb,
+                        SceneName = townScene.Name,
+                        ResolveStaticScriptSpawns = false,
+                        PreResolvedScriptSpawnAttachments = attachments
+                    });
+
+                Assert.True(exportResult.Success, exportResult.ErrorMessage);
+                Assert.Equal(3, exportResult.Stats.TotalMeshInstances);
+
+                using var glbDoc = ParseGlbJson(outGlb);
+                var nodeNames = glbDoc.RootElement.GetProperty("nodes")
+                    .EnumerateArray()
+                    .Select(n => n.TryGetProperty("name", out var np) ? np.GetString() ?? string.Empty : string.Empty)
+                    .ToList();
+
+                Assert.Contains("Stage_TownSquare_Model_SUNNY", nodeNames);
+                Assert.Contains("Stage_TownSquare_NOON_SUNNY_NORMAL_VARIANT", nodeNames);
+                Assert.DoesNotContain(nodeNames, n => n.Contains("[ScriptSpawned]", StringComparison.Ordinal));
+                Assert.DoesNotContain("Stage_TownSquare_Model_NIGHT", nodeNames);
+                Assert.DoesNotContain("Stage_TownSquare_SPECIAL1_VARIANT", nodeNames);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void GltfExporter_PackedMultiChannelOcclusionMap_RepacksGreenChannelInsteadOfMultiplyingDarkRed()
+        {
+            var tempRoot = CreateTempDirectory("packed_occlusion_repack");
+            try
+            {
+                // Build a 2x2 non-grayscale packed mask PNG:
+                // Channel R = 4 (dark specular/metallic), Channel G = 180..230 (real AO), Channel B = 35 (detail mask).
+                var bgra = new byte[]
+                {
+                    35, 180, 4, 255,
+                    35, 220, 4, 255,
+                    35, 230, 4, 255,
+                    35, 210, 4, 255
+                };
+                byte[] packedMaskPng;
+                using (var bmp = ImageExtensions.CreateBgraUnpremulBitmap(bgra, 2, 2, flipVertical: false))
+                using (var ms = bmp.ConvertToStream(ImageFormat.Png))
+                {
+                    packedMaskPng = ms.ToArray();
+                }
+
+                using var am = new AssetsManager();
+                var sf = CreateSyntheticSerializedFile(am, "CAB-occ01", "2022.3.20f1");
+                var rootGo = CreateSyntheticGameObject(sf, 1, "CharacterProp", isActive: true);
+                var rootTr = CreateSyntheticTransform(sf, 2, rootGo, null, Vector3.Zero);
+                var mesh = CreateSyntheticBoxMesh(sf, 3, "PropMesh");
+                var mat = CreateSyntheticMaterial(sf, 4, "PropMat");
+                var mf = CreateSyntheticMeshFilter(sf, 5, rootGo, 0, mesh.m_PathID);
+                var mr = CreateSyntheticMeshRenderer(sf, 6, rootGo, enabled: true, new[] { CreatePPtr<Material>(sf, 0, mat.m_PathID) });
+                AttachComponents(rootGo, rootTr, mf, mr);
+
+                var converter = ModelConverter.CreateForScene(
+                    "OcclusionTestScene",
+                    new[] { rootGo },
+                    ImageFormat.Png,
+                    includeInactive: false,
+                    includeAnimations: false);
+
+                converter.TextureList.Add(new ImportedTexture(new MemoryStream(packedMaskPng), "Prop_spcOccMcm.png"));
+                var importedMat = Assert.Single(converter.MaterialList);
+                importedMat.OcclusionStrength = 1.0f;
+                importedMat.Textures.Add(new ImportedMaterialTexture
+                {
+                    Name = "Prop_spcOccMcm.png",
+                    Dest = 5, // Occlusion slot
+                    Offset = new Vector2(0f, 0f),
+                    Scale = new Vector2(1f, 1f)
+                });
+
+                var outGlb = Path.Combine(tempRoot, "OcclusionTest.glb");
+                var stats = ModelExporter.ExportGltfWithStats(
+                    outGlb,
+                    converter,
+                    binary: true,
+                    skins: false,
+                    animation: false,
+                    blendShape: false,
+                    scaleFactor: 1f,
+                    combineMeshes: false,
+                    enableInstancing: true);
+
+                Assert.Equal(1, stats.TexturesCount);
+
+                // Extract the BIN chunk from the GLB and decode the embedded occlusion PNG.
+                var glbBytes = File.ReadAllBytes(outGlb);
+                using var glbDoc = ParseGlbJson(outGlb);
+                var occTexIdx = glbDoc.RootElement.GetProperty("materials")[0]
+                    .GetProperty("occlusionTexture")
+                    .GetProperty("index")
+                    .GetInt32();
+                var imgIdx = glbDoc.RootElement.GetProperty("textures")[occTexIdx]
+                    .GetProperty("source")
+                    .GetInt32();
+                var bvIdx = glbDoc.RootElement.GetProperty("images")[imgIdx]
+                    .GetProperty("bufferView")
+                    .GetInt32();
+                var bv = glbDoc.RootElement.GetProperty("bufferViews")[bvIdx];
+                var byteOffset = bv.TryGetProperty("byteOffset", out var bo) ? bo.GetInt32() : 0;
+                var byteLength = bv.GetProperty("byteLength").GetInt32();
+
+                var jsonChunkLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(glbBytes.AsSpan(12, 4));
+                var binChunkDataStart = 20 + jsonChunkLen + 8;
+                var exportedPng = glbBytes.AsSpan(binChunkDataStart + byteOffset, byteLength).ToArray();
+
+                using var decodedOcc = ImageExtensions.DecodeBgraUnpremul(exportedPng);
+                Assert.NotNull(decodedOcc);
+                var outPixels = new byte[decodedOcc!.Width * decodedOcc.Height * 4];
+                decodedOcc.CopyBgraPixelsTo(outPixels);
+
+                // glTF samples channel R (BGRA offset +2). It MUST equal the packed AO channel G (180..230), NOT 4!
+                Assert.Equal(180, outPixels[2]);
+                Assert.Equal(220, outPixels[6]);
+                Assert.Equal(230, outPixels[10]);
+                Assert.Equal(210, outPixels[14]);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
         // =========================================================================
         // Helpers
         // =========================================================================
@@ -1272,6 +1800,18 @@ namespace AssetStudio.Tests
         private static void AttachComponents(GameObject go, params Component[] components)
         {
             go.m_Components = components.Select(c => CreatePPtr<Component>(go.assetsFile, 0, c.m_PathID)).ToArray();
+        }
+
+        private static void WriteAlignedString(BinaryWriter bw, string value)
+        {
+            var bytes = Encoding.UTF8.GetBytes(value);
+            bw.Write(bytes.Length);
+            bw.Write(bytes);
+            var mod = bytes.Length & 3;
+            if (mod != 0)
+            {
+                bw.Write(new byte[4 - mod]);
+            }
         }
 
         private static void WriteStringArray(BinaryWriter bw, string[] items)
