@@ -6,8 +6,9 @@ namespace AssetStudio
 {
     public sealed class RijndaelBlockCipher
     {
-        private const int MaxStateWords = 8;
-        private const int MaxRounds = 14;
+        public const int MaxStateWords = 8;
+        public const int MaxRounds = 14;
+        public const int MaxKeyScheduleWords = MaxStateWords * (MaxRounds + 1);
 
         private static readonly byte[] SBox = Convert.FromHexString(
             "637C777BF26B6FC53001672BFED7AB76CA82C97DFA5947F0ADD4A2AF9CA472C0" +
@@ -28,17 +29,18 @@ namespace AssetStudio
         private static readonly uint[] Td1 = RotateTable(Td0, 8);
         private static readonly uint[] Td2 = RotateTable(Td0, 16);
         private static readonly uint[] Td3 = RotateTable(Td0, 24);
+        private static readonly uint[] Imc0 = BuildInvMixColumn(14, 9, 13, 11);
+        private static readonly uint[] Imc1 = BuildInvMixColumn(11, 14, 9, 13);
+        private static readonly uint[] Imc2 = BuildInvMixColumn(13, 11, 14, 9);
+        private static readonly uint[] Imc3 = BuildInvMixColumn(9, 13, 11, 14);
+        private static readonly byte[] Mod4 = { 0, 1, 2, 3, 0, 1, 2, 3 };
+        private static readonly byte[] Mod6 = { 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5 };
+        private static readonly byte[] Mod8 = { 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7 };
 
-        private readonly uint[] encryptKeys = new uint[MaxStateWords * (MaxRounds + 1)];
-        private readonly uint[] decryptKeys = new uint[MaxStateWords * (MaxRounds + 1)];
+        private readonly uint[] encryptKeys = new uint[MaxKeyScheduleWords];
+        private readonly uint[] decryptKeys = new uint[MaxKeyScheduleWords];
         private readonly int nb;
         private readonly int nr;
-        private readonly int encShift1;
-        private readonly int encShift2;
-        private readonly int encShift3;
-        private readonly int decShift1;
-        private readonly int decShift2;
-        private readonly int decShift3;
 
         public int BlockSize => nb * 4;
         public int KeySize { get; }
@@ -56,20 +58,39 @@ namespace AssetStudio
                 throw new ArgumentException("Rijndael block size must be 128, 192, or 256 bits.", nameof(blockSizeBits));
             }
 
-            int nk = key.Length / 4;
             nb = blockSizeBits / 32;
-            nr = Math.Max(nk, nb) + 6;
             KeySize = key.Length;
+            nr = ExpandKey(key, key.Length / 4, nb, encryptKeys, decryptKeys);
+        }
 
-            bool wide = nb == MaxStateWords;
-            encShift1 = 1;
-            encShift2 = wide ? 3 : 2;
-            encShift3 = wide ? 4 : 3;
-            decShift1 = (nb - encShift1) % nb;
-            decShift2 = (nb - encShift2) % nb;
-            decShift3 = (nb - encShift3) % nb;
+        public static int ExpandDecryptKey(ReadOnlySpan<byte> key, int blockSizeBits, Span<uint> destination)
+        {
+            if (key.Length is not (16 or 24 or 32) || blockSizeBits is not (128 or 192 or 256) || destination.Length < MaxKeyScheduleWords)
+            {
+                return -1;
+            }
 
-            ExpandKey(key, nk);
+            return ExpandKey(key, key.Length / 4, blockSizeBits / 32, Span<uint>.Empty, destination);
+        }
+
+        public static void DecryptBlock(
+            ReadOnlySpan<uint> decryptKeys,
+            int blockSizeBits,
+            int rounds,
+            ReadOnlySpan<byte> source,
+            Span<byte> destination)
+        {
+            int size = blockSizeBits / 32 * 4;
+            if (source.Length < size || destination.Length < size)
+            {
+                throw new ArgumentException(source.Length < size ? nameof(source) : nameof(destination));
+            }
+
+            Span<uint> s = stackalloc uint[MaxStateWords];
+            Span<uint> t = stackalloc uint[MaxStateWords];
+            LoadState(source, size / 4, s);
+            ReadOnlySpan<uint> state = DecryptCore(decryptKeys, size / 4, rounds, s, t);
+            StoreState(state.Slice(0, size / 4), destination);
         }
 
         public void EncryptBlock(ReadOnlySpan<byte> source, Span<byte> destination)
@@ -77,20 +98,21 @@ namespace AssetStudio
             ValidateBlockArgs(source, destination);
             Span<uint> s = stackalloc uint[MaxStateWords];
             Span<uint> t = stackalloc uint[MaxStateWords];
-            LoadState(source, s);
+            LoadState(source, nb, s);
 
             for (int c = 0; c < nb; c++)
             {
                 s[c] ^= encryptKeys[c];
             }
 
+            GetEncryptShifts(nb, out int shift1, out int shift2, out int shift3);
             for (int round = 1; round < nr; round++)
             {
-                Mix(s, t, Te0, Te1, Te2, Te3, encShift1, encShift2, encShift3, encryptKeys, round * nb);
+                Mix(s, t, nb, Te0, Te1, Te2, Te3, shift1, shift2, shift3, encryptKeys, round * nb);
                 Swap(ref s, ref t);
             }
 
-            Substitute(s, t, SBox, encShift1, encShift2, encShift3, encryptKeys, nr * nb);
+            Substitute(s, t, nb, SBox, shift1, shift2, shift3, encryptKeys, nr * nb);
             StoreState(t.Slice(0, nb), destination);
         }
 
@@ -99,26 +121,42 @@ namespace AssetStudio
             ValidateBlockArgs(source, destination);
             Span<uint> s = stackalloc uint[MaxStateWords];
             Span<uint> t = stackalloc uint[MaxStateWords];
-            LoadState(source, s);
+            LoadState(source, nb, s);
+            ReadOnlySpan<uint> state = DecryptCore(decryptKeys, nb, nr, s, t);
+            StoreState(state.Slice(0, nb), destination);
+        }
 
+        private static ReadOnlySpan<uint> DecryptCore(ReadOnlySpan<uint> keys, int nb, int rounds, Span<uint> s, Span<uint> t)
+        {
             for (int c = 0; c < nb; c++)
             {
-                s[c] ^= decryptKeys[nr * nb + c];
+                s[c] ^= keys[rounds * nb + c];
             }
 
-            for (int round = nr - 1; round >= 1; round--)
+            int shift1 = nb - 1;
+            int shift2 = nb - (nb == MaxStateWords ? 3 : 2);
+            int shift3 = nb - (nb == MaxStateWords ? 4 : 3);
+            for (int round = rounds - 1; round >= 1; round--)
             {
-                Mix(s, t, Td0, Td1, Td2, Td3, decShift1, decShift2, decShift3, decryptKeys, round * nb);
+                Mix(s, t, nb, Td0, Td1, Td2, Td3, shift1, shift2, shift3, keys, round * nb);
                 Swap(ref s, ref t);
             }
 
-            Substitute(s, t, InvSBox, decShift1, decShift2, decShift3, decryptKeys, 0);
-            StoreState(t.Slice(0, nb), destination);
+            Substitute(s, t, nb, InvSBox, shift1, shift2, shift3, keys, 0);
+            return t;
         }
 
-        private void Mix(
+        private static void GetEncryptShifts(int nb, out int shift1, out int shift2, out int shift3)
+        {
+            shift1 = 1;
+            shift2 = nb == MaxStateWords ? 3 : 2;
+            shift3 = nb == MaxStateWords ? 4 : 3;
+        }
+
+        private static void Mix(
             ReadOnlySpan<uint> s,
             Span<uint> t,
+            int nb,
             uint[] t0,
             uint[] t1,
             uint[] t2,
@@ -126,35 +164,38 @@ namespace AssetStudio
             int shift1,
             int shift2,
             int shift3,
-            uint[] keys,
+            ReadOnlySpan<uint> keys,
             int keyBase)
         {
+            byte[] mod = nb == 4 ? Mod4 : nb == 6 ? Mod6 : Mod8;
             for (int c = 0; c < nb; c++)
             {
                 t[c] = (t0[s[c] & 0xFF]
-                        ^ t1[(s[(c + shift1) % nb] >> 8) & 0xFF]
-                        ^ t2[(s[(c + shift2) % nb] >> 16) & 0xFF]
-                        ^ t3[s[(c + shift3) % nb] >> 24])
+                        ^ t1[(s[mod[c + shift1]] >> 8) & 0xFF]
+                        ^ t2[(s[mod[c + shift2]] >> 16) & 0xFF]
+                        ^ t3[s[mod[c + shift3]] >> 24])
                     ^ keys[keyBase + c];
             }
         }
 
-        private void Substitute(
+        private static void Substitute(
             ReadOnlySpan<uint> s,
             Span<uint> t,
+            int nb,
             byte[] box,
             int shift1,
             int shift2,
             int shift3,
-            uint[] keys,
+            ReadOnlySpan<uint> keys,
             int keyBase)
         {
+            byte[] mod = nb == 4 ? Mod4 : nb == 6 ? Mod6 : Mod8;
             for (int c = 0; c < nb; c++)
             {
                 t[c] = (box[s[c] & 0xFF]
-                        | (uint)box[(s[(c + shift1) % nb] >> 8) & 0xFF] << 8
-                        | (uint)box[(s[(c + shift2) % nb] >> 16) & 0xFF] << 16
-                        | (uint)box[s[(c + shift3) % nb] >> 24] << 24)
+                        | (uint)box[(s[mod[c + shift1]] >> 8) & 0xFF] << 8
+                        | (uint)box[(s[mod[c + shift2]] >> 16) & 0xFF] << 16
+                        | (uint)box[s[mod[c + shift3]] >> 24] << 24)
                     ^ keys[keyBase + c];
             }
         }
@@ -172,9 +213,9 @@ namespace AssetStudio
             }
         }
 
-        private void LoadState(ReadOnlySpan<byte> source, Span<uint> state)
+        private static void LoadState(ReadOnlySpan<byte> source, int words, Span<uint> state)
         {
-            for (int c = 0; c < nb; c++)
+            for (int c = 0; c < words; c++)
             {
                 state[c] = source[c * 4]
                     | (uint)source[c * 4 + 1] << 8
@@ -201,42 +242,50 @@ namespace AssetStudio
             b = tmp;
         }
 
-        private void ExpandKey(ReadOnlySpan<byte> key, int nk)
+        private static int ExpandKey(ReadOnlySpan<byte> key, int nk, int nb, Span<uint> encryptSchedule, Span<uint> decryptSchedule)
         {
-            int total = nb * (nr + 1);
-            Span<uint> w = stackalloc uint[MaxStateWords * (MaxRounds + 1)];
+            int rounds = Math.Max(nk, nb) + 6;
+            int total = nb * (rounds + 1);
+            Span<uint> w = stackalloc uint[MaxKeyScheduleWords];
             for (int i = 0; i < nk; i++)
             {
                 w[i] = BinaryPrimitives.ReadUInt32BigEndian(key.Slice(i * 4, 4));
             }
 
             byte rcon = 1;
+            int position = 0;
             for (int i = nk; i < total; i++)
             {
                 uint temp = w[i - 1];
-                if (i % nk == 0)
+                if (position == 0)
                 {
                     temp = SubWord((temp << 8) | (temp >> 24)) ^ (uint)rcon << 24;
                     rcon = XTime(rcon);
                 }
-                else if (nk > 6 && i % nk == 4)
+                else if (nk > 6 && position == 4)
                 {
                     temp = SubWord(temp);
                 }
 
                 w[i] = w[i - nk] ^ temp;
+                position = position + 1 == nk ? 0 : position + 1;
             }
 
             for (int i = 0; i < total; i++)
             {
-                encryptKeys[i] = BinaryPrimitives.ReverseEndianness(w[i]);
-                decryptKeys[i] = encryptKeys[i];
+                uint word = BinaryPrimitives.ReverseEndianness(w[i]);
+                if (encryptSchedule.Length > 0)
+                {
+                    encryptSchedule[i] = word;
+                }
+
+                if (decryptSchedule.Length > 0)
+                {
+                    decryptSchedule[i] = i >= nb && i < rounds * nb ? InvMixColumn(word) : word;
+                }
             }
 
-            for (int i = nb; i < nr * nb; i++)
-            {
-                decryptKeys[i] = InvMixColumn(decryptKeys[i]);
-            }
+            return rounds;
         }
 
         private static uint SubWord(uint value)
@@ -248,17 +297,7 @@ namespace AssetStudio
         }
 
         private static uint InvMixColumn(uint value)
-        {
-            byte a0 = (byte)value;
-            byte a1 = (byte)(value >> 8);
-            byte a2 = (byte)(value >> 16);
-            byte a3 = (byte)(value >> 24);
-            uint r0 = (uint)(Multiply(a0, 14) ^ Multiply(a1, 11) ^ Multiply(a2, 13) ^ Multiply(a3, 9));
-            uint r1 = (uint)(Multiply(a0, 9) ^ Multiply(a1, 14) ^ Multiply(a2, 11) ^ Multiply(a3, 13));
-            uint r2 = (uint)(Multiply(a0, 13) ^ Multiply(a1, 9) ^ Multiply(a2, 14) ^ Multiply(a3, 11));
-            uint r3 = (uint)(Multiply(a0, 11) ^ Multiply(a1, 13) ^ Multiply(a2, 9) ^ Multiply(a3, 14));
-            return r0 | r1 << 8 | r2 << 16 | r3 << 24;
-        }
+            => Imc0[value & 0xFF] ^ Imc1[(value >> 8) & 0xFF] ^ Imc2[(value >> 16) & 0xFF] ^ Imc3[value >> 24];
 
         private static byte XTime(byte value)
         {
@@ -297,6 +336,21 @@ namespace AssetStudio
             }
 
             return inverse;
+        }
+
+        private static uint[] BuildInvMixColumn(int row0, int row1, int row2, int row3)
+        {
+            var table = new uint[256];
+            for (int i = 0; i < 256; i++)
+            {
+                byte x = (byte)i;
+                table[i] = Multiply(x, row0)
+                    | (uint)Multiply(x, row1) << 8
+                    | (uint)Multiply(x, row2) << 16
+                    | (uint)Multiply(x, row3) << 24;
+            }
+
+            return table;
         }
 
         private static uint[] BuildTable(byte[] box, int row0, int row1, int row2, int row3)

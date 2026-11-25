@@ -70,12 +70,13 @@ namespace AssetStudio
 
         private static IStreamTransformProvider[] BuildDefaultPipeline()
         {
-            var list = new List<IStreamTransformProvider>(5 + customProviders.Count)
+            var list = new List<IStreamTransformProvider>(6 + customProviders.Count)
             {
                 new Block512CatalogTransformProvider(),
                 new DeclarativeProfileTransformProvider(GetProfilesSnapshot),
                 new OffsetHeaderSkipTransformProvider(),
                 new PassphraseCtrTransformProvider(),
+                new CompositeStringKeyTransformProvider(),
                 new KnownPlaintextXorTransformProvider()
             };
             list.AddRange(customProviders);
@@ -492,6 +493,7 @@ namespace AssetStudio
             }
 
             PassphraseCtrTransformProvider.ClearCache();
+            CompositeStringKeyTransformProvider.ClearCache();
             AddressablesCatalogDependencyResolver.ClearCache();
         }
 

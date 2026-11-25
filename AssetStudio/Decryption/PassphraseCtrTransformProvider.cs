@@ -19,8 +19,6 @@ namespace AssetStudio
         private const int MaxFailedAttempts = 6;
         private const int SequentialCandidateLimit = 2048;
         private static readonly byte[] ExpectedPlain = Encoding.ASCII.GetBytes("UnityFS\0\0\0\0\0" + "5.x.");
-        private static readonly string[] BundleExtensions = { ".bundle", ".enc", ".unity3d", ".ab", "" };
-        private static readonly ConcurrentDictionary<string, string?> SourceKeys = new(StringComparer.OrdinalIgnoreCase);
         private static readonly ConcurrentDictionary<string, ProjectState> Projects = new(StringComparer.OrdinalIgnoreCase);
 
         public string Id => "PassphraseCtr";
@@ -28,7 +26,7 @@ namespace AssetStudio
 
         public static void ClearCache()
         {
-            SourceKeys.Clear();
+            DecryptionSources.ClearCache();
             Projects.Clear();
         }
 
@@ -67,7 +65,7 @@ namespace AssetStudio
 
             string fullPath = Path.GetFullPath(filePath);
             string directory = Path.GetDirectoryName(fullPath) ?? string.Empty;
-            string sourceKey = SourceKeys.GetOrAdd(directory, static d => FindSourceKey(d)) ?? string.Empty;
+            string sourceKey = DecryptionSources.GetSourceKey(directory) ?? string.Empty;
             if (sourceKey.Length == 0)
             {
                 return null;
@@ -148,40 +146,6 @@ namespace AssetStudio
 
                 return stream.Length <= state.MinRange ? -1 : -3;
             }
-        }
-
-        private static string? FindSourceKey(string directory)
-        {
-            string? current = directory;
-            for (int depth = 0; depth < 6 && !string.IsNullOrEmpty(current); depth++)
-            {
-                string managed = Path.Combine(current, "Managed");
-                string metadata = Path.Combine(current, "il2cpp_data", "Metadata", "global-metadata.dat");
-                bool hasManaged = Directory.Exists(managed);
-                bool hasMetadata = File.Exists(metadata);
-                if (hasManaged || hasMetadata)
-                {
-                    return (hasManaged ? "M:" + managed : string.Empty) + (hasMetadata ? "|I:" + metadata : string.Empty);
-                }
-
-                current = Path.GetDirectoryName(current);
-            }
-
-            return null;
-        }
-
-        private static bool IsBundleLikeFile(string filePath)
-        {
-            string extension = Path.GetExtension(filePath);
-            foreach (string candidate in BundleExtensions)
-            {
-                if (string.Equals(extension, candidate, StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-
-            return false;
         }
 
         public static bool MatchesPassphrase(string passphrase, byte[] salt, byte[] cipherHead)
@@ -283,7 +247,7 @@ namespace AssetStudio
                 {
                     if (part.StartsWith("M:", StringComparison.Ordinal))
                     {
-                        foreach (string dll in OrderAssemblyPaths(Directory.EnumerateFiles(part[2..], "*.dll", SearchOption.TopDirectoryOnly)))
+                        foreach (string dll in DecryptionSources.OrderAssemblyPaths(Directory.EnumerateFiles(part[2..], "*.dll", SearchOption.TopDirectoryOnly)))
                         {
                             AddCandidates(primary, secondary, seen, ReadUtf16Strings(File.ReadAllBytes(dll)));
                         }
@@ -307,22 +271,6 @@ namespace AssetStudio
             }
 
             return (primary, secondary);
-        }
-
-        private static IEnumerable<string> OrderAssemblyPaths(IEnumerable<string> paths)
-        {
-            return paths.OrderBy(static p => IsFrameworkAssembly(p) ? 1 : 0)
-                .ThenBy(static p => p, StringComparer.OrdinalIgnoreCase);
-        }
-
-        private static bool IsFrameworkAssembly(string path)
-        {
-            string name = Path.GetFileName(path);
-            return name.StartsWith("System", StringComparison.OrdinalIgnoreCase)
-                || name.StartsWith("Microsoft", StringComparison.OrdinalIgnoreCase)
-                || name.StartsWith("Mono", StringComparison.OrdinalIgnoreCase)
-                || name.Equals("mscorlib.dll", StringComparison.OrdinalIgnoreCase)
-                || name.Equals("netstandard.dll", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void AddCandidates(List<string> primary, List<string> secondary, HashSet<string> seen, IEnumerable<string> candidates)
@@ -452,7 +400,7 @@ namespace AssetStudio
             {
                 lock (Sync)
                 {
-                    if (Passphrase != null || !IsBundleLikeFile(filePath))
+                    if (Passphrase != null || !DecryptionSources.IsBundleLikeFile(filePath))
                     {
                         return Passphrase;
                     }
