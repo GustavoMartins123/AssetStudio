@@ -454,14 +454,21 @@ public partial class MainWindow : Window
                 return;
             }
 
-            string? selectedFolder = null;
-            if (Dispatcher.UIThread.CheckAccess())
+            string? selectedFolder = TryAutoDiscoverManagedAssemblyDirectory();
+            if (string.IsNullOrEmpty(selectedFolder))
             {
-                selectedFolder = await PickAssemblyFolderOnUiThreadAsync();
+                if (Dispatcher.UIThread.CheckAccess())
+                {
+                    selectedFolder = await PickAssemblyFolderOnUiThreadAsync();
+                }
+                else
+                {
+                    selectedFolder = await Dispatcher.UIThread.InvokeAsync(PickAssemblyFolderOnUiThreadAsync);
+                }
             }
             else
             {
-                selectedFolder = await Dispatcher.UIThread.InvokeAsync(PickAssemblyFolderOnUiThreadAsync);
+                _lastLoadedAssemblyDirectory = selectedFolder;
             }
 
             if (!string.IsNullOrEmpty(selectedFolder))
@@ -489,6 +496,75 @@ public partial class MainWindow : Window
         {
             _assemblyLoaderGate.Release();
         }
+    }
+
+    private string? TryAutoDiscoverManagedAssemblyDirectory()
+    {
+        static bool DirectoryHasDlls(string dir)
+        {
+            try
+            {
+                using var enumerator = Directory.EnumerateFiles(dir, "*.dll", SearchOption.TopDirectoryOnly).GetEnumerator();
+                return enumerator.MoveNext();
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        var roots = new[]
+        {
+            _currentProjectAnalysis?.Report?.BackupManagedDirectory,
+            GetCurrentCacheFolderPath(),
+            assetsManager.ProjectRoot
+        };
+
+        for (var i = 0; i < roots.Length; i++)
+        {
+            var root = roots[i];
+            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+            {
+                continue;
+            }
+
+            if (i == 0 && DirectoryHasDlls(root))
+            {
+                return root;
+            }
+
+            var directManaged = Path.Combine(root, "Managed");
+            if (Directory.Exists(directManaged) && DirectoryHasDlls(directManaged))
+            {
+                return directManaged;
+            }
+
+            try
+            {
+                foreach (var dataDir in Directory.EnumerateDirectories(root, "*_Data", SearchOption.TopDirectoryOnly))
+                {
+                    var subManaged = Path.Combine(dataDir, "Managed");
+                    if (Directory.Exists(subManaged) && DirectoryHasDlls(subManaged))
+                    {
+                        return subManaged;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            var backupDirs = Services.ProjectAnalysis.ProjectRuntimeDetector.DiscoverBackupManagedDirectories(root);
+            for (var b = 0; b < backupDirs.Count; b++)
+            {
+                if (DirectoryHasDlls(backupDirs[b]))
+                {
+                    return backupDirs[b];
+                }
+            }
+        }
+
+        return null;
     }
 
     private async Task<string?> PickAssemblyFolderOnUiThreadAsync()

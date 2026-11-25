@@ -805,6 +805,14 @@ public partial class MainWindow
                         managedDirs.Add(subManaged);
                     }
                 }
+
+                foreach (var backupManaged in Services.ProjectAnalysis.ProjectRuntimeDetector.DiscoverBackupManagedDirectories(projectRoot))
+                {
+                    if (!managedDirs.Contains(backupManaged, StringComparer.OrdinalIgnoreCase))
+                    {
+                        managedDirs.Add(backupManaged);
+                    }
+                }
             }
             catch
             {

@@ -33,7 +33,7 @@ namespace AssetStudio.Avalonia.Services
     {
         public const string LazyExpandPlaceholderText = "Expand to load scene hierarchy...";
         public const string LazyLoadingPlaceholderText = "Loading scene hierarchy...";
-        public const int DefaultContainerPageSize = 500;
+        public const int DefaultContainerPageSize = 150;
         public const int DefaultContainerSearchCap = 1000;
 
         public static HashSet<ClassIDType> GetSceneHierarchyObjectTypes()

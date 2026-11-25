@@ -26,6 +26,38 @@ public partial class MainWindow
     private bool _containersIndexIsLazy;
     private bool _isBuildingContainersIndex;
     private long _containerPreviewRequestId;
+    private bool _lazySceneHierarchyPendingRefresh;
+    private long _lazySceneHierarchyLoadedSessionId = -1;
+    private int _lazySceneHierarchyFullScanIndexCount = -1;
+
+    private void LeftTabControl_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (IsWindowClosingOrClosed || LeftTabControl == null)
+        {
+            return;
+        }
+
+        var selectedIndex = LeftTabControl.SelectedIndex;
+        if (SceneHierarchyTabContent != null)
+        {
+            SceneHierarchyTabContent.IsVisible = selectedIndex == 0;
+        }
+        if (AssetListTabContent != null)
+        {
+            AssetListTabContent.IsVisible = selectedIndex == 1;
+        }
+        if (AssetClassesTabContent != null)
+        {
+            AssetClassesTabContent.IsVisible = selectedIndex == 2;
+        }
+
+        if (selectedIndex == 0
+            && assetsManager.LazyLoading
+            && (_lazySceneHierarchyPendingRefresh || _lazySceneHierarchyLoadedSessionId != lazyIndexingSessionId))
+        {
+            RefreshLazySceneHierarchyNowAsync(lazyIndexingSessionId, forceFullScan: false);
+        }
+    }
 
     internal SceneHierarchyViewModel SceneHierarchy => ViewModel.SceneHierarchy;
     private SceneTreeSearchSession treeSearchSession => SceneHierarchy.SearchSession;
@@ -71,6 +103,9 @@ public partial class MainWindow
 
         _containersIndexSessionId = -1;
         _containersIndexAssetCount = -1;
+        _lazySceneHierarchyPendingRefresh = false;
+        _lazySceneHierarchyLoadedSessionId = -1;
+        _lazySceneHierarchyFullScanIndexCount = -1;
         Interlocked.Increment(ref _containerPreviewRequestId);
     }
 
@@ -131,10 +166,110 @@ public partial class MainWindow
         _containersIndexSessionId = -1;
         _containersIndexAssetCount = -1;
 
+        // Defer scene discovery while the user is browsing Asset List / Asset Classes so project loading
+        // pays zero scene-discovery cost until Scene Hierarchy is actually viewed.
+        if (LeftTabControl != null && LeftTabControl.SelectedIndex != 0)
+        {
+            _lazySceneHierarchyPendingRefresh = true;
+            return;
+        }
+
+        RefreshLazySceneHierarchyNowAsync(expectedSessionId, forceFullScan: true);
+    }
+
+    private void RefreshLazySceneHierarchyNowAsync(long expectedSessionId, bool forceFullScan)
+    {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager || !assetsManager.LazyLoading)
+        {
+            return;
+        }
+
+        _lazySceneHierarchyPendingRefresh = false;
+        var currentIndexCount = assetsManager.ProjectIndex.Count;
         var cacheFolder = GetCurrentCacheFolderPath();
         var scanResultSnapshot = currentScanResult;
         var projectRoot = !string.IsNullOrWhiteSpace(cacheFolder) ? cacheFolder : assetsManager.ProjectRoot;
         var token = GetOrCreateLazySceneHierarchyToken();
+
+        void ApplyDescriptorsOnUiThread(List<LazySceneDescriptor> descriptors, bool markSessionLoaded)
+        {
+            var realGeometryCount = 0;
+            for (var i = 0; i < descriptors.Count; i++)
+            {
+                if (descriptors[i].RendererCount > 0)
+                {
+                    realGeometryCount++;
+                }
+            }
+
+            var lazyRoots = SceneHierarchyBuilderService.BuildLazySceneRootNodes(
+                descriptors,
+                onExpanded: OnLazySceneRootExpanded);
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (IsWindowClosingOrClosed
+                    || _isReturningToProjectManager
+                    || !assetsManager.LazyLoading
+                    || expectedSessionId != lazyIndexingSessionId
+                    || token.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                // Preserve any already-expanded lazy scene nodes for the same session so refreshes
+                // don't collapse user work.
+                if (SceneHierarchy.Nodes.Count > 0 && SceneHierarchy.IsLazyMode)
+                {
+                    var existingLoadedById = new Dictionary<string, GameObjectNode>(StringComparer.OrdinalIgnoreCase);
+                    for (var i = 0; i < SceneHierarchy.Nodes.Count; i++)
+                    {
+                        var existing = SceneHierarchy.Nodes[i];
+                        if (existing.IsLazySceneRoot && existing.IsSceneLoaded && existing.LazyScene != null)
+                        {
+                            var key = !string.IsNullOrWhiteSpace(existing.LazyScene.ScenePath)
+                                ? existing.LazyScene.ScenePath
+                                : existing.LazyScene.SerializedFileName;
+                            if (!string.IsNullOrWhiteSpace(key))
+                            {
+                                existingLoadedById.TryAdd(key, existing);
+                            }
+                        }
+                    }
+
+                    if (existingLoadedById.Count > 0)
+                    {
+                        for (var i = 0; i < lazyRoots.Count; i++)
+                        {
+                            var desc = lazyRoots[i].LazyScene;
+                            if (desc == null) continue;
+                            var key = !string.IsNullOrWhiteSpace(desc.ScenePath) ? desc.ScenePath : desc.SerializedFileName;
+                            if (!string.IsNullOrWhiteSpace(key) && existingLoadedById.TryGetValue(key, out var loadedNode))
+                            {
+                                lazyRoots[i] = loadedNode;
+                            }
+                        }
+                    }
+                }
+
+                SceneHierarchy.SetLazySceneRoots(lazyRoots, realGeometryCount);
+                SceneHierarchy.CanRefresh = assetsManager.ProjectIndex.Count > 0 || lazyRoots.Count > 0;
+                if (!ReferenceEquals(SceneTreeView.ItemsSource, SceneHierarchy.Nodes))
+                {
+                    SceneTreeView.ItemsSource = SceneHierarchy.Nodes;
+                }
+
+                if (markSessionLoaded)
+                {
+                    _lazySceneHierarchyLoadedSessionId = expectedSessionId;
+                }
+
+                if (SceneHierarchy.IsContainersMode)
+                {
+                    _ = EnsureContainersIndexBuiltAsync(forceRebuild: false);
+                }
+            });
+        }
 
         _ = Task.Run(() =>
         {
@@ -142,11 +277,27 @@ public partial class MainWindow
             {
                 token.ThrowIfCancellationRequested();
 
+                // Fast SQLite first pass (<5 ms): show persisted scenes immediately without waiting for full handle scan.
                 List<IndexedSceneRecord>? sqliteScenes = null;
                 if (scanResultSnapshot != null && !string.IsNullOrWhiteSpace(cacheFolder) && Directory.Exists(cacheFolder))
                 {
                     var signature = _sqliteCache.GetFolderSignature(scanResultSnapshot);
                     sqliteScenes = _sqliteCache.GetIndexedScenes(cacheFolder, signature);
+                }
+
+                if (sqliteScenes is { Count: > 0 } && SceneHierarchy.Nodes.Count == 0)
+                {
+                    var quickDescriptors = SceneHierarchyBuilderService.BuildLazySceneDescriptors(
+                        discoveredScenes: null,
+                        sqliteIndexedScenes: sqliteScenes);
+                    ApplyDescriptorsOnUiThread(quickDescriptors, markSessionLoaded: false);
+                }
+
+                if (!forceFullScan
+                    && _lazySceneHierarchyLoadedSessionId == expectedSessionId
+                    && _lazySceneHierarchyFullScanIndexCount == currentIndexCount)
+                {
+                    return;
                 }
 
                 token.ThrowIfCancellationRequested();
@@ -159,76 +310,8 @@ public partial class MainWindow
                     discovered.SceneFileStats,
                     discovered.CompanionStageFilesBySceneSf);
 
-                var realGeometryCount = 0;
-                for (var i = 0; i < descriptors.Count; i++)
-                {
-                    if (descriptors[i].RendererCount > 0)
-                    {
-                        realGeometryCount++;
-                    }
-                }
-
-                var lazyRoots = SceneHierarchyBuilderService.BuildLazySceneRootNodes(
-                    descriptors,
-                    onExpanded: OnLazySceneRootExpanded);
-
-                token.ThrowIfCancellationRequested();
-
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (IsWindowClosingOrClosed
-                        || _isReturningToProjectManager
-                        || !assetsManager.LazyLoading
-                        || expectedSessionId != lazyIndexingSessionId
-                        || token.IsCancellationRequested)
-                    {
-                        return;
-                    }
-
-                    // Preserve any already-expanded lazy scene nodes for the same session so refreshes
-                    // (e.g. after structure build finishes following warm load) don't collapse user work.
-                    if (SceneHierarchy.Nodes.Count > 0 && SceneHierarchy.IsLazyMode)
-                    {
-                        var existingLoadedById = new Dictionary<string, GameObjectNode>(StringComparer.OrdinalIgnoreCase);
-                        for (var i = 0; i < SceneHierarchy.Nodes.Count; i++)
-                        {
-                            var existing = SceneHierarchy.Nodes[i];
-                            if (existing.IsLazySceneRoot && existing.IsSceneLoaded && existing.LazyScene != null)
-                            {
-                                var key = !string.IsNullOrWhiteSpace(existing.LazyScene.ScenePath)
-                                    ? existing.LazyScene.ScenePath
-                                    : existing.LazyScene.SerializedFileName;
-                                if (!string.IsNullOrWhiteSpace(key))
-                                {
-                                    existingLoadedById.TryAdd(key, existing);
-                                }
-                            }
-                        }
-
-                        if (existingLoadedById.Count > 0)
-                        {
-                            for (var i = 0; i < lazyRoots.Count; i++)
-                            {
-                                var desc = lazyRoots[i].LazyScene;
-                                if (desc == null) continue;
-                                var key = !string.IsNullOrWhiteSpace(desc.ScenePath) ? desc.ScenePath : desc.SerializedFileName;
-                                if (!string.IsNullOrWhiteSpace(key) && existingLoadedById.TryGetValue(key, out var loadedNode))
-                                {
-                                    lazyRoots[i] = loadedNode;
-                                }
-                            }
-                        }
-                    }
-
-                    SceneHierarchy.SetLazySceneRoots(lazyRoots, realGeometryCount);
-                    SceneHierarchy.CanRefresh = assetsManager.ProjectIndex.Count > 0 || lazyRoots.Count > 0;
-                    SceneTreeView.ItemsSource = SceneHierarchy.Nodes;
-
-                    if (SceneHierarchy.IsContainersMode)
-                    {
-                        _ = EnsureContainersIndexBuiltAsync(forceRebuild: true);
-                    }
-                });
+                _lazySceneHierarchyFullScanIndexCount = currentIndexCount;
+                ApplyDescriptorsOnUiThread(descriptors, markSessionLoaded: true);
             }
             catch (OperationCanceledException)
             {

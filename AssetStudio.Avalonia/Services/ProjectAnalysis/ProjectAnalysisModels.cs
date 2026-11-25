@@ -46,6 +46,8 @@ public sealed class ProjectAnalysisReport
     public bool Il2CppMetadataObfuscated { get; set; }
     public bool HasManagedAssemblies { get; set; }
     public int ManagedAssemblyCount { get; set; }
+    public bool HasBackupManagedAssemblies { get; set; }
+    public string BackupManagedDirectory { get; set; } = string.Empty;
     public bool HasAddressables { get; set; }
     public List<string> AddressablesCatalogPaths { get; set; } = new();
     public bool Il2CppDumperArtifactsDetected { get; set; }
@@ -63,9 +65,16 @@ public sealed class ProjectAnalysisReport
         switch (ScriptingBackend)
         {
             case UnityScriptingBackend.Il2Cpp:
-                parts.Add(Il2CppMetadataVersion.HasValue
+                var il2CppLabel = Il2CppMetadataVersion.HasValue
                     ? $"IL2CPP v{Il2CppMetadataVersion.Value}"
-                    : (Il2CppMetadataObfuscated ? "IL2CPP (obfuscated metadata)" : "IL2CPP"));
+                    : (Il2CppMetadataObfuscated ? "IL2CPP (obfuscated metadata)" : "IL2CPP");
+                if (HasBackupManagedAssemblies)
+                {
+                    il2CppLabel = ManagedAssemblyCount > 0
+                        ? $"{il2CppLabel} + Backup Managed DLLs ({ManagedAssemblyCount})"
+                        : $"{il2CppLabel} + Backup Managed DLLs";
+                }
+                parts.Add(il2CppLabel);
                 break;
             case UnityScriptingBackend.Mono:
                 parts.Add(ManagedAssemblyCount > 0
@@ -144,6 +153,8 @@ public sealed class ProjectAnalysisReport
             Il2CppMetadataObfuscated = Il2CppMetadataObfuscated,
             HasManagedAssemblies = HasManagedAssemblies,
             ManagedAssemblyCount = ManagedAssemblyCount,
+            HasBackupManagedAssemblies = HasBackupManagedAssemblies,
+            BackupManagedDirectory = BackupManagedDirectory,
             HasAddressables = HasAddressables,
             AddressablesCatalogPaths = AddressablesCatalogPaths.ToList(),
             Il2CppDumperArtifactsDetected = Il2CppDumperArtifactsDetected,
@@ -352,6 +363,8 @@ public sealed class ProjectRuntimeDetectionResult
     public string? Il2CppMetadataAnomalyReason { get; set; }
     public bool HasManagedAssemblies { get; set; }
     public int ManagedAssemblyCount { get; set; }
+    public bool HasBackupManagedAssemblies { get; set; }
+    public string BackupManagedDirectory { get; set; } = string.Empty;
     public bool HasAddressables { get; set; }
     public List<string> AddressablesCatalogPaths { get; set; } = new();
     public List<string> Il2CppDumperArtifactPaths { get; set; } = new();

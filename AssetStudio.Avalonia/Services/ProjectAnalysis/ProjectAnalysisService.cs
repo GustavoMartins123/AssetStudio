@@ -395,6 +395,8 @@ public sealed class ProjectAnalysisService
             Il2CppMetadataObfuscated = detection.Il2CppMetadataObfuscated,
             HasManagedAssemblies = detection.HasManagedAssemblies,
             ManagedAssemblyCount = detection.ManagedAssemblyCount,
+            HasBackupManagedAssemblies = detection.HasBackupManagedAssemblies,
+            BackupManagedDirectory = detection.BackupManagedDirectory,
             HasAddressables = detection.HasAddressables,
             AddressablesCatalogPaths = new List<string>(detection.AddressablesCatalogPaths),
             Il2CppDumperArtifactsDetected = detection.Il2CppDumperArtifactPaths.Count > 0,

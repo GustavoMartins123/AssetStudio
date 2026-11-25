@@ -167,10 +167,12 @@ public sealed class ProjectRuntimeDetector
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        // 3. Detect Managed assemblies (*_Data/Managed/*.dll)
-        var managedDlls = DetectManagedAssemblies(fullRoot, dataDirectories);
+        // 3. Detect Managed assemblies (*_Data/Managed/*.dll or Unity *_BackUpThisFolder_ButDontShipItWithYourGame/Managed/*.dll)
+        var managedDlls = DetectManagedAssemblies(fullRoot, dataDirectories, out var backupManagedDir);
         result.ManagedAssemblyCount = managedDlls.Count;
         result.HasManagedAssemblies = managedDlls.Count > 0;
+        result.HasBackupManagedAssemblies = !string.IsNullOrEmpty(backupManagedDir) && managedDlls.Count > 0;
+        result.BackupManagedDirectory = backupManagedDir ?? string.Empty;
         foreach (var dll in managedDlls)
         {
             signatureFiles.Add(dll);
@@ -433,8 +435,89 @@ public sealed class ProjectRuntimeDetector
         return null;
     }
 
-    private static List<string> DetectManagedAssemblies(string fullRoot, IReadOnlyList<string> dataDirectories)
+    public const string UnityBackupFolderSuffix = "_BackUpThisFolder_ButDontShipItWithYourGame";
+
+    public static List<string> DiscoverBackupManagedDirectories(string? projectRoot)
     {
+        var results = new List<string>();
+        if (string.IsNullOrWhiteSpace(projectRoot) || !Directory.Exists(projectRoot))
+        {
+            return results;
+        }
+
+        string fullRoot;
+        try
+        {
+            fullRoot = Path.GetFullPath(projectRoot);
+        }
+        catch
+        {
+            return results;
+        }
+
+        var seen = new HashSet<string>(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
+
+        void ProbeContainerRoot(string rootDir)
+        {
+            if (string.IsNullOrWhiteSpace(rootDir) || !Directory.Exists(rootDir))
+            {
+                return;
+            }
+
+            try
+            {
+                foreach (var dir in Directory.EnumerateDirectories(rootDir, "*" + UnityBackupFolderSuffix, SearchOption.TopDirectoryOnly)
+                    .OrderBy(static d => d, StringComparer.OrdinalIgnoreCase))
+                {
+                    var managedDir = Path.Combine(dir, "Managed");
+                    if (Directory.Exists(managedDir) && seen.Add(managedDir))
+                    {
+                        results.Add(managedDir);
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        ProbeContainerRoot(fullRoot);
+
+        // If projectRoot points directly to <Game>_Data, also check its parent folder for sibling *_BackUpThisFolder_ButDontShipItWithYourGame/Managed.
+        var leafName = Path.GetFileName(fullRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        if (leafName.EndsWith("_Data", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(leafName, "Data", StringComparison.OrdinalIgnoreCase))
+        {
+            var parent = Path.GetDirectoryName(fullRoot);
+            if (!string.IsNullOrEmpty(parent))
+            {
+                ProbeContainerRoot(parent);
+            }
+        }
+
+        // Bounded depth-2 fallback for nested build folders
+        if (results.Count == 0)
+        {
+            try
+            {
+                foreach (var childDir in Directory.EnumerateDirectories(fullRoot, "*", SearchOption.TopDirectoryOnly)
+                    .OrderBy(static d => d, StringComparer.OrdinalIgnoreCase)
+                    .Take(32))
+                {
+                    ProbeContainerRoot(childDir);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return results;
+    }
+
+    private static List<string> DetectManagedAssemblies(string fullRoot, IReadOnlyList<string> dataDirectories, out string? backupManagedDirectory)
+    {
+        backupManagedDirectory = null;
         var results = new List<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -449,26 +532,46 @@ public sealed class ProjectRuntimeDetector
             managedDirs.Add(Path.Combine(fullRoot, "Managed"));
         }
 
-        foreach (var managedDir in managedDirs.Distinct(StringComparer.OrdinalIgnoreCase))
+        void CollectDllsFromDirectories(IEnumerable<string> directories)
         {
-            if (!Directory.Exists(managedDir))
+            foreach (var managedDir in directories.Distinct(StringComparer.OrdinalIgnoreCase))
             {
-                continue;
-            }
-
-            try
-            {
-                foreach (var dll in Directory.EnumerateFiles(managedDir, "*.dll", SearchOption.TopDirectoryOnly)
-                    .OrderBy(static f => f, StringComparer.OrdinalIgnoreCase))
+                if (!Directory.Exists(managedDir))
                 {
-                    if (seen.Add(dll))
+                    continue;
+                }
+
+                try
+                {
+                    foreach (var dll in Directory.EnumerateFiles(managedDir, "*.dll", SearchOption.TopDirectoryOnly)
+                        .OrderBy(static f => f, StringComparer.OrdinalIgnoreCase))
                     {
-                        results.Add(dll);
+                        if (seen.Add(dll))
+                        {
+                            results.Add(dll);
+                        }
                     }
                 }
+                catch
+                {
+                }
             }
-            catch
+        }
+
+        CollectDllsFromDirectories(managedDirs);
+
+        // Fallback for IL2CPP builds that shipped Unity's *_BackUpThisFolder_ButDontShipItWithYourGame/Managed folder
+        // containing full-IL C# assemblies.
+        if (results.Count == 0)
+        {
+            var backupDirs = DiscoverBackupManagedDirectories(fullRoot);
+            if (backupDirs.Count > 0)
             {
+                CollectDllsFromDirectories(backupDirs);
+                if (results.Count > 0)
+                {
+                    backupManagedDirectory = backupDirs[0];
+                }
             }
         }
 

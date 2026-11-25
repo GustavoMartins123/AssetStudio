@@ -462,6 +462,13 @@ public static class ScriptSourceDiscovery
             TryAddGlobalMetadataFile(Path.Combine(fullRoot, "Managed", "Metadata", "global-metadata.dat"));
             TryAddGlobalMetadataFile(Path.Combine(fullRoot, "global-metadata.dat"));
 
+            // Auto-detect Unity IL2CPP backup Managed DLLs (*_BackUpThisFolder_ButDontShipItWithYourGame/Managed)
+            // as full-IL managed assemblies, prioritized above global-metadata.dat / DummyDll stubs.
+            foreach (var backupManagedDir in ProjectRuntimeDetector.DiscoverBackupManagedDirectories(fullRoot))
+            {
+                TryAddDllDirectory(backupManagedDir, preferDummy: false);
+            }
+
             // Probe direct child directories that look like dumper outputs
             try
             {
