@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text;
 using NumericsVector4 = System.Numerics.Vector4;
 
 namespace AssetStudio
@@ -8,6 +10,7 @@ namespace AssetStudio
     public abstract class ShaderPreviewReader
     {
         protected const int MaxBlobBytes = 64 * 1024 * 1024;
+        protected static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
         public abstract string Name { get; }
         public abstract IReadOnlyDictionary<string, NumericsVector4> Values { get; }
@@ -19,7 +22,8 @@ namespace AssetStudio
 
         public static bool SupportsVersion(int[] version) => version is [5, 3, ..] || SupportsSerializedVersion(version);
 
-        private static bool SupportsSerializedVersion(int[] version) => version is [2017, 4, ..] or [2018, 2, ..] or [2019, 3, ..];
+        private static bool SupportsSerializedVersion(int[] version) =>
+            version is [2017, 4, ..] or [2018, 2, ..] or [2019, 3, ..] or [2020, 3, ..];
 
         public static ShaderPreviewReader Read(Shader shader)
         {
@@ -28,7 +32,7 @@ namespace AssetStudio
             {
                 [5, 3, ..] => LegacyShaderPreview.Read(shader),
                 _ when SupportsSerializedVersion(shader.version) => new SerializedShaderPreview(shader),
-                _ => throw new NotSupportedException("Shader preview supports Unity 5.3, 2017.4, 2018.2 and 2019.3 Built-in shaders compiled for Direct3D 11.")
+                _ => throw new NotSupportedException("Shader preview supports Unity 5.3, 2017.4, 2018.2, 2019.3 and 2020.3 Built-in shaders compiled for Direct3D 11.")
             };
         }
 
@@ -59,6 +63,46 @@ namespace AssetStudio
             ShaderPreviewProgramKind.Domain => type == ShaderGpuProgramType.DX11DomainSM50,
             _ => throw new ArgumentOutOfRangeException(nameof(stage))
         };
+
+        protected static void ReadProgramChannels(BinaryReader reader)
+        {
+            reader.ReadUInt32(); // Source-channel mask.
+            int channelCount = ReadCount(reader, 32);
+            for (int i = 0; i < channelCount; i++)
+            {
+                reader.ReadUInt32(); // Source channel.
+                reader.ReadUInt32(); // Destination channel.
+            }
+        }
+
+        protected static ShaderPreviewParameter ReadProgramParameter(BinaryReader reader) =>
+            new(ReadString(reader), reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt32(),
+                reader.ReadInt32() != 0, reader.ReadInt32(), reader.ReadInt32());
+
+        protected static int ReadCount(BinaryReader reader, int maximum)
+        {
+            int count = reader.ReadInt32();
+            if (count < 0 || count > maximum)
+            {
+                throw new InvalidDataException($"Invalid Unity shader field length {count}.");
+            }
+            return count;
+        }
+
+        protected static string ReadString(BinaryReader reader) => StrictUtf8.GetString(ReadField(reader, 4096));
+
+        protected static byte[] ReadField(BinaryReader reader, int maximum)
+        {
+            int count = ReadCount(reader, maximum);
+            int padding = (4 - count % 4) % 4;
+            if (count + padding > reader.BaseStream.Length - reader.BaseStream.Position)
+            {
+                throw new EndOfStreamException("The Unity shader program ended inside an aligned field.");
+            }
+            byte[] value = reader.ReadBytes(count);
+            reader.BaseStream.Seek(padding, SeekOrigin.Current);
+            return value;
+        }
 
         internal static ShaderPreviewSamplerBinding ReadInlineSampler(uint encoded, int slot)
         {

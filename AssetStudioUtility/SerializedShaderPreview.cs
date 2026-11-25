@@ -79,7 +79,13 @@ namespace AssetStudio
         public override IReadOnlyList<string> DefaultKeywords => _defaultKeywords;
         public override IReadOnlyList<ShaderPreviewSubShader> SubShaders { get; }
 
-        private sealed record Variant(SerializedSubProgram Program, string[] Keywords);
+        private sealed record Variant(SerializedSubProgram Program, SerializedProgramParameters? CommonParameters, string[] Keywords);
+        private sealed record ConstantBufferLayout(string Name, int Size, bool IsPartial, ShaderPreviewParameter[] Parameters);
+        private sealed record EmbeddedBindings(IReadOnlyList<ConstantBufferLayout> Layouts, IReadOnlyList<(string Name, int Slot)> Buffers,
+            IReadOnlyList<ShaderPreviewTextureBinding> Textures, IReadOnlyList<ShaderPreviewStructuredBufferBinding> StructuredBuffers)
+        {
+            internal static readonly EmbeddedBindings Empty = new([], [], [], []);
+        }
 
         private sealed record Pass(string PassName, string Mode, SerializedPass Source, IReadOnlyDictionary<int, string> Names,
             Variant[] Vertex, Variant[] Pixel, Variant[] Geometry, Variant[] Hull, Variant[] Domain) :
@@ -122,7 +128,8 @@ namespace AssetStudio
 
             Variant[] Variants(SerializedProgram program, ShaderPreviewProgramKind kind) => program.m_SubPrograms
                 .Where(sub => IsDirect3D11Stage(sub.m_GpuProgramType, kind))
-                .Select(sub => new Variant(sub, sub.m_KeywordIndices.Select(index => ReadNameIndex(names, index)).ToArray())).ToArray();
+                .Select(sub => new Variant(sub, program.m_CommonParameters,
+                    sub.m_KeywordIndices.Select(index => ReadNameIndex(names, index)).ToArray())).ToArray();
         }
 
         private static Dictionary<string, string> ReadTags(SerializedTagMap tags) =>
@@ -254,29 +261,87 @@ namespace AssetStudio
             }
             using var reader = new BinaryReader(new MemoryStream(bytes, entry.Offset, entry.Length, writable: false));
             var code = new ShaderSubProgram(reader);
-            const int prefixBytes = 6;
+            const int extendedHeaderBytes = 38;
+            // Unity 2020.3 can store a larger Direct3D 11 header before the DXBC container.
+            int prefixBytes = code.m_ProgramCode switch
+            {
+                [1, ..] => 6,
+                [2, ..] => extendedHeaderBytes,
+                _ => throw new InvalidDataException($"GPU program {index} has an unsupported Direct3D 11 program header.")
+            };
             if (code.m_ProgramType != sub.m_GpuProgramType || code.m_ProgramCode.Length < prefixBytes + 32 ||
-                code.m_ProgramCode[0] != 1 || !code.m_ProgramCode.AsSpan(prefixBytes, 4).SequenceEqual("DXBC"u8))
+                !code.m_ProgramCode.AsSpan(prefixBytes, 4).SequenceEqual("DXBC"u8))
             {
                 throw new InvalidDataException($"GPU program {index} does not contain the declared Direct3D 11 stage.");
             }
-            if (sub.m_VectorParams.Length != 0 || sub.m_MatrixParams.Length != 0 || sub.m_UAVParams.Length != 0)
+            var specific = sub.m_Parameters;
+            var common = variant.CommonParameters;
+            if ((specific == null) != (common == null))
+            {
+                throw new InvalidDataException("The stage has an incomplete common and per-variant parameter layout.");
+            }
+            if (Parameters(sub.m_VectorParams, p => p.m_VectorParams).Any() ||
+                Parameters(sub.m_MatrixParams, p => p.m_MatrixParams).Any() ||
+                Parameters(sub.m_UAVParams, p => p.m_UAVParams).Any())
             {
                 throw new NotSupportedException("The stage requires ungrouped constants or UAVs.");
             }
 
             string NameOf(int id) => ReadNameIndex(names, id);
-            var constants = sub.m_ConstantBuffers.ToDictionary(buffer => buffer.m_NameIndex);
+            var embedded = prefixBytes == extendedHeaderBytes ? ReadEmbeddedBindings(reader) : EmbeddedBindings.Empty;
+            var constants = Parameters(sub.m_ConstantBuffers, p => p.m_ConstantBuffers)
+                .Select(ReadLayout).Concat(embedded.Layouts)
+                .GroupBy(layout => layout.Name, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
             var buffers = new List<ShaderPreviewBuffer>();
             var slots = new HashSet<int>();
-            foreach (var binding in sub.m_ConstantBufferBindings)
+            var bindings = Parameters(sub.m_ConstantBufferBindings, p => p.m_ConstantBufferBindings)
+                .Select(binding => (Name: NameOf(binding.m_NameIndex), Slot: binding.m_Index))
+                .Concat(embedded.Buffers).Distinct();
+            foreach (var (name, slot) in bindings)
             {
-                string name = NameOf(binding.m_NameIndex);
-                if (binding.m_Index is < 0 or >= 14 || !slots.Add(binding.m_Index) ||
-                    !constants.Remove(binding.m_NameIndex, out var buffer) || buffer.m_Size is <= 0 or > 65536)
+                if (slot is < 0 or >= 14 || !slots.Add(slot) || !constants.Remove(name, out var layouts) ||
+                    layouts.Count(layout => !layout.IsPartial) > 1)
                 {
                     throw new InvalidDataException($"Invalid constant buffer binding '{name}'.");
                 }
+                int size = layouts.Max(layout => layout.Size);
+                if (size is <= 0 or > 65536)
+                {
+                    throw new InvalidDataException($"Invalid constant buffer size for '{name}'.");
+                }
+                var parameters = layouts.SelectMany(layout => layout.Parameters).Distinct().ToArray();
+                if (parameters.Select(parameter => parameter.Offset).Distinct().Count() != parameters.Length)
+                {
+                    throw new InvalidDataException($"Constant buffer '{name}' has conflicting declarations for the same offset.");
+                }
+                buffers.Add(new ShaderPreviewBuffer(name, slot, size, parameters));
+            }
+            if (constants.Values.SelectMany(layouts => layouts).Any(layout => layout.Parameters.Length != 0))
+            {
+                throw new InvalidDataException("The stage contains constants with no buffer binding.");
+            }
+
+            var textures = Parameters(sub.m_TextureParams, p => p.m_TextureParams)
+                .Select(binding => ReadTextureBinding(NameOf(binding.m_NameIndex), binding.m_Index, binding.m_SamplerIndex, binding.m_Dim))
+                .Concat(embedded.Textures).Distinct().ToArray();
+            var samplers = Parameters(sub.m_Samplers, p => p.m_Samplers)
+                .Select(binding => ReadInlineSampler(binding.sampler, binding.bindPoint)).Distinct().ToArray();
+            return new ShaderPreviewStage(code.m_ProgramCode[prefixBytes..], buffers.ToArray(), textures)
+            {
+                StructuredBuffers = Parameters(sub.m_BufferParams, p => p.m_BufferParams)
+                    .Select(binding => new ShaderPreviewStructuredBufferBinding(NameOf(binding.m_NameIndex), binding.m_Index))
+                    .Concat(embedded.StructuredBuffers).Distinct().ToArray(),
+                InlineSamplers = samplers
+            };
+
+            // Unity 2020.3.2 and later share bindings across the variants of a stage.
+            IEnumerable<T> Parameters<T>(T[] legacy, Func<SerializedProgramParameters, T[]> select) =>
+                specific == null ? legacy : select(common!).Concat(select(specific));
+
+            ConstantBufferLayout ReadLayout(ConstantBuffer buffer)
+            {
+                string name = NameOf(buffer.m_NameIndex);
                 if (buffer.m_StructParams.Length != 0)
                 {
                     throw new NotSupportedException($"Constant buffer '{name}' contains structured parameters.");
@@ -285,29 +350,77 @@ namespace AssetStudio
                     m.m_RowCount, 4, true, ReadArraySize(m.m_ArraySize), m.m_Index))
                     .Concat(buffer.m_VectorParams.Select(v => new ShaderPreviewParameter(NameOf(v.m_NameIndex), v.m_Type,
                         1, v.m_Dim, false, ReadArraySize(v.m_ArraySize), v.m_Index))).ToArray();
-                buffers.Add(new ShaderPreviewBuffer(name, binding.m_Index, buffer.m_Size, parameters));
+                return new ConstantBufferLayout(name, buffer.m_Size, buffer.m_IsPartialCB, parameters);
             }
-            if (constants.Values.Any(buffer => buffer.m_VectorParams.Length != 0 || buffer.m_MatrixParams.Length != 0 || buffer.m_StructParams.Length != 0))
+        }
+
+        private static EmbeddedBindings ReadEmbeddedBindings(BinaryReader reader)
+        {
+            // The extended program stores the rest of each layout and the per-program bindings after DXBC.
+            ReadProgramChannels(reader);
+            int groupCount = ReadCount(reader, 64);
+            var layouts = new List<ConstantBufferLayout>(groupCount);
+            for (int i = 0; i < groupCount; i++)
             {
-                throw new InvalidDataException("The stage contains constants with no buffer binding.");
+                string name = ReadString(reader);
+                int size = ReadCount(reader, 65536);
+                var parameters = new ShaderPreviewParameter[ReadCount(reader, 4096)];
+                for (int j = 0; j < parameters.Length; j++)
+                {
+                    var parameter = ReadProgramParameter(reader);
+                    parameters[j] = parameter with { ArraySize = ReadArraySize(parameter.ArraySize) };
+                }
+                if (ReadCount(reader, 4096) != 0)
+                {
+                    throw new NotSupportedException($"Constant buffer '{name}' contains structured parameters.");
+                }
+                if (name.Length != 0 || size != 0 || parameters.Length != 0)
+                {
+                    layouts.Add(new ConstantBufferLayout(name, size, true, parameters));
+                }
             }
 
-            var textures = sub.m_TextureParams.Select(binding =>
+            int resourceCount = ReadCount(reader, 160);
+            var buffers = new List<(string Name, int Slot)>();
+            var textures = new List<ShaderPreviewTextureBinding>();
+            var structuredBuffers = new List<ShaderPreviewStructuredBufferBinding>();
+            for (int i = 0; i < resourceCount; i++)
             {
-                string name = NameOf(binding.m_NameIndex);
-                var dimension = (ShaderPreviewTextureDimension)binding.m_Dim;
-                if (binding.m_Index is < 0 or >= 128 || binding.m_SamplerIndex is < -1 or >= 16 || !Enum.IsDefined(dimension))
+                string name = ReadString(reader);
+                int kind = reader.ReadInt32();
+                int slot = reader.ReadInt32();
+                int extra = reader.ReadInt32();
+                switch (kind)
                 {
-                    throw new NotSupportedException($"Unsupported shader texture '{name}' (dimension {binding.m_Dim}, slot {binding.m_Index}, sampler {binding.m_SamplerIndex}).");
+                    case 0:
+                        // The texture dimension is stored above the multisample flag.
+                        textures.Add(ReadTextureBinding(name, slot, extra, reader.ReadInt32() >> 1));
+                        break;
+                    case 1 when extra == 0:
+                        buffers.Add((name, slot));
+                        break;
+                    case 2 when extra == 0 && slot is >= 0 and < 128:
+                        structuredBuffers.Add(new ShaderPreviewStructuredBufferBinding(name, slot));
+                        break;
+                    default:
+                        throw new NotSupportedException($"Unsupported embedded shader resource '{name}' (type {kind}, slot {slot}).");
                 }
-                return new ShaderPreviewTextureBinding(name, binding.m_Index, binding.m_SamplerIndex, dimension);
-            }).ToArray();
-            var samplers = sub.m_Samplers.Select(binding => ReadInlineSampler(binding.sampler, binding.bindPoint)).ToArray();
-            return new ShaderPreviewStage(code.m_ProgramCode[prefixBytes..], buffers.ToArray(), textures)
+            }
+            if (reader.BaseStream.Position != reader.BaseStream.Length)
             {
-                StructuredBuffers = sub.m_BufferParams.Select(binding => new ShaderPreviewStructuredBufferBinding(NameOf(binding.m_NameIndex), binding.m_Index)).ToArray(),
-                InlineSamplers = samplers
-            };
+                throw new InvalidDataException("The shader program contains extra binding data.");
+            }
+            return new EmbeddedBindings(layouts, buffers, textures, structuredBuffers);
+        }
+
+        private static ShaderPreviewTextureBinding ReadTextureBinding(string name, int slot, int sampler, int dimension)
+        {
+            var textureDimension = (ShaderPreviewTextureDimension)dimension;
+            if (slot is < 0 or >= 128 || sampler is < -1 or >= 16 || !Enum.IsDefined(textureDimension))
+            {
+                throw new NotSupportedException($"Unsupported shader texture '{name}' (dimension {dimension}, slot {slot}, sampler {sampler}).");
+            }
+            return new ShaderPreviewTextureBinding(name, slot, sampler, textureDimension);
         }
 
         // The serialized layout uses a zero array count for single parameters.

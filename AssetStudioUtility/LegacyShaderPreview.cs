@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
 using K4os.Compression.LZ4;
 using NumericsVector4 = System.Numerics.Vector4;
 
@@ -94,7 +93,6 @@ namespace AssetStudio
 
     public sealed class LegacyShaderPreview : ShaderPreviewReader
     {
-        private static readonly UTF8Encoding StrictUtf8 = new(false, true);
         private readonly LegacyShaderLab _lab;
         private readonly Shader _shader;
         private readonly Dictionary<(int, ShaderPreviewProgramKind), ProgramHeader> _headers = new();
@@ -273,13 +271,7 @@ namespace AssetStudio
             }
 
             // Unity stores binding metadata after the DXBC container, including when RDEF is stripped.
-            reader.ReadUInt32(); // source-channel mask
-            int channelCount = ReadCount(reader, 32);
-            for (int i = 0; i < channelCount; i++)
-            {
-                reader.ReadUInt32(); // source channel
-                reader.ReadUInt32(); // destination channel
-            }
+            ReadProgramChannels(reader);
             int groupCount = ReadCount(reader, 64);
             var groups = new Dictionary<string, (int Size, ShaderPreviewParameter[] Parameters)>(StringComparer.Ordinal);
             for (int i = 0; i < groupCount; i++)
@@ -289,8 +281,7 @@ namespace AssetStudio
                 var parameters = new ShaderPreviewParameter[ReadCount(reader, 4096)];
                 for (int j = 0; j < parameters.Length; j++)
                 {
-                    parameters[j] = new ShaderPreviewParameter(ReadString(reader), reader.ReadInt32(),
-                        reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt32() != 0, reader.ReadInt32(), reader.ReadInt32());
+                    parameters[j] = ReadProgramParameter(reader);
                 }
                 if (!groups.TryAdd(name, (size, parameters)))
                 {
@@ -334,29 +325,5 @@ namespace AssetStudio
             return new ShaderPreviewStage(code[unityDxbcPrefixBytes..], buffers.ToArray(), textures.ToArray()) { StructuredBuffers = structured.ToArray() };
         }
 
-        private static int ReadCount(BinaryReader reader, int maximum)
-        {
-            int count = reader.ReadInt32();
-            if (count < 0 || count > maximum)
-            {
-                throw new InvalidDataException($"Invalid Unity shader field length {count}.");
-            }
-            return count;
-        }
-
-        private static string ReadString(BinaryReader reader) => StrictUtf8.GetString(ReadField(reader, 4096));
-
-        private static byte[] ReadField(BinaryReader reader, int maximum)
-        {
-            int count = ReadCount(reader, maximum);
-            int padding = (4 - count % 4) % 4;
-            if (count + padding > reader.BaseStream.Length - reader.BaseStream.Position)
-            {
-                throw new EndOfStreamException("The Unity shader program ended inside an aligned field.");
-            }
-            byte[] value = reader.ReadBytes(count);
-            reader.BaseStream.Seek(padding, SeekOrigin.Current);
-            return value;
-        }
     }
 }
