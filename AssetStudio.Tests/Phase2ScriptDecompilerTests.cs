@@ -18,7 +18,7 @@ using Xunit;
 
 namespace AssetStudio.Tests
 {
-    public class Phase2ScriptDecompilerTests
+    public partial class Phase2ScriptDecompilerTests
     {
         [Fact]
         public void MonoDecompilerService_DecompilesRealAssemblyType_WithoutLockingSourceFile()

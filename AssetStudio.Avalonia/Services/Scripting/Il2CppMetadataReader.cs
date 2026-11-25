@@ -20,23 +20,56 @@ public sealed class Il2CppMetadataLoadOutcome
 }
 
 /// <summary>
-/// Pure-C# reader for Unity IL2CPP <c>global-metadata.dat</c> (versions 24 through 31).
+/// Pure-C# reader for Unity IL2CPP <c>global-metadata.dat</c>: the classic layout (versions 24 through 31)
+/// and the compact layout of Unity 6000.3 (v39) and Unity 6000.5 (v107).
 /// Reconstructs readable C# type declarations, fields, properties, events, methods,
 /// parameters, generic parameters, base classes, interfaces, and enum constants without
 /// requiring any external tool.
 /// </summary>
+/// <remarks>
+/// The compact layout follows libil2cpp's <c>vm/GlobalMetadataFileInternals.h</c> and
+/// <c>vm/MetadataDeserialization.cpp</c> shipped with the Unity Editor: the header stores
+/// <c>(offset, size, count)</c> triples, and index columns take 1, 2 or 4 bytes depending on the element
+/// count of the table they point into (all-ones meaning -1).
+/// </remarks>
 public sealed class Il2CppMetadataReader
 {
     public const uint MetadataSanity = 0xFAB11BAF;
-    public const int MinSupportedVersion = 24;
-    public const int MaxSupportedVersion = 31;
+    public const int MinLegacyVersion = 24;
+    public const int MaxLegacyVersion = 31;
     private const int MaxCachedFiles = 2;
     private const int MaxHeaderBytes = 1024;
     private const int MaxStringReadBytes = 2048;
+    private const int MinCompactSectionCount = 31;
+    private const int MaxCompactSectionCount = 64;
+    private const int Unity6000_3SectionCount = 31;
+    private const int Unity6000_5SectionCount = 32;
 
     private readonly record struct TableSlice(int Offset, int Size)
     {
         public bool IsValid => Offset >= 0 && Size >= 0;
+    }
+
+    /// <summary>
+    /// Serialized byte width of each index kind. Classic metadata always uses 4 bytes; compact metadata sizes
+    /// them from table counts (<c>SerializedIndexSizes</c> in libil2cpp).
+    /// </summary>
+    private sealed record IndexWidths
+    {
+        public static readonly IndexWidths Legacy = new();
+
+        public int Type { get; init; } = 4;
+        public int TypeDefinition { get; init; } = 4;
+        public int GenericContainer { get; init; } = 4;
+        public int Parameter { get; init; } = 4;
+        public int GenericParameter { get; init; } = 4;
+        public int Interfaces { get; init; } = 4;
+        public int Event { get; init; } = 4;
+        public int Property { get; init; } = 4;
+        public int NestedType { get; init; } = 4;
+        public int Field { get; init; } = 4;
+        public int DefaultValueData { get; init; } = 4;
+        public int Method { get; init; } = 4;
     }
 
     private readonly record struct TypeDefLayout(
@@ -68,7 +101,9 @@ public sealed class Il2CppMetadataReader
         int StructSize,
         int ParameterStartOffset,
         int GenericContainerIndexOffset,
-        int MethodIndexOffset = -1)
+        int MethodIndexOffset = -1,
+        int DeclaringTypeOffset = 4,
+        int ReturnTypeOffset = 8)
     {
         public int TokenOffset => StructSize - 12;
         public int FlagsOffset => StructSize - 8;
@@ -118,6 +153,13 @@ public sealed class Il2CppMetadataReader
         public required int ParameterStructSize { get; init; }
         public required int PropertyStructSize { get; init; }
         public required int EventStructSize { get; init; }
+        public IndexWidths Widths { get; init; } = IndexWidths.Legacy;
+        public int FieldDefaultValueStructSize { get; init; } = 12;
+        public int GenericParameterStructSize { get; init; } = 16;
+        public int GenericContainerStructSize { get; init; } = 16;
+        public int GenericContainerArgCountWidth { get; init; } = 4;
+        public int GenericContainerParameterStartOffset { get; init; } = 12;
+        public bool EncodedAttributeConstructors { get; init; }
         public required int TotalMethods { get; init; }
         public int Int32ByvalTypeIndex { get; init; } = -1;
         public int Int32TypeDefIndex { get; init; } = -1;
@@ -427,11 +469,24 @@ public sealed class Il2CppMetadataReader
             }
 
             var version = BinaryPrimitives.ReadInt32LittleEndian(headerBuf.AsSpan(4, 4));
-            if (version < MinSupportedVersion || version > MaxSupportedVersion)
+            if (version < MinLegacyVersion || version > MaxLegacyVersion)
             {
+                if (TryReadCompactSections(headerBuf, fileLength, out var compactSections))
+                {
+                    return BuildCompactIndex(
+                        stream,
+                        fullPath,
+                        fileLength,
+                        lastWriteTicks,
+                        accessTick,
+                        version,
+                        compactSections,
+                        cancellationToken);
+                }
+
                 return Fail(
-                    $"IL2CPP global-metadata.dat version v{version} is outside the built-in reader's supported range (v{MinSupportedVersion}-v{MaxSupportedVersion}).",
-                    isObfuscated: version < 16 || version > 100);
+                    $"IL2CPP global-metadata.dat version v{version} is not supported by the built-in reader (supported: v{MinLegacyVersion}-v{MaxLegacyVersion}, v39 from Unity 6000.3 and v107 from Unity 6000.5).",
+                    isObfuscated: version < 16 || version > 1000);
             }
 
             var headerSize = BinaryPrimitives.ReadInt32LittleEndian(headerBuf.AsSpan(8, 4));
@@ -564,113 +619,15 @@ public sealed class Il2CppMetadataReader
                 attrRangeOrTypes = pairs[27];
             }
 
-            // Build lightweight lookup index
-            var types = new TypeSummary[totalTypes];
-            var byFullName = new Dictionary<string, List<int>>(totalTypes, StringComparer.OrdinalIgnoreCase);
-            var bySimpleName = new Dictionary<string, List<int>>(totalTypes, StringComparer.OrdinalIgnoreCase);
-            var byvalMap = new Dictionary<int, int>(totalTypes);
-            var int32Byval = -1;
-            var int32Td = -1;
-            var objectByval = -1;
-            var stringByval = -1;
-            var voidByval = -1;
-            var sampleValueTypeByval = -1;
-
-            // Map TypeDefIndex -> ImageIndex in O(totalTypes)
-            var typeToImage = new int[totalTypes];
-            Array.Fill(typeToImage, -1);
-            for (var imgIdx = 0; imgIdx < images.Length; imgIdx++)
-            {
-                var img = images[imgIdx];
-                var end = Math.Min(totalTypes, img.TypeStart + img.TypeCount);
-                for (var t = Math.Max(0, img.TypeStart); t < end; t++)
-                {
-                    typeToImage[t] = imgIdx;
-                }
-            }
-
-            for (var i = 0; i < totalTypes; i++)
-            {
-                if ((i & 0xFFF) == 0)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-
-                var entryOff = i * typeDefStructSize;
-                var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(typeDefBytes.AsSpan(entryOff, 4));
-                var nsIdx = BinaryPrimitives.ReadInt32LittleEndian(typeDefBytes.AsSpan(entryOff + 4, 4));
-                var byvalIdx = BinaryPrimitives.ReadInt32LittleEndian(typeDefBytes.AsSpan(entryOff + typeDefLayout.ByvalTypeIndexOffset, 4));
-                var declaringIdx = BinaryPrimitives.ReadInt32LittleEndian(typeDefBytes.AsSpan(entryOff + typeDefLayout.DeclaringTypeIndexOffset, 4));
-                var bitfield = BinaryPrimitives.ReadUInt32LittleEndian(typeDefBytes.AsSpan(entryOff + typeDefLayout.BitfieldOffset, 4));
-
-                var name = ReadNullTerminatedUtf8(stringBytes, nameIdx) ?? string.Empty;
-                var ns = ReadNullTerminatedUtf8(stringBytes, nsIdx) ?? string.Empty;
-
-                types[i] = new TypeSummary(name, ns, typeToImage[i], declaringIdx);
-
-                if (byvalIdx >= 0 && !byvalMap.ContainsKey(byvalIdx))
-                {
-                    byvalMap[byvalIdx] = i;
-                }
-
-                if (byvalIdx >= 0)
-                {
-                    if (sampleValueTypeByval < 0 && (bitfield & 0x1u) != 0 && !string.Equals(name, "Void", StringComparison.Ordinal))
-                    {
-                        sampleValueTypeByval = byvalIdx;
-                    }
-
-                    if (string.Equals(ns, "System", StringComparison.Ordinal))
-                    {
-                        if (int32Byval < 0 && string.Equals(name, "Int32", StringComparison.Ordinal))
-                        {
-                            int32Byval = byvalIdx;
-                            int32Td = i;
-                        }
-                        else if (objectByval < 0 && string.Equals(name, "Object", StringComparison.Ordinal))
-                        {
-                            objectByval = byvalIdx;
-                        }
-                        else if (stringByval < 0 && string.Equals(name, "String", StringComparison.Ordinal))
-                        {
-                            stringByval = byvalIdx;
-                        }
-                        else if (voidByval < 0 && string.Equals(name, "Void", StringComparison.Ordinal))
-                        {
-                            voidByval = byvalIdx;
-                        }
-                    }
-                }
-
-                if (string.IsNullOrEmpty(name) || string.Equals(name, "<Module>", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                var baseName = StripGenericArity(name);
-                if (!string.IsNullOrEmpty(ns))
-                {
-                    AddToBucket(byFullName, $"{ns}.{name}", i);
-                    if (!string.Equals(baseName, name, StringComparison.Ordinal))
-                    {
-                        AddToBucket(byFullName, $"{ns}.{baseName}", i);
-                    }
-                }
-                else
-                {
-                    AddToBucket(byFullName, name, i);
-                    if (!string.Equals(baseName, name, StringComparison.Ordinal))
-                    {
-                        AddToBucket(byFullName, baseName, i);
-                    }
-                }
-
-                AddToBucket(bySimpleName, name, i);
-                if (!string.Equals(baseName, name, StringComparison.Ordinal))
-                {
-                    AddToBucket(bySimpleName, baseName, i);
-                }
-            }
+            var lookup = BuildTypeLookup(
+                typeDefBytes,
+                totalTypes,
+                typeDefStructSize,
+                typeDefLayout,
+                IndexWidths.Legacy,
+                stringBytes,
+                images,
+                cancellationToken);
 
             var index = new MetadataIndex
             {
@@ -703,17 +660,17 @@ public sealed class Il2CppMetadataReader
                 PropertyStructSize = propertyStructSize,
                 EventStructSize = eventStructSize,
                 TotalMethods = totalMethods,
-                Int32ByvalTypeIndex = int32Byval,
-                Int32TypeDefIndex = int32Td,
-                ObjectByvalTypeIndex = objectByval,
-                StringByvalTypeIndex = stringByval,
-                VoidByvalTypeIndex = voidByval,
-                SampleValueTypeByvalTypeIndex = sampleValueTypeByval,
+                Int32ByvalTypeIndex = lookup.Int32ByvalTypeIndex,
+                Int32TypeDefIndex = lookup.Int32TypeDefIndex,
+                ObjectByvalTypeIndex = lookup.ObjectByvalTypeIndex,
+                StringByvalTypeIndex = lookup.StringByvalTypeIndex,
+                VoidByvalTypeIndex = lookup.VoidByvalTypeIndex,
+                SampleValueTypeByvalTypeIndex = lookup.SampleValueTypeByvalTypeIndex,
                 Images = images,
-                Types = types,
-                ByFullName = byFullName,
-                BySimpleName = bySimpleName,
-                ByvalTypeToTypeDef = byvalMap,
+                Types = lookup.Types,
+                ByFullName = lookup.ByFullName,
+                BySimpleName = lookup.BySimpleName,
+                ByvalTypeToTypeDef = lookup.ByvalTypeToTypeDef,
                 LastAccessTick = accessTick
             };
 
@@ -733,6 +690,539 @@ public sealed class Il2CppMetadataReader
         {
             return Fail($"Failed to parse global-metadata.dat: {ex.Message}", isObfuscated: false);
         }
+    }
+
+    private sealed class TypeLookup
+    {
+        public required TypeSummary[] Types { get; init; }
+        public required Dictionary<string, List<int>> ByFullName { get; init; }
+        public required Dictionary<string, List<int>> BySimpleName { get; init; }
+        public required Dictionary<int, int> ByvalTypeToTypeDef { get; init; }
+        public int Int32ByvalTypeIndex { get; init; } = -1;
+        public int Int32TypeDefIndex { get; init; } = -1;
+        public int ObjectByvalTypeIndex { get; init; } = -1;
+        public int StringByvalTypeIndex { get; init; } = -1;
+        public int VoidByvalTypeIndex { get; init; } = -1;
+        public int SampleValueTypeByvalTypeIndex { get; init; } = -1;
+    }
+
+    private static TypeLookup BuildTypeLookup(
+        byte[] typeDefBytes,
+        int totalTypes,
+        int typeDefStructSize,
+        TypeDefLayout typeDefLayout,
+        IndexWidths widths,
+        byte[] stringBytes,
+        ImageEntry[] images,
+        CancellationToken cancellationToken)
+    {
+        var types = new TypeSummary[totalTypes];
+        var byFullName = new Dictionary<string, List<int>>(totalTypes, StringComparer.OrdinalIgnoreCase);
+        var bySimpleName = new Dictionary<string, List<int>>(totalTypes, StringComparer.OrdinalIgnoreCase);
+        var byvalMap = new Dictionary<int, int>(totalTypes);
+        var int32Byval = -1;
+        var int32Td = -1;
+        var objectByval = -1;
+        var stringByval = -1;
+        var voidByval = -1;
+        var sampleValueTypeByval = -1;
+
+        // Map TypeDefIndex -> ImageIndex in O(totalTypes)
+        var typeToImage = new int[totalTypes];
+        Array.Fill(typeToImage, -1);
+        for (var imgIdx = 0; imgIdx < images.Length; imgIdx++)
+        {
+            var img = images[imgIdx];
+            var end = Math.Min(totalTypes, img.TypeStart + img.TypeCount);
+            for (var t = Math.Max(0, img.TypeStart); t < end; t++)
+            {
+                typeToImage[t] = imgIdx;
+            }
+        }
+
+        for (var i = 0; i < totalTypes; i++)
+        {
+            if ((i & 0xFFF) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            var entry = typeDefBytes.AsSpan(i * typeDefStructSize, typeDefStructSize);
+            var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(0, 4));
+            var nsIdx = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(4, 4));
+            var byvalIdx = ReadIndex(entry, typeDefLayout.ByvalTypeIndexOffset, widths.Type);
+            var declaringIdx = ReadIndex(entry, typeDefLayout.DeclaringTypeIndexOffset, widths.Type);
+            var bitfield = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(typeDefLayout.BitfieldOffset, 4));
+
+            var name = ReadNullTerminatedUtf8(stringBytes, nameIdx) ?? string.Empty;
+            var ns = ReadNullTerminatedUtf8(stringBytes, nsIdx) ?? string.Empty;
+
+            types[i] = new TypeSummary(name, ns, typeToImage[i], declaringIdx);
+
+            if (byvalIdx >= 0 && !byvalMap.ContainsKey(byvalIdx))
+            {
+                byvalMap[byvalIdx] = i;
+            }
+
+            if (byvalIdx >= 0)
+            {
+                if (sampleValueTypeByval < 0 && (bitfield & 0x1u) != 0 && !string.Equals(name, "Void", StringComparison.Ordinal))
+                {
+                    sampleValueTypeByval = byvalIdx;
+                }
+
+                if (string.Equals(ns, "System", StringComparison.Ordinal))
+                {
+                    if (int32Byval < 0 && string.Equals(name, "Int32", StringComparison.Ordinal))
+                    {
+                        int32Byval = byvalIdx;
+                        int32Td = i;
+                    }
+                    else if (objectByval < 0 && string.Equals(name, "Object", StringComparison.Ordinal))
+                    {
+                        objectByval = byvalIdx;
+                    }
+                    else if (stringByval < 0 && string.Equals(name, "String", StringComparison.Ordinal))
+                    {
+                        stringByval = byvalIdx;
+                    }
+                    else if (voidByval < 0 && string.Equals(name, "Void", StringComparison.Ordinal))
+                    {
+                        voidByval = byvalIdx;
+                    }
+                }
+            }
+
+            if (string.IsNullOrEmpty(name) || string.Equals(name, "<Module>", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var baseName = StripGenericArity(name);
+            if (!string.IsNullOrEmpty(ns))
+            {
+                AddToBucket(byFullName, $"{ns}.{name}", i);
+                if (!string.Equals(baseName, name, StringComparison.Ordinal))
+                {
+                    AddToBucket(byFullName, $"{ns}.{baseName}", i);
+                }
+            }
+            else
+            {
+                AddToBucket(byFullName, name, i);
+                if (!string.Equals(baseName, name, StringComparison.Ordinal))
+                {
+                    AddToBucket(byFullName, baseName, i);
+                }
+            }
+
+            AddToBucket(bySimpleName, name, i);
+            if (!string.Equals(baseName, name, StringComparison.Ordinal))
+            {
+                AddToBucket(bySimpleName, baseName, i);
+            }
+        }
+
+        return new TypeLookup
+        {
+            Types = types,
+            ByFullName = byFullName,
+            BySimpleName = bySimpleName,
+            ByvalTypeToTypeDef = byvalMap,
+            Int32ByvalTypeIndex = int32Byval,
+            Int32TypeDefIndex = int32Td,
+            ObjectByvalTypeIndex = objectByval,
+            StringByvalTypeIndex = stringByval,
+            VoidByvalTypeIndex = voidByval,
+            SampleValueTypeByvalTypeIndex = sampleValueTypeByval
+        };
+    }
+
+    private static int ReadIndex(ReadOnlySpan<byte> buffer, int offset, int width)
+    {
+        switch (width)
+        {
+            case 1:
+                var u8 = buffer[offset];
+                return u8 == byte.MaxValue ? -1 : u8;
+            case 2:
+                var u16 = BinaryPrimitives.ReadUInt16LittleEndian(buffer.Slice(offset, 2));
+                return u16 == ushort.MaxValue ? -1 : u16;
+            default:
+                return BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(offset, 4));
+        }
+    }
+
+    private static int CompactIndexWidth(int elementCount)
+    {
+        return elementCount <= byte.MaxValue ? 1 : elementCount <= ushort.MaxValue ? 2 : 4;
+    }
+
+    private readonly record struct CompactSection(int Offset, int Size, int Count)
+    {
+        public TableSlice Slice => new(Offset, Size);
+    }
+
+    private enum CompactTable
+    {
+        Strings = 2,
+        Events = 3,
+        Properties = 4,
+        Methods = 5,
+        ParameterDefaultValues = 6,
+        FieldDefaultValues = 7,
+        FieldAndParameterDefaultValueData = 8,
+        FieldMarshaledSizes = 9,
+        Parameters = 10,
+        Fields = 11,
+        GenericParameters = 12,
+        GenericParameterConstraints = 13,
+        GenericContainers = 14,
+        NestedTypes = 15,
+        Interfaces = 16,
+        InterfaceOffsets = 18,
+        TypeDefinitions = 19,
+        Images = 20,
+        FieldRefs = 22,
+        AttributeData = 24,
+        AttributeDataRanges = 25
+    }
+
+    /// <summary>
+    /// Reads the compact header: <c>stringLiterals.offset</c> equals the header size, which is 8 bytes plus one
+    /// 12-byte <c>Il2CppSectionMetadata</c> triple per section.
+    /// </summary>
+    private static bool TryReadCompactSections(byte[] header, long fileLength, out CompactSection[] sections)
+    {
+        sections = Array.Empty<CompactSection>();
+        if (header.Length < 12)
+        {
+            return false;
+        }
+
+        var headerSize = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(8, 4));
+        if (headerSize < 8 + MinCompactSectionCount * 12
+            || headerSize > 8 + MaxCompactSectionCount * 12
+            || (headerSize - 8) % 12 != 0
+            || headerSize > header.Length
+            || headerSize > fileLength)
+        {
+            return false;
+        }
+
+        var count = (headerSize - 8) / 12;
+        var parsed = new CompactSection[count];
+        for (var i = 0; i < count; i++)
+        {
+            var entry = header.AsSpan(8 + i * 12, 12);
+            var offset = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(0, 4));
+            var size = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(4, 4));
+            var rows = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(8, 4));
+            if (offset < headerSize || size < 0 || rows < 0 || (long)offset + size > fileLength)
+            {
+                return false;
+            }
+
+            parsed[i] = new CompactSection(offset, size, rows);
+        }
+
+        sections = parsed;
+        return true;
+    }
+
+    /// <summary>
+    /// Indexes Unity 6000.3+ compact metadata. Unity 6000.5 (v107) inserts <c>typeInlineArrays</c> after
+    /// <c>typeDefinitions</c>, sizes almost every index column from its table count, packs
+    /// <c>Il2CppGenericContainer</c> and stores custom attribute constructors as encoded method indexes.
+    /// The TypeIndex width comes from the native binary's type count, which the metadata does not record,
+    /// so it is inferred from row sizes and accepted only when every table size agrees with it.
+    /// </summary>
+    private static (MetadataIndex? Index, Il2CppMetadataLoadOutcome Outcome) BuildCompactIndex(
+        FileStream stream,
+        string fullPath,
+        long fileLength,
+        long lastWriteTicks,
+        long accessTick,
+        int version,
+        CompactSection[] sections,
+        CancellationToken cancellationToken)
+    {
+        bool isUnity6000_5;
+        if (sections.Length == Unity6000_3SectionCount)
+        {
+            isUnity6000_5 = false;
+        }
+        else if (sections.Length == Unity6000_5SectionCount)
+        {
+            isUnity6000_5 = true;
+        }
+        else
+        {
+            return Fail(
+                $"global-metadata.dat (v{version}) uses a compact header with {sections.Length} sections; only the Unity 6000.3 (v39, 31 sections) and Unity 6000.5 (v107, 32 sections) layouts are supported.",
+                isObfuscated: true);
+        }
+
+        CompactSection Table(CompactTable table)
+        {
+            var position = (int)table;
+            if (isUnity6000_5 && position >= (int)CompactTable.Images)
+            {
+                position++;
+            }
+            return sections[position];
+        }
+
+        int PerTableWidth(CompactTable table) => isUnity6000_5 ? CompactIndexWidth(Table(table).Count) : 4;
+
+        var fields = Table(CompactTable.Fields);
+        var impliedTypeWidth = fields.Count > 0 && fields.Size % fields.Count == 0 ? fields.Size / fields.Count - 8 : 0;
+        var typeWidthCandidates = new[] { impliedTypeWidth, 4, 2, 1 }.Where(static w => w is 1 or 2 or 4).Distinct();
+
+        IndexWidths? widths = null;
+        string? mismatch = null;
+        foreach (var typeWidth in typeWidthCandidates)
+        {
+            var candidate = new IndexWidths
+            {
+                Type = typeWidth,
+                TypeDefinition = CompactIndexWidth(Table(CompactTable.TypeDefinitions).Count),
+                GenericContainer = CompactIndexWidth(Table(CompactTable.GenericContainers).Count),
+                Parameter = CompactIndexWidth(Table(CompactTable.Parameters).Count),
+                GenericParameter = PerTableWidth(CompactTable.GenericParameters),
+                Interfaces = PerTableWidth(CompactTable.InterfaceOffsets),
+                Event = PerTableWidth(CompactTable.Events),
+                Property = PerTableWidth(CompactTable.Properties),
+                NestedType = PerTableWidth(CompactTable.NestedTypes),
+                Field = PerTableWidth(CompactTable.Fields),
+                DefaultValueData = PerTableWidth(CompactTable.FieldAndParameterDefaultValueData),
+                Method = PerTableWidth(CompactTable.Methods)
+            };
+
+            var currentMismatch = FindCompactRowSizeMismatch(Table, candidate, isUnity6000_5);
+            if (currentMismatch == null)
+            {
+                widths = candidate;
+                break;
+            }
+            mismatch ??= currentMismatch;
+        }
+
+        if (widths == null)
+        {
+            return Fail(
+                $"global-metadata.dat (v{version}) has a compact header, but its tables do not match the Unity 6000.3/6000.5 row layouts ({mismatch}); metadata may be obfuscated or use an unknown layout.",
+                isObfuscated: true);
+        }
+
+        var w = widths;
+        var stringsSlice = Table(CompactTable.Strings).Slice;
+        var typeDefsSection = Table(CompactTable.TypeDefinitions);
+        var imagesSection = Table(CompactTable.Images);
+        if (stringsSlice.Size <= 0 || typeDefsSection.Count <= 0 || imagesSection.Count <= 0)
+        {
+            return Fail(
+                $"global-metadata.dat (v{version}) has empty string, type definition, or image tables.",
+                isObfuscated: true);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var stringBytes = ReadTableBytes(stream, stringsSlice, 0, null);
+        var totalTypes = typeDefsSection.Count;
+        var typeDefStructSize = typeDefsSection.Size / totalTypes;
+        var typeDefBytes = ReadTableBytes(stream, typeDefsSection.Slice, 0, null);
+        if (!ValidateTypeDefTokens(typeDefBytes, totalTypes, typeDefStructSize))
+        {
+            return Fail(
+                $"global-metadata.dat (v{version}) type definition tokens are invalid; metadata appears encrypted or obfuscated.",
+                isObfuscated: true);
+        }
+
+        // Il2CppImageDefinition: nameIndex, assemblyIndex, typeStart, typeCount, exportedTypeStart,
+        // exportedTypeCount, entryPointIndex, token, customAttributeStart, customAttributeCount
+        var imageRowSize = imagesSection.Size / imagesSection.Count;
+        var imageTypeCountOffset = 8 + w.TypeDefinition;
+        var imageCustomAttributeOffset = 16 + 2 * w.TypeDefinition + w.Method + 4;
+        var imageBytes = ReadTableBytes(stream, imagesSection.Slice, 0, null);
+        var images = new ImageEntry[imagesSection.Count];
+        for (var i = 0; i < images.Length; i++)
+        {
+            var row = imageBytes.AsSpan(i * imageRowSize, imageRowSize);
+            var name = ReadNullTerminatedUtf8(stringBytes, BinaryPrimitives.ReadInt32LittleEndian(row.Slice(0, 4)));
+            var typeStart = ReadIndex(row, 8, w.TypeDefinition);
+            var typeCount = BinaryPrimitives.ReadInt32LittleEndian(row.Slice(imageTypeCountOffset, 4));
+            if (string.IsNullOrWhiteSpace(name)
+                || !LooksLikeValidIdentifierOrFileName(name)
+                || typeStart < 0
+                || typeCount < 0
+                || (long)typeStart + typeCount > totalTypes)
+            {
+                return Fail(
+                    $"global-metadata.dat (v{version}) image table #{i} is invalid; metadata appears encrypted or obfuscated.",
+                    isObfuscated: true);
+            }
+
+            var caStart = BinaryPrimitives.ReadInt32LittleEndian(row.Slice(imageCustomAttributeOffset, 4));
+            var caCount = BinaryPrimitives.ReadInt32LittleEndian(row.Slice(imageCustomAttributeOffset + 4, 4));
+            if (caStart < 0 || caCount <= 0)
+            {
+                caStart = -1;
+                caCount = 0;
+            }
+
+            images[i] = new ImageEntry(name, typeStart, typeCount, caStart, caCount);
+        }
+
+        // Il2CppTypeDefinition: nameIndex, namespaceIndex, byvalTypeIndex, declaringTypeIndex, parentIndex,
+        // genericContainerIndex, flags, fieldStart, methodStart, eventStart, propertyStart, nestedTypesStart,
+        // interfacesStart, vtableStart, interfaceOffsetsStart, eight uint16 counts, bitfield, token.
+        // elementTypeIndex no longer exists; enum underlying types come from the value__ field.
+        var genericContainerOffset = 8 + 3 * w.Type;
+        var fieldStartOffset = genericContainerOffset + w.GenericContainer + 4;
+        var methodStartOffset = fieldStartOffset + w.Field;
+        var eventStartOffset = methodStartOffset + w.Method;
+        var propertyStartOffset = eventStartOffset + w.Event;
+        var nestedTypesStartOffset = propertyStartOffset + w.Property;
+        var interfacesStartOffset = nestedTypesStartOffset + w.NestedType;
+        var typeDefLayout = new TypeDefLayout(
+            StructSize: typeDefStructSize,
+            ByvalTypeIndexOffset: 8,
+            DeclaringTypeIndexOffset: 8 + w.Type,
+            ParentIndexOffset: 8 + 2 * w.Type,
+            ElementTypeIndexOffset: -1,
+            GenericContainerIndexOffset: genericContainerOffset,
+            FlagsOffset: genericContainerOffset + w.GenericContainer,
+            FieldStartOffset: fieldStartOffset,
+            MethodStartOffset: methodStartOffset,
+            EventStartOffset: eventStartOffset,
+            PropertyStartOffset: propertyStartOffset,
+            NestedTypesStartOffset: nestedTypesStartOffset,
+            InterfacesStartOffset: interfacesStartOffset);
+
+        // Il2CppMethodDefinition: nameIndex, declaringType, returnType, returnParameterToken, parameterStart,
+        // genericContainerIndex, token, flags, iflags, slot, parameterCount
+        var methodsSection = Table(CompactTable.Methods);
+        var methodLayout = new MethodLayout(
+            StructSize: CompactMethodRowSize(w),
+            ParameterStartOffset: 8 + w.TypeDefinition + w.Type,
+            GenericContainerIndexOffset: 8 + w.TypeDefinition + w.Type + w.Parameter,
+            MethodIndexOffset: -1,
+            DeclaringTypeOffset: 4,
+            ReturnTypeOffset: 4 + w.TypeDefinition);
+
+        var lookup = BuildTypeLookup(
+            typeDefBytes,
+            totalTypes,
+            typeDefStructSize,
+            typeDefLayout,
+            w,
+            stringBytes,
+            images,
+            cancellationToken);
+
+        var genericContainerRowSize = isUnity6000_5 ? 7 + w.GenericParameter : 16;
+        var index = new MetadataIndex
+        {
+            FilePath = fullPath,
+            FileLength = fileLength,
+            LastWriteTicks = lastWriteTicks,
+            Version = version,
+            Strings = stringsSlice,
+            Events = Table(CompactTable.Events).Slice,
+            Properties = Table(CompactTable.Properties).Slice,
+            Methods = methodsSection.Slice,
+            FieldDefaultValues = Table(CompactTable.FieldDefaultValues).Slice,
+            DefaultValueData = Table(CompactTable.FieldAndParameterDefaultValueData).Slice,
+            Parameters = Table(CompactTable.Parameters).Slice,
+            Fields = fields.Slice,
+            GenericParameters = Table(CompactTable.GenericParameters).Slice,
+            GenericContainers = Table(CompactTable.GenericContainers).Slice,
+            NestedTypes = Table(CompactTable.NestedTypes).Slice,
+            Interfaces = Table(CompactTable.Interfaces).Slice,
+            TypeDefinitions = typeDefsSection.Slice,
+            AttributeDataOrInfo = Table(CompactTable.AttributeData).Slice,
+            AttributeDataRangeOrTypes = Table(CompactTable.AttributeDataRanges).Slice,
+            UsesV29CustomAttributeFormat = true,
+            EncodedAttributeConstructors = isUnity6000_5,
+            TypeDefLayout = typeDefLayout,
+            MethodLayout = methodLayout,
+            Widths = w,
+            FieldStructSize = 8 + w.Type,
+            ParameterStructSize = 8 + w.Type,
+            PropertyStructSize = 12 + 2 * w.Method,
+            EventStructSize = 8 + w.Type + 3 * w.Method,
+            FieldDefaultValueStructSize = w.Field + w.Type + w.DefaultValueData,
+            GenericParameterStructSize = w.GenericContainer + 12,
+            GenericContainerStructSize = genericContainerRowSize,
+            GenericContainerArgCountWidth = isUnity6000_5 ? 2 : 4,
+            GenericContainerParameterStartOffset = isUnity6000_5 ? 7 : 12,
+            TotalMethods = methodsSection.Count,
+            Int32ByvalTypeIndex = lookup.Int32ByvalTypeIndex,
+            Int32TypeDefIndex = lookup.Int32TypeDefIndex,
+            ObjectByvalTypeIndex = lookup.ObjectByvalTypeIndex,
+            StringByvalTypeIndex = lookup.StringByvalTypeIndex,
+            VoidByvalTypeIndex = lookup.VoidByvalTypeIndex,
+            SampleValueTypeByvalTypeIndex = lookup.SampleValueTypeByvalTypeIndex,
+            Images = images,
+            Types = lookup.Types,
+            ByFullName = lookup.ByFullName,
+            BySimpleName = lookup.BySimpleName,
+            ByvalTypeToTypeDef = lookup.ByvalTypeToTypeDef,
+            LastAccessTick = accessTick
+        };
+
+        return (index, new Il2CppMetadataLoadOutcome
+        {
+            Success = true,
+            MetadataVersion = version,
+            TypeCount = totalTypes,
+            ImageCount = images.Length
+        });
+    }
+
+    private static int CompactMethodRowSize(IndexWidths w)
+    {
+        return 20 + w.TypeDefinition + w.Type + w.Parameter + w.GenericContainer;
+    }
+
+    private static string? FindCompactRowSizeMismatch(Func<CompactTable, CompactSection> table, IndexWidths w, bool isUnity6000_5)
+    {
+        var expected = new (CompactTable Table, int RowSize)[]
+        {
+            (CompactTable.Events, 8 + w.Type + 3 * w.Method),
+            (CompactTable.Properties, 12 + 2 * w.Method),
+            (CompactTable.Methods, CompactMethodRowSize(w)),
+            (CompactTable.ParameterDefaultValues, w.Parameter + w.Type + w.DefaultValueData),
+            (CompactTable.FieldDefaultValues, w.Field + w.Type + w.DefaultValueData),
+            (CompactTable.FieldMarshaledSizes, w.Field + w.Type + 4),
+            (CompactTable.Parameters, 8 + w.Type),
+            (CompactTable.Fields, 8 + w.Type),
+            (CompactTable.GenericParameters, w.GenericContainer + 12),
+            (CompactTable.GenericParameterConstraints, w.Type),
+            (CompactTable.GenericContainers, isUnity6000_5 ? 7 + w.GenericParameter : 16),
+            (CompactTable.NestedTypes, 4),
+            (CompactTable.Interfaces, w.Type),
+            (CompactTable.InterfaceOffsets, w.Type + 4),
+            (CompactTable.TypeDefinitions, 40 + 3 * w.Type + w.GenericContainer + w.Field + w.Method + w.Event + w.Property + w.NestedType + 2 * w.Interfaces),
+            (CompactTable.Images, 28 + 2 * w.TypeDefinition + w.Method),
+            (CompactTable.FieldRefs, w.Type + w.Field),
+            (CompactTable.AttributeDataRanges, 8)
+        };
+
+        foreach (var (name, rowSize) in expected)
+        {
+            var section = table(name);
+            if ((long)section.Count * rowSize != section.Size)
+            {
+                var observed = section.Count > 0
+                    ? $"{section.Size / (double)section.Count:0.##} bytes per row"
+                    : $"{section.Size} bytes and no rows";
+                return $"table '{name}' has {observed}, expected {rowSize} with a {w.Type}-byte TypeIndex";
+            }
+        }
+
+        return null;
     }
 
     private static (MetadataIndex? Index, Il2CppMetadataLoadOutcome Outcome) Fail(string message, bool isObfuscated)
@@ -1747,7 +2237,8 @@ public sealed class Il2CppMetadataReader
 
         private string? ResolveGenericParamName(int genericParamIndex)
         {
-            const int gpSize = 16;
+            var gpSize = _index.GenericParameterStructSize;
+            var nameOffset = _index.Widths.GenericContainer;
             if (genericParamIndex < 0 || (long)(genericParamIndex + 1) * gpSize > _index.GenericParameters.Size)
             {
                 return null;
@@ -1769,11 +2260,11 @@ public sealed class Il2CppMetadataReader
                 return null;
             }
 
-            var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(4, 4));
+            var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(nameOffset, 4));
             var name = ReadStringAt(_stream, _index, nameIdx);
             if (string.IsNullOrWhiteSpace(name))
             {
-                var num = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(12, 2));
+                var num = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(nameOffset + 8, 2));
                 name = $"T{num}";
             }
 
@@ -1799,16 +2290,19 @@ public sealed class Il2CppMetadataReader
         var imageEntry = hasImage ? index.Images[summary.ImageIndex] : default;
         var assemblyName = hasImage ? imageEntry.Name : string.Empty;
 
-        var parentTypeIndex = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.ParentIndexOffset, 4));
-        var elementTypeIndex = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.ElementTypeIndexOffset, 4));
-        var genericContainerIdx = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.GenericContainerIndexOffset, 4));
+        var w = index.Widths;
+        var parentTypeIndex = ReadIndex(tdBytes, tdLayout.ParentIndexOffset, w.Type);
+        var elementTypeIndex = tdLayout.ElementTypeIndexOffset >= 0
+            ? ReadIndex(tdBytes, tdLayout.ElementTypeIndexOffset, w.Type)
+            : -1;
+        var genericContainerIdx = ReadIndex(tdBytes, tdLayout.GenericContainerIndexOffset, w.GenericContainer);
         var flags = BinaryPrimitives.ReadUInt32LittleEndian(tdBytes.AsSpan(tdLayout.FlagsOffset, 4));
-        var fieldStart = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.FieldStartOffset, 4));
-        var methodStart = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.MethodStartOffset, 4));
-        var eventStart = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.EventStartOffset, 4));
-        var propertyStart = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.PropertyStartOffset, 4));
-        var nestedStart = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.NestedTypesStartOffset, 4));
-        var interfacesStart = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.InterfacesStartOffset, 4));
+        var fieldStart = ReadIndex(tdBytes, tdLayout.FieldStartOffset, w.Field);
+        var methodStart = ReadIndex(tdBytes, tdLayout.MethodStartOffset, w.Method);
+        var eventStart = ReadIndex(tdBytes, tdLayout.EventStartOffset, w.Event);
+        var propertyStart = ReadIndex(tdBytes, tdLayout.PropertyStartOffset, w.Property);
+        var nestedStart = ReadIndex(tdBytes, tdLayout.NestedTypesStartOffset, w.NestedType);
+        var interfacesStart = ReadIndex(tdBytes, tdLayout.InterfacesStartOffset, w.Interfaces);
 
         var methodCount = BinaryPrimitives.ReadUInt16LittleEndian(tdBytes.AsSpan(tdLayout.MethodCountOffset, 2));
         var propertyCount = BinaryPrimitives.ReadUInt16LittleEndian(tdBytes.AsSpan(tdLayout.PropertyCountOffset, 2));
@@ -1862,7 +2356,13 @@ public sealed class Il2CppMetadataReader
         var typeDisplayAttrs = FormatDisplayAttributes(typeRawAttrs, isNotSerializedFlag: false, isSerializableFlag: (flags & 0x00002000) != 0);
 
         var parentTypeName = typeResolver.ResolveTypeName(parentTypeIndex, includeNamespace: true);
-        var underlyingEnumTypeName = isEnum ? typeResolver.ResolveTypeName(elementTypeIndex, includeNamespace: true) : null;
+        string? underlyingEnumTypeName = null;
+        if (isEnum)
+        {
+            underlyingEnumTypeName = tdLayout.ElementTypeIndexOffset >= 0
+                ? typeResolver.ResolveTypeName(elementTypeIndex, includeNamespace: true)
+                : parsedFields.FirstOrDefault(static f => string.Equals(f.Name, "value__", StringComparison.Ordinal))?.ResolvedTypeName;
+        }
         if (!string.IsNullOrWhiteSpace(underlyingEnumTypeName))
         {
             underlyingEnumTypeName = FormatFriendlyTypeName(underlyingEnumTypeName, summary.Namespace);
@@ -2250,6 +2750,8 @@ public sealed class Il2CppMetadataReader
         var safeCount = Math.Min(methodCount, totalMethods - methodStart);
         var buf = ReadBytesAt(stream, index.Methods.Offset + index.BodyOffsetDelta + (long)methodStart * ml.StructSize, safeCount * ml.StructSize, index.BodyXorKey);
         var totalParams = index.ParameterStructSize > 0 ? index.Parameters.Size / index.ParameterStructSize : 0;
+        var w = index.Widths;
+        var paramTypeOffset = index.ParameterStructSize - w.Type;
 
         for (var i = 0; i < safeCount; i++)
         {
@@ -2259,10 +2761,11 @@ public sealed class Il2CppMetadataReader
             }
 
             var off = i * ml.StructSize;
-            var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off, 4));
-            var returnTypeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 8, 4));
-            var paramStart = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + ml.ParameterStartOffset, 4));
-            var genContainerIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + ml.GenericContainerIndexOffset, 4));
+            var row = buf.AsSpan(off, ml.StructSize);
+            var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(row.Slice(0, 4));
+            var returnTypeIdx = ReadIndex(row, ml.ReturnTypeOffset, w.Type);
+            var paramStart = ReadIndex(row, ml.ParameterStartOffset, w.Parameter);
+            var genContainerIdx = ReadIndex(row, ml.GenericContainerIndexOffset, w.GenericContainer);
             var methodIdx = ml.MethodIndexOffset >= 0 && ml.MethodIndexOffset + 4 <= ml.StructSize
                 ? BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + ml.MethodIndexOffset, 4))
                 : -1;
@@ -2298,7 +2801,7 @@ public sealed class Il2CppMetadataReader
                     var pOff = p * index.ParameterStructSize;
                     var pNameIdx = BinaryPrimitives.ReadInt32LittleEndian(pBuf.AsSpan(pOff, 4));
                     var pToken = BinaryPrimitives.ReadUInt32LittleEndian(pBuf.AsSpan(pOff + 4, 4));
-                    var pTypeIdx = BinaryPrimitives.ReadInt32LittleEndian(pBuf.AsSpan(pOff + index.ParameterStructSize - 4, 4));
+                    var pTypeIdx = ReadIndex(pBuf, pOff + paramTypeOffset, w.Type);
                     var pName = ReadStringAt(stream, index, pNameIdx) ?? $"arg{p}";
                     var hasParamType = typeResolver.TryResolveType(pTypeIdx, out var resolvedParam);
                     var isByRef = hasParamType && resolvedParam.IsByRef;
@@ -2537,13 +3040,14 @@ public sealed class Il2CppMetadataReader
 
         var safeCount = Math.Min(propertyCount, totalProps - propertyStart);
         var buf = ReadBytesAt(stream, index.Properties.Offset + index.BodyOffsetDelta + (long)propertyStart * psz, safeCount * psz, index.BodyXorKey);
+        var methodWidth = index.Widths.Method;
 
         for (var i = 0; i < safeCount; i++)
         {
             var off = i * psz;
             var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off, 4));
-            var getIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 4, 4));
-            var setIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 8, 4));
+            var getIdx = ReadIndex(buf, off + 4, methodWidth);
+            var setIdx = ReadIndex(buf, off + 4 + methodWidth, methodWidth);
             var token = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off + psz - 4, 4));
 
             var name = ReadStringAt(stream, index, nameIdx) ?? $"Property_{i}";
@@ -2636,14 +3140,15 @@ public sealed class Il2CppMetadataReader
 
         var safeCount = Math.Min(eventCount, totalEvents - eventStart);
         var buf = ReadBytesAt(stream, index.Events.Offset + index.BodyOffsetDelta + (long)eventStart * esz, safeCount * esz, index.BodyXorKey);
+        var w = index.Widths;
 
         for (var i = 0; i < safeCount; i++)
         {
             var off = i * esz;
             var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off, 4));
-            var typeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 4, 4));
-            var addIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 8, 4));
-            var removeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 12, 4));
+            var typeIdx = ReadIndex(buf, off + 4, w.Type);
+            var addIdx = ReadIndex(buf, off + 4 + w.Type, w.Method);
+            var removeIdx = ReadIndex(buf, off + 4 + w.Type + w.Method, w.Method);
             var token = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off + esz - 4, 4));
 
             var name = ReadStringAt(stream, index, nameIdx) ?? $"Event_{i}";
@@ -2716,7 +3221,7 @@ public sealed class Il2CppMetadataReader
             var globalFieldIndex = fieldStart + i;
             var off = i * fsz;
             var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off, 4));
-            var typeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 4, 4));
+            var typeIdx = ReadIndex(buf, off + 4, index.Widths.Type);
             var token = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off + fsz - 4, 4));
 
             var name = ReadStringAt(stream, index, nameIdx) ?? $"field_{i}";
@@ -3072,29 +3577,33 @@ public sealed class Il2CppMetadataReader
             return;
         }
 
-        Span<byte> declBuf = stackalloc byte[4];
+        var declaringTypeWidth = index.Widths.TypeDefinition;
+        Span<byte> declBuf = stackalloc byte[declaringTypeWidth];
         for (var i = 0; i < (int)attrCount; i++)
         {
-            var ctorMethodIdx = BinaryPrimitives.ReadInt32LittleEndian(blob.AsSpan(pos + i * 4, 4));
+            var rawCtor = BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(pos + i * 4, 4));
+            var ctorMethodIdx = index.EncodedAttributeConstructors
+                ? DecodeMethodDefinitionIndex(rawCtor)
+                : unchecked((int)rawCtor);
             if (ctorMethodIdx < 0 || ctorMethodIdx >= index.TotalMethods)
             {
                 continue;
             }
 
-            var methodDeclOff = index.Methods.Offset + index.BodyOffsetDelta + (long)ctorMethodIdx * ml.StructSize + 4;
-            if (methodDeclOff < 0 || methodDeclOff + 4 > stream.Length)
+            var methodDeclOff = index.Methods.Offset + index.BodyOffsetDelta + (long)ctorMethodIdx * ml.StructSize + ml.DeclaringTypeOffset;
+            if (methodDeclOff < 0 || methodDeclOff + declaringTypeWidth > stream.Length)
             {
                 continue;
             }
 
             stream.Position = methodDeclOff;
-            if (stream.Read(declBuf) != 4)
+            if (stream.Read(declBuf) != declaringTypeWidth)
             {
                 continue;
             }
             ApplyXorInPlace(declBuf, methodDeclOff, index.BodyXorKey);
 
-            var declaringTd = BinaryPrimitives.ReadInt32LittleEndian(declBuf);
+            var declaringTd = ReadIndex(declBuf, 0, declaringTypeWidth);
             if (declaringTd >= 0 && declaringTd < index.Types.Length)
             {
                 var attrName = index.Types[declaringTd].Name;
@@ -3104,6 +3613,19 @@ public sealed class Il2CppMetadataReader
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Decodes an <c>EncodedMethodIndex</c> (Unity 6000.5+ attribute constructors): the top three bits hold the
+    /// metadata usage kind and bits 1..28 the index. Only method definitions map to a declaring type;
+    /// generic method specs live in the native binary and yield -1.
+    /// </summary>
+    private static int DecodeMethodDefinitionIndex(uint encoded)
+    {
+        const uint methodDefinitionUsage = 3;
+        return encoded >> 29 == methodDefinitionUsage
+            ? (int)((encoded & 0x1FFFFFFEu) >> 1)
+            : -1;
     }
 
     private static void ReadCustomAttributesLegacy(
@@ -3252,8 +3774,9 @@ public sealed class Il2CppMetadataReader
     {
         typeIndex = -1;
         dataIndex = -1;
-        const int entrySize = 12;
-        var count = index.FieldDefaultValues.Size / entrySize;
+        var w = index.Widths;
+        var entrySize = index.FieldDefaultValueStructSize;
+        var count = entrySize > 0 ? index.FieldDefaultValues.Size / entrySize : 0;
         if (count <= 0)
         {
             return false;
@@ -3273,11 +3796,11 @@ public sealed class Il2CppMetadataReader
             }
             ApplyXorInPlace(entry, fileOffset, index.BodyXorKey);
 
-            var fieldIdx = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(0, 4));
+            var fieldIdx = ReadIndex(entry, 0, w.Field);
             if (fieldIdx == targetFieldIndex)
             {
-                typeIndex = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(4, 4));
-                dataIndex = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(8, 4));
+                typeIndex = ReadIndex(entry, w.Field, w.Type);
+                dataIndex = ReadIndex(entry, w.Field + w.Type, w.DefaultValueData);
                 return true;
             }
 
@@ -3404,8 +3927,8 @@ public sealed class Il2CppMetadataReader
         int genericContainerIndex)
     {
         var names = new List<string>();
-        const int gcSize = 16;
-        const int gpSize = 16;
+        var gcSize = index.GenericContainerStructSize;
+        var gpSize = index.GenericParameterStructSize;
         if (genericContainerIndex < 0 || index.GenericContainers.Size < gcSize || index.GenericParameters.Size < gpSize)
         {
             return names;
@@ -3418,9 +3941,12 @@ public sealed class Il2CppMetadataReader
         }
 
         var gcBuf = ReadBytesAt(stream, index.GenericContainers.Offset + index.BodyOffsetDelta + (long)genericContainerIndex * gcSize, gcSize, index.BodyXorKey);
-        var typeArgCount = BinaryPrimitives.ReadInt32LittleEndian(gcBuf.AsSpan(4, 4));
-        var paramStart = BinaryPrimitives.ReadInt32LittleEndian(gcBuf.AsSpan(12, 4));
+        var typeArgCount = index.GenericContainerArgCountWidth == 2
+            ? BinaryPrimitives.ReadUInt16LittleEndian(gcBuf.AsSpan(4, 2))
+            : BinaryPrimitives.ReadInt32LittleEndian(gcBuf.AsSpan(4, 4));
+        var paramStart = ReadIndex(gcBuf, index.GenericContainerParameterStartOffset, index.Widths.GenericParameter);
         var totalParams = index.GenericParameters.Size / gpSize;
+        var gpNameOffset = index.Widths.GenericContainer;
         if (typeArgCount <= 0 || typeArgCount > 32 || paramStart < 0 || paramStart >= totalParams)
         {
             return names;
@@ -3430,7 +3956,7 @@ public sealed class Il2CppMetadataReader
         var gpBuf = ReadBytesAt(stream, index.GenericParameters.Offset + index.BodyOffsetDelta + (long)paramStart * gpSize, safeCount * gpSize, index.BodyXorKey);
         for (var i = 0; i < safeCount; i++)
         {
-            var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(gpBuf.AsSpan(i * gpSize + 4, 4));
+            var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(gpBuf.AsSpan(i * gpSize + gpNameOffset, 4));
             var name = ReadStringAt(stream, index, nameIdx);
             names.Add(!string.IsNullOrWhiteSpace(name) ? name : $"T{i}");
         }
@@ -3446,22 +3972,23 @@ public sealed class Il2CppMetadataReader
         int interfacesCount)
     {
         var results = new List<string>();
-        if (interfacesCount <= 0 || interfacesStart < 0 || index.Interfaces.Size < 4)
+        var entrySize = index.Widths.Type;
+        if (interfacesCount <= 0 || interfacesStart < 0 || index.Interfaces.Size < entrySize)
         {
             return results;
         }
 
-        var totalEntries = index.Interfaces.Size / 4;
+        var totalEntries = index.Interfaces.Size / entrySize;
         if (interfacesStart >= totalEntries)
         {
             return results;
         }
 
         var safeCount = Math.Min(interfacesCount, totalEntries - interfacesStart);
-        var buf = ReadBytesAt(stream, index.Interfaces.Offset + index.BodyOffsetDelta + (long)interfacesStart * 4, safeCount * 4, index.BodyXorKey);
+        var buf = ReadBytesAt(stream, index.Interfaces.Offset + index.BodyOffsetDelta + (long)interfacesStart * entrySize, safeCount * entrySize, index.BodyXorKey);
         for (var i = 0; i < safeCount; i++)
         {
-            var ifaceTypeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(i * 4, 4));
+            var ifaceTypeIdx = ReadIndex(buf, i * entrySize, entrySize);
             var name = typeResolver.ResolveTypeName(ifaceTypeIdx, includeNamespace: true);
             if (!string.IsNullOrWhiteSpace(name))
             {
