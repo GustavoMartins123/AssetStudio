@@ -296,29 +296,149 @@
             
             <TabControl x:Name="LeftTabControl" Grid.Column="0" Margin="2">
                 <TabItem Header="Scene Hierarchy">
-                    <Grid RowDefinitions="Auto, *">
-                        <TextBox x:Name="treeSearch" Grid.Row="0" PlaceholderText=" Search " Margin="0,0,0,2" Text="{Binding SceneHierarchy.SearchQuery, Mode=TwoWay}" TextChanged="TreeSearch_TextChanged" KeyDown="TreeSearch_KeyDown"/>
-                        <TreeView x:Name="SceneTreeView" Grid.Row="1" x:CompileBindings="False" AutoScrollToSelectedItem="True" SelectionChanged="SceneTreeView_SelectionChanged">
-                            <TreeView.ContextMenu>
-                                <ContextMenu x:DataType="vm:MainWindowViewModel" x:CompileBindings="True">
-                                    <MenuItem Header="Export Scene to .glb (Instanced)..." Command="{Binding ExportSceneGlbCommand}" />
-                                    <MenuItem Header="Export Selected Subtree to .glb (Instanced)..." Command="{Binding ExportSelectedSubtreeGlbCommand}" />
-                                </ContextMenu>
-                            </TreeView.ContextMenu>
-                            <TreeView.Styles>
-                                <Style Selector="TreeViewItem">
-                                    <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
-                                </Style>
-                            </TreeView.Styles>
-                            <TreeView.ItemTemplate>
-                                <TreeDataTemplate ItemsSource="{Binding Children, Mode=OneTime}" x:DataType="local:GameObjectNode" x:CompileBindings="True">
-                                    <StackPanel Orientation="Horizontal" Spacing="4">
-                                        <CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" Focusable="False" VerticalAlignment="Center" />
-                                        <TextBlock Text="{Binding Name, Mode=OneTime}" VerticalAlignment="Center" />
-                                    </StackPanel>
-                                </TreeDataTemplate>
-                            </TreeView.ItemTemplate>
-                        </TreeView>
+                    <Grid RowDefinitions="Auto, Auto, *">
+                        <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" Margin="0,0,0,3" ColumnSpacing="4">
+                            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
+                                <ToggleButton x:Name="SceneHierarchyScenesModeButton"
+                                              Content="Scenes"
+                                              Height="24"
+                                              Padding="8,1"
+                                              FontSize="11"
+                                              IsChecked="{Binding SceneHierarchy.IsScenesMode, Mode=TwoWay}"
+                                              Command="{Binding SceneHierarchy.ShowScenesModeCommand}"
+                                              ToolTip.Tip="Browse Unity scenes and GameObject hierarchies (loads scenes on demand in Lazy Mode)" />
+                                <ToggleButton x:Name="SceneHierarchyContainersModeButton"
+                                              Content="Containers"
+                                              Height="24"
+                                              Padding="8,1"
+                                              FontSize="11"
+                                              IsChecked="{Binding SceneHierarchy.IsContainersMode, Mode=TwoWay}"
+                                              Command="{Binding SceneHierarchy.ShowContainersModeCommand}"
+                                              ToolTip.Tip="Browse assets organized by Unity container path or bundle filename (zero disk I/O)" />
+                            </StackPanel>
+                            <TextBlock x:Name="SceneHierarchySummaryText"
+                                       Grid.Column="1"
+                                       Text="{Binding SceneHierarchy.ModeSummaryText}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                       TextTrimming="CharacterEllipsis"
+                                       VerticalAlignment="Center"
+                                       Margin="4,0" />
+                            <Button x:Name="SceneHierarchyRefreshButton"
+                                    Grid.Column="2"
+                                    Classes="toolbar-btn"
+                                    Height="24"
+                                    Padding="6,1"
+                                    Content="↻"
+                                    Command="{Binding SceneHierarchy.RefreshCurrentModeCommand}"
+                                    IsVisible="{Binding SceneHierarchy.CanRefresh}"
+                                    ToolTip.Tip="Refresh Scene Hierarchy view" />
+                        </Grid>
+
+                        <TextBox x:Name="treeSearch"
+                                 Grid.Row="1"
+                                 PlaceholderText="{Binding SceneHierarchy.SearchPlaceholderText}"
+                                 Margin="0,0,0,2"
+                                 Text="{Binding SceneHierarchy.SearchQuery, Mode=TwoWay}"
+                                 TextChanged="TreeSearch_TextChanged"
+                                 KeyDown="TreeSearch_KeyDown"/>
+
+                        <Panel Grid.Row="2">
+                            <TreeView x:Name="SceneTreeView"
+                                      IsVisible="{Binding SceneHierarchy.IsScenesMode}"
+                                      ItemsSource="{Binding SceneHierarchy.Nodes}"
+                                      AutoScrollToSelectedItem="True"
+                                      SelectionChanged="SceneTreeView_SelectionChanged">
+                                <TreeView.ContextMenu>
+                                    <ContextMenu x:DataType="vm:MainWindowViewModel" x:CompileBindings="True">
+                                        <MenuItem Header="Load Scene Hierarchy"
+                                                  Command="{Binding SceneHierarchy.LoadSelectedSceneCommand}"
+                                                  IsVisible="{Binding SceneHierarchy.CanLoadSelectedScene}" />
+                                        <MenuItem Header="Export Selected Scene to .glb (Instanced)..."
+                                                  Command="{Binding SceneHierarchy.ExportSelectedSceneGlbCommand}" />
+                                        <MenuItem Header="Export Selected Subtree to .glb (Instanced)..."
+                                                  Command="{Binding ExportSelectedSubtreeGlbCommand}" />
+                                        <Separator />
+                                        <MenuItem Header="Export Scene(s) Dialog..."
+                                                  Command="{Binding ExportSceneGlbCommand}" />
+                                        <MenuItem Header="Expand Loaded Subtree"
+                                                  Command="{Binding SceneHierarchy.ExpandSelectedSubtreeCommand}" />
+                                        <MenuItem Header="Collapse Subtree"
+                                                  Command="{Binding SceneHierarchy.CollapseSelectedSubtreeCommand}" />
+                                    </ContextMenu>
+                                </TreeView.ContextMenu>
+                                <TreeView.Styles>
+                                    <Style Selector="TreeViewItem" x:DataType="local:GameObjectNode">
+                                        <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                                    </Style>
+                                </TreeView.Styles>
+                                <TreeView.ItemTemplate>
+                                    <TreeDataTemplate ItemsSource="{Binding Children, Mode=OneWay}" x:DataType="local:GameObjectNode" x:CompileBindings="True">
+                                        <StackPanel Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+                                            <CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}"
+                                                      IsVisible="{Binding ShowCheckBox, Mode=OneWay}"
+                                                      Focusable="False"
+                                                      VerticalAlignment="Center" />
+                                            <TextBlock Text="{Binding Name, Mode=OneWay}"
+                                                       Opacity="{Binding NodeTextOpacity, Mode=OneWay}"
+                                                       VerticalAlignment="Center" />
+                                            <TextBlock Text="{Binding Subtitle, Mode=OneWay}"
+                                                       IsVisible="{Binding HasSubtitle, Mode=OneWay}"
+                                                       FontSize="11"
+                                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                       VerticalAlignment="Center" />
+                                        </StackPanel>
+                                    </TreeDataTemplate>
+                                </TreeView.ItemTemplate>
+                            </TreeView>
+
+                            <TreeView x:Name="ContainersTreeView"
+                                      IsVisible="{Binding SceneHierarchy.IsContainersMode}"
+                                      ItemsSource="{Binding SceneHierarchy.ContainerNodes}"
+                                      AutoScrollToSelectedItem="True"
+                                      SelectionChanged="ContainersTreeView_SelectionChanged">
+                                <TreeView.ContextMenu>
+                                    <ContextMenu x:DataType="vm:MainWindowViewModel" x:CompileBindings="True">
+                                        <MenuItem Header="Show in Asset List"
+                                                  Command="{Binding SceneHierarchy.ShowSelectedContainerInAssetListCommand}" />
+                                        <MenuItem Header="Export Selected Asset..."
+                                                  Command="{Binding SceneHierarchy.ExportSelectedContainerAssetCommand}" />
+                                        <MenuItem Header="Copy Container Path"
+                                                  Command="{Binding SceneHierarchy.CopySelectedContainerPathCommand}" />
+                                    </ContextMenu>
+                                </TreeView.ContextMenu>
+                                <TreeView.Styles>
+                                    <Style Selector="TreeViewItem" x:DataType="vm:ContainerTreeNode">
+                                        <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                                    </Style>
+                                </TreeView.Styles>
+                                <TreeView.ItemTemplate>
+                                    <TreeDataTemplate ItemsSource="{Binding Children, Mode=OneWay}" x:DataType="vm:ContainerTreeNode" x:CompileBindings="True">
+                                        <StackPanel Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding NodeGlyph, Mode=OneTime}"
+                                                       FontSize="11"
+                                                       Opacity="{Binding NodeTextOpacity, Mode=OneWay}"
+                                                       VerticalAlignment="Center" />
+                                            <TextBlock Text="{Binding Name, Mode=OneTime}"
+                                                       Opacity="{Binding NodeTextOpacity, Mode=OneWay}"
+                                                       VerticalAlignment="Center" />
+                                            <Border Classes="badge-chip"
+                                                    IsVisible="{Binding HasTypeBadge, Mode=OneTime}">
+                                                <TextBlock Text="{Binding TypeBadge, Mode=OneTime}"
+                                                           FontSize="10"
+                                                           Opacity="0.85"
+                                                           VerticalAlignment="Center" />
+                                            </Border>
+                                            <TextBlock Text="{Binding Subtitle, Mode=OneWay}"
+                                                       IsVisible="{Binding HasSubtitle, Mode=OneWay}"
+                                                       FontSize="11"
+                                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                       VerticalAlignment="Center" />
+                                        </StackPanel>
+                                    </TreeDataTemplate>
+                                </TreeView.ItemTemplate>
+                            </TreeView>
+                        </Panel>
                     </Grid>
                 </TabItem>
                 

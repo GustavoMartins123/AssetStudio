@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\'))</RepoRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AssetStudio\AssetStudio.csproj" />
+    <ProjectReference Include="..\AssetStudioUtility\AssetStudioUtility.csproj" />
+  </ItemGroup>
+
+  <Target Name="CopyExtraFiles" AfterTargets="AfterBuild">
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\Release\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="!Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll') And Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\Release\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\Release\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="!Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll') And Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\Release\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so" DestinationFolder="$(TargetDir)" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so')" />
+  </Target>
+
+</Project>

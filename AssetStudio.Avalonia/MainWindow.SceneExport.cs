@@ -330,7 +330,8 @@ public partial class MainWindow
                         rootGameObjects,
                         companionGroups,
                         assemblyLoader,
-                        ctsToken);
+                        ctsToken,
+                        preferredStagePresetName: sceneExportOptions.PreferredStagePresetName);
                 }
 
                 SceneScriptSpawnAnalysisOptions? scriptSpawnOptions = null;
@@ -359,6 +360,8 @@ public partial class MainWindow
                     SkipDisabledRenderers = true,
                     LodMode = sceneExportOptions.LodMode,
                     ExportCamerasAndLights = sceneExportOptions.ExportCamerasAndLights,
+                    HideAuxiliaryAndShadowOnlyRenderers = sceneExportOptions.HideAuxiliaryAndShadowOnlyRenderers,
+                    PreferredStagePresetName = sceneExportOptions.PreferredStagePresetName,
                     ResolveStaticScriptSpawns = sceneExportOptions.ResolveStaticScriptSpawns,
                     WriteManifest = sceneExportOptions.WriteManifest,
                     MaxScriptSpawnInstances = sceneExportOptions.MaxScriptSpawnInstances,
@@ -597,13 +600,37 @@ public partial class MainWindow
                 seenKeys.Add($"file:{candidate.SerializedFileName}");
             }
 
-            candidates.Add(candidate);
             IReadOnlyList<(string SerializedFileName, string OriginalPath)>? companionFiles = null;
             if (!string.IsNullOrWhiteSpace(candidate.SerializedFileName)
                 && discovered.CompanionStageFilesBySceneSf.TryGetValue(candidate.SerializedFileName, out var foundCompanions))
             {
                 companionFiles = foundCompanions;
             }
+
+            if (companionFiles != null && companionFiles.Count > 0)
+            {
+                var discoveredPresets = DiscoverStagePresetsForCompanionFiles(candidate.Name, candidate.ScenePath, companionFiles);
+                if (discoveredPresets.Count > 0)
+                {
+                    candidate = new SceneExportCandidate
+                    {
+                        Id = candidate.Id,
+                        Name = candidate.Name,
+                        ScenePath = candidate.ScenePath,
+                        BuildIndex = candidate.BuildIndex,
+                        SourceKind = candidate.SourceKind,
+                        SerializedFileName = candidate.SerializedFileName,
+                        OriginalPath = candidate.OriginalPath,
+                        ContainerKey = candidate.ContainerKey,
+                        IsPreselected = candidate.IsPreselected,
+                        GameObjectCount = candidate.GameObjectCount,
+                        RendererCount = candidate.RendererCount,
+                        AvailableStagePresets = discoveredPresets
+                    };
+                }
+            }
+
+            candidates.Add(candidate);
 
             bindings[candidate.Id] = new SceneCandidateBinding
             {
@@ -1245,6 +1272,56 @@ public partial class MainWindow
         return new List<SerializedFile>();
     }
 
+    private List<string> DiscoverStagePresetsForCompanionFiles(
+        string? sceneName,
+        string? scenePath,
+        IReadOnlyList<(string SerializedFileName, string OriginalPath)> companionFiles)
+    {
+        var presets = new List<string>();
+        var stageStem = ProjectLoadingService.ExtractSceneStageStem(sceneName, scenePath);
+        if (stageStem.Length < 6 || companionFiles == null || companionFiles.Count == 0)
+        {
+            return presets;
+        }
+
+        var prefix = stageStem + "_";
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < companionFiles.Count; i++)
+        {
+            var sfName = companionFiles[i].SerializedFileName;
+            if (string.IsNullOrWhiteSpace(sfName))
+            {
+                continue;
+            }
+
+            foreach (var handle in assetsManager.ProjectIndex.GetHandlesForFile(sfName))
+            {
+                if (handle == null || handle.Type != ClassIDType.MonoBehaviour || string.IsNullOrWhiteSpace(handle.Name))
+                {
+                    continue;
+                }
+
+                if (!handle.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var suffix = handle.Name.Substring(prefix.Length).Trim();
+                if (!string.IsNullOrEmpty(suffix) && seen.Add(suffix))
+                {
+                    presets.Add(suffix);
+                }
+            }
+        }
+
+        presets.Sort(static (a, b) =>
+        {
+            var cmp = SceneGlbExportService.ScoreStagePresetName(b).CompareTo(SceneGlbExportService.ScoreStagePresetName(a));
+            return cmp != 0 ? cmp : string.Compare(a, b, StringComparison.OrdinalIgnoreCase);
+        });
+        return presets;
+    }
+
     private SceneGlbExportOptions BuildSceneGlbExportOptions(string outputPath, string sceneName, bool includeInactive = false)
     {
         var binary = !outputPath.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase);
@@ -1256,6 +1333,8 @@ public partial class MainWindow
             SkipDisabledRenderers = true,
             LodMode = _lastSceneExportOptions.LodMode,
             ExportCamerasAndLights = _lastSceneExportOptions.ExportCamerasAndLights,
+            HideAuxiliaryAndShadowOnlyRenderers = _lastSceneExportOptions.HideAuxiliaryAndShadowOnlyRenderers,
+            PreferredStagePresetName = _lastSceneExportOptions.PreferredStagePresetName,
             ResolveStaticScriptSpawns = false,
             WriteManifest = _lastSceneExportOptions.WriteManifest,
             IncludeAnimations = exportOptions.ExportAnimations,

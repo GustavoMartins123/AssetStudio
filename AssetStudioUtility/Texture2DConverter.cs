@@ -69,6 +69,18 @@ namespace AssetStudio
             outPutSize = expectedOutput <= int.MaxValue ? (int)expectedOutput : 0;
         }
 
+        internal Texture2DConverter(ResourceReader reader, int width, int height, TextureFormat textureFormat, int[] version, BuildTarget platform)
+        {
+            this.reader = reader ?? throw new ArgumentNullException(nameof(reader));
+            m_Width = width;
+            m_Height = height;
+            m_TextureFormat = textureFormat;
+            this.version = version ?? Array.Empty<int>();
+            this.platform = platform;
+            long expectedOutput = (m_Width > 0 && m_Height > 0) ? (long)m_Width * m_Height * 4 : 0;
+            outPutSize = expectedOutput <= int.MaxValue ? (int)expectedOutput : 0;
+        }
+
         public bool SupportsDirectSpanDecode => true;
 
         internal bool CanDecode()
@@ -211,7 +223,7 @@ namespace AssetStudio
             return flag;
         }
 
-        private static bool IsSupportedFormat(TextureFormat format)
+        internal static bool IsSupportedFormat(TextureFormat format)
         {
             return format switch
             {
@@ -1375,7 +1387,7 @@ namespace AssetStudio
             }
             return false;
         }
-        private static long GetMinimumDataSize(TextureFormat format, int width, int height)
+        internal static long GetMinimumDataSize(TextureFormat format, int width, int height)
         {
             if (width <= 0 || height <= 0)
             {

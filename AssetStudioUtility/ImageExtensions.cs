@@ -321,6 +321,19 @@ namespace AssetStudio
             }
         }
 
+        public static string GetFileExtension(this ImageFormat imageFormat)
+        {
+            return imageFormat switch
+            {
+                ImageFormat.Jpeg => ".jpeg",
+                ImageFormat.Png => ".png",
+                ImageFormat.Bmp => ".bmp",
+                ImageFormat.Tga => ".tga",
+                ImageFormat.Webp => ".webp",
+                _ => throw new ArgumentOutOfRangeException(nameof(imageFormat), imageFormat, "Unsupported image format.")
+            };
+        }
+
         public static void WriteToStream(this SKBitmap image, Stream stream, ImageFormat imageFormat)
         {
             if (image == null) throw new ArgumentNullException(nameof(image));
@@ -340,6 +353,9 @@ namespace AssetStudio
                 case ImageFormat.Tga:
                     WriteTga32(image, stream);
                     break;
+                case ImageFormat.Webp:
+                    WriteWebp(image, stream);
+                    break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(imageFormat), imageFormat, "Unsupported image format.");
             }
@@ -350,6 +366,60 @@ namespace AssetStudio
             var stream = new MemoryStream();
             image.WriteToStream(stream, imageFormat);
             return stream;
+        }
+
+        public static MemoryStream ConvertToStream(this SKBitmap image, ImageFormat imageFormat, int webpQuality, bool webpLossless = false)
+        {
+            if (image == null) throw new ArgumentNullException(nameof(image));
+            var stream = new MemoryStream();
+            if (imageFormat == ImageFormat.Webp)
+            {
+                WriteWebp(image, stream, webpQuality, webpLossless);
+            }
+            else
+            {
+                image.WriteToStream(stream, imageFormat);
+            }
+            return stream;
+        }
+
+        private static void WriteWebp(SKBitmap image, Stream stream, int quality = 90, bool lossless = false)
+        {
+            int clampedQuality = Math.Clamp(quality, 0, 100);
+            SKBitmap source = image;
+            SKBitmap? converted = null;
+            try
+            {
+                if (image.ColorType != SKColorType.Bgra8888 && image.ColorType != SKColorType.Rgba8888)
+                {
+                    converted = new SKBitmap(new SKImageInfo(image.Width, image.Height, SKColorType.Bgra8888, SKAlphaType.Unpremul));
+                    if (!image.CopyTo(converted, SKColorType.Bgra8888))
+                    {
+                        throw new InvalidOperationException($"Failed to convert bitmap from {image.ColorType} to Bgra8888 for WebP encoding.");
+                    }
+                    source = converted;
+                }
+
+                using var pixmap = source.PeekPixels();
+                if (pixmap == null)
+                {
+                    throw new InvalidOperationException("Failed to access bitmap pixels for WebP encoding.");
+                }
+
+                var compression = lossless ? SKWebpEncoderCompression.Lossless : SKWebpEncoderCompression.Lossy;
+                using var data = pixmap.Encode(new SKWebpEncoderOptions(compression, clampedQuality));
+                if (data == null)
+                {
+                    throw new InvalidOperationException("Failed to encode bitmap as WebP.");
+                }
+
+                data.SaveTo(stream);
+                GC.KeepAlive(source);
+            }
+            finally
+            {
+                converted?.Dispose();
+            }
         }
 
         private static void WritePng(SKBitmap image, Stream stream)

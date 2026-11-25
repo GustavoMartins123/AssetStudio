@@ -791,18 +791,22 @@ namespace AssetStudio.Avalonia.Services
 
         public static string GetDecompressedBundleScopeKey(string folderPath)
         {
+            return GetDecompressedBundleScopeKey(folderPath, caseSensitive: OperatingSystem.IsLinux());
+        }
+
+        internal static string GetDecompressedBundleScopeKey(string folderPath, bool caseSensitive)
+        {
             string normalized;
             try
             {
-                normalized = Path.GetFullPath(folderPath)
-                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                normalized = SQLiteProjectIndexCache.TrimTrailingDirectorySeparatorsPreservingRoot(Path.GetFullPath(folderPath));
             }
             catch
             {
-                normalized = folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                normalized = SQLiteProjectIndexCache.TrimTrailingDirectorySeparatorsPreservingRoot(folderPath ?? string.Empty);
             }
 
-            if (OperatingSystem.IsWindows())
+            if (!caseSensitive)
             {
                 normalized = normalized.ToLowerInvariant();
             }
@@ -1925,13 +1929,26 @@ namespace AssetStudio.Avalonia.Services
                 && !string.IsNullOrWhiteSpace(folderPath)
                 && targetIndex != null)
             {
-                var plan = sqliteCache.PlanIncrementalDelta(folderPath, scanResult);
-                if (plan.CanApplyIncremental
-                    && sqliteCache.TryLoadUnchangedAssetsForIncrementalUpdate(folderPath, plan, targetIndex, out var loadedSources))
+                var hasSplitFiles = false;
+                for (var i = 0; i < scanResult.Files.Count; i++)
                 {
-                    deltaPlan = plan;
-                    unchangedSourceFiles = loadedSources;
-                    return plan.FilesToReindex.ToList();
+                    if (scanResult.Files[i].Path.EndsWith(".split0", StringComparison.OrdinalIgnoreCase))
+                    {
+                        hasSplitFiles = true;
+                        break;
+                    }
+                }
+
+                if (!hasSplitFiles)
+                {
+                    var plan = sqliteCache.PlanIncrementalDelta(folderPath, scanResult);
+                    if (plan.CanApplyIncremental
+                        && sqliteCache.TryLoadUnchangedAssetsForIncrementalUpdate(folderPath, plan, targetIndex, out var loadedSources))
+                    {
+                        deltaPlan = plan;
+                        unchangedSourceFiles = loadedSources;
+                        return plan.FilesToReindex.ToList();
+                    }
                 }
             }
 

@@ -500,8 +500,14 @@ namespace AssetStudio.Avalonia
 
         private string BuildProjectIdCacheKey(string dbPath, string folderPath, string signature)
         {
-            var normalizedDb = _caseSensitivePaths ? dbPath : dbPath.ToUpperInvariant();
+            var normalizedDb = NormalizeDbPathKey(dbPath);
             return $"{normalizedDb}\u001f{NormalizeProjectPathForCache(folderPath)}\u001f{signature}";
+        }
+
+        private string NormalizeDbPathKey(string dbPath)
+        {
+            var full = string.IsNullOrWhiteSpace(dbPath) ? string.Empty : NormalizeDbPath(dbPath);
+            return _caseSensitivePaths ? full : full.ToUpperInvariant();
         }
 
         internal bool TryGetCachedProjectId(string folderPath, string signature, out long projectId)
@@ -522,7 +528,7 @@ namespace AssetStudio.Avalonia
 
         private void InvalidateProjectIdCacheForDb(string dbPath)
         {
-            var normalizedDb = _caseSensitivePaths ? dbPath : dbPath.ToUpperInvariant();
+            var normalizedDb = NormalizeDbPathKey(dbPath);
             var prefix = normalizedDb + "\u001f";
             foreach (var key in _projectIdCache.Keys)
             {
@@ -537,7 +543,7 @@ namespace AssetStudio.Avalonia
 
         private void InvalidateSemanticStatusCacheForDb(string dbPath)
         {
-            var normalizedDb = _caseSensitivePaths ? dbPath : dbPath.ToUpperInvariant();
+            var normalizedDb = NormalizeDbPathKey(dbPath);
             var prefix = normalizedDb + "\u001f";
             foreach (var key in _semanticStatusCache.Keys)
             {

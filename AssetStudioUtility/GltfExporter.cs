@@ -26,6 +26,7 @@ namespace AssetStudio
         public int AnimationsCount { get; init; }
         public int CamerasCount { get; init; }
         public int LightsCount { get; init; }
+        public int HiddenNodesCount { get; init; }
         public long OutputBytes { get; init; }
 
         public double InstancingPercent =>
@@ -110,6 +111,7 @@ namespace AssetStudio
         private int _uniqueGeometryBuffers;
         private int _reusedMeshCount;
         private int _reusedGeometryCount;
+        private int _hiddenNodesCount;
         private readonly Dictionary<string, string?> _uniqueSuffixToPath = new Dictionary<string, string?>(StringComparer.Ordinal);
         private readonly Dictionary<string, int?> _uniqueLeafToNode = new Dictionary<string, int?>(StringComparer.Ordinal);
         private readonly Dictionary<string, int> _materialIndexByName = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -256,6 +258,7 @@ namespace AssetStudio
                     AnimationsCount = _animations.Count,
                     CamerasCount = _cameras.Count,
                     LightsCount = _lights.Count,
+                    HiddenNodesCount = _hiddenNodesCount,
                     OutputBytes = outputBytes
                 };
             }
@@ -291,6 +294,7 @@ namespace AssetStudio
             _uniqueGeometryBuffers = 0;
             _reusedMeshCount = 0;
             _reusedGeometryCount = 0;
+            _hiddenNodesCount = 0;
             _uniqueSuffixToPath.Clear();
             _uniqueLeafToNode.Clear();
             _materialIndexByName.Clear();
@@ -346,8 +350,15 @@ namespace AssetStudio
                 Translation = IsNearlyZero(translation) ? null : translation,
                 Rotation = IsNearlyIdentity(rotation) ? null : rotation,
                 Scale = IsNearlyOne(scale) ? null : scale,
-                Extras = frame.Extras
+                Extras = frame.Extras,
+                IsInitiallyHidden = frame.IsInitiallyHidden,
+                HiddenReason = frame.HiddenReason
             };
+            if (frame.IsInitiallyHidden)
+            {
+                _hiddenNodesCount++;
+                _extensionsUsed.Add("KHR_node_visibility");
+            }
             _nodes.Add(node);
             _nodeGlobalRowMatrices.Add(globalRow);
             _nodeParentIndices.Add(parentIndex);
@@ -780,6 +791,36 @@ namespace AssetStudio
             {
                 gltfMat.AlphaMode = "BLEND";
             }
+
+            if (mat.IsUnlit)
+            {
+                gltfMat.IsUnlit = true;
+                _extensionsUsed.Add("KHR_materials_unlit");
+            }
+            else
+            {
+                if (mat.TransmissionFactor.HasValue && float.IsFinite(mat.TransmissionFactor.Value))
+                {
+                    float tf = Clamp01(mat.TransmissionFactor.Value);
+                    if (tf > 1e-4f)
+                    {
+                        gltfMat.TransmissionFactor = tf;
+                        _extensionsUsed.Add("KHR_materials_transmission");
+                    }
+                }
+
+                if (mat.Ior.HasValue && float.IsFinite(mat.Ior.Value))
+                {
+                    float ior = Math.Clamp(mat.Ior.Value, 1.0f, 3.0f);
+                    if (gltfMat.TransmissionFactor.HasValue || MathF.Abs(ior - 1.5f) > 1e-4f)
+                    {
+                        gltfMat.Ior = ior;
+                        _extensionsUsed.Add("KHR_materials_ior");
+                    }
+                }
+            }
+
+            gltfMat.UnityShaderMetadata = mat.UnityShaderMetadata;
 
             int matIdx = _materials.Count;
             _materials.Add(gltfMat);
@@ -3164,17 +3205,33 @@ namespace AssetStudio
                             w.WriteNumberValue(SanitizeScaleFloat(s.Z));
                             w.WriteEndArray();
                         }
-                        if (n.Light.HasValue)
+                        bool emitVisibilityFalse = n.IsInitiallyHidden;
+                        bool emitVisibilityTrue = !n.IsInitiallyHidden
+                            && i < _nodeParentIndices.Count
+                            && _nodeParentIndices[i] >= 0
+                            && _nodes[_nodeParentIndices[i]].IsInitiallyHidden;
+                        bool hasVisibilityExt = emitVisibilityFalse || emitVisibilityTrue;
+
+                        if (n.Light.HasValue || hasVisibilityExt)
                         {
                             w.WriteStartObject("extensions");
-                            w.WriteStartObject("KHR_lights_punctual");
-                            w.WriteNumber("light", n.Light.Value);
-                            w.WriteEndObject();
+                            if (n.Light.HasValue)
+                            {
+                                w.WriteStartObject("KHR_lights_punctual");
+                                w.WriteNumber("light", n.Light.Value);
+                                w.WriteEndObject();
+                            }
+                            if (hasVisibilityExt)
+                            {
+                                w.WriteStartObject("KHR_node_visibility");
+                                w.WriteBoolean("visible", emitVisibilityTrue);
+                                w.WriteEndObject();
+                            }
                             w.WriteEndObject();
                         }
-                        if (n.Extras != null)
+                        if (n.Extras != null || !string.IsNullOrEmpty(n.HiddenReason))
                         {
-                            WriteNodeExtras(w, n.Extras);
+                            WriteNodeExtras(w, n.Extras, n.HiddenReason);
                         }
                         w.WriteEndObject();
                     }
@@ -3346,6 +3403,36 @@ namespace AssetStudio
                         if (mat.DoubleSided)
                         {
                             w.WriteBoolean("doubleSided", true);
+                        }
+                        bool hasMaterialExtensions = mat.IsUnlit || mat.TransmissionFactor.HasValue || mat.Ior.HasValue;
+                        if (hasMaterialExtensions)
+                        {
+                            w.WriteStartObject("extensions");
+                            if (mat.IsUnlit)
+                            {
+                                w.WriteStartObject("KHR_materials_unlit");
+                                w.WriteEndObject();
+                            }
+                            else
+                            {
+                                if (mat.TransmissionFactor.HasValue)
+                                {
+                                    w.WriteStartObject("KHR_materials_transmission");
+                                    w.WriteNumber("transmissionFactor", Clamp01(mat.TransmissionFactor.Value));
+                                    w.WriteEndObject();
+                                }
+                                if (mat.Ior.HasValue)
+                                {
+                                    w.WriteStartObject("KHR_materials_ior");
+                                    w.WriteNumber("ior", Math.Clamp(SanitizeFloat(mat.Ior.Value, 1.5f), 1.0f, 3.0f));
+                                    w.WriteEndObject();
+                                }
+                            }
+                            w.WriteEndObject();
+                        }
+                        if (mat.UnityShaderMetadata != null && HasUnityShaderMetadata(mat.UnityShaderMetadata))
+                        {
+                            WriteMaterialUnityShaderExtras(w, mat.UnityShaderMetadata);
                         }
 
                         w.WriteEndObject();
@@ -3619,48 +3706,149 @@ namespace AssetStudio
             return ms.ToArray();
         }
 
-        private static void WriteNodeExtras(Utf8JsonWriter w, ImportedFrameExtras extras)
+        private static void WriteNodeExtras(Utf8JsonWriter w, ImportedFrameExtras? extras, string? hiddenReason)
         {
             w.WriteStartObject("extras");
-            w.WriteNumber("pathId", extras.PathId);
-            w.WriteString("sourceFile", extras.SourceFile ?? string.Empty);
-            w.WriteNumber("tag", extras.Tag);
-            w.WriteNumber("layer", extras.Layer);
-            if (!extras.IsActive)
+            if (extras != null)
             {
-                w.WriteBoolean("isActive", false);
-            }
-            if (extras.IsScriptSpawned)
-            {
-                w.WriteBoolean("scriptSpawned", true);
-                if (extras.ScriptSpawn != null)
+                w.WriteNumber("pathId", extras.PathId);
+                w.WriteString("sourceFile", extras.SourceFile ?? string.Empty);
+                w.WriteNumber("tag", extras.Tag);
+                w.WriteNumber("layer", extras.Layer);
+                if (!extras.IsActive)
                 {
-                    var s = extras.ScriptSpawn;
-                    w.WriteStartObject("scriptSpawn");
-                    w.WriteString("scriptClass", s.ScriptClass ?? string.Empty);
-                    w.WriteString("fieldPath", s.FieldPath ?? string.Empty);
-                    w.WriteString("sourceKind", s.SourceKind ?? string.Empty);
-                    w.WriteString("confidence", s.Confidence ?? string.Empty);
-                    w.WriteNumber("ownerPathId", s.OwnerPathId);
-                    if (s.AnchorTransformPathId != 0)
+                    w.WriteBoolean("isActive", false);
+                }
+                if (extras.IsScriptSpawned)
+                {
+                    w.WriteBoolean("scriptSpawned", true);
+                    if (extras.ScriptSpawn != null)
                     {
-                        w.WriteNumber("anchorTransformPathId", s.AnchorTransformPathId);
+                        var s = extras.ScriptSpawn;
+                        w.WriteStartObject("scriptSpawn");
+                        w.WriteString("scriptClass", s.ScriptClass ?? string.Empty);
+                        w.WriteString("fieldPath", s.FieldPath ?? string.Empty);
+                        w.WriteString("sourceKind", s.SourceKind ?? string.Empty);
+                        w.WriteString("confidence", s.Confidence ?? string.Empty);
+                        w.WriteNumber("ownerPathId", s.OwnerPathId);
+                        if (s.AnchorTransformPathId != 0)
+                        {
+                            w.WriteNumber("anchorTransformPathId", s.AnchorTransformPathId);
+                        }
+                        if (!string.IsNullOrEmpty(s.TargetFileName))
+                        {
+                            w.WriteString("targetFileName", s.TargetFileName);
+                        }
+                        if (s.TargetPathId != 0)
+                        {
+                            w.WriteNumber("targetPathId", s.TargetPathId);
+                        }
+                        if (!string.IsNullOrEmpty(s.TargetGuid))
+                        {
+                            w.WriteString("targetGuid", s.TargetGuid);
+                        }
+                        w.WriteEndObject();
                     }
-                    if (!string.IsNullOrEmpty(s.TargetFileName))
-                    {
-                        w.WriteString("targetFileName", s.TargetFileName);
-                    }
-                    if (s.TargetPathId != 0)
-                    {
-                        w.WriteNumber("targetPathId", s.TargetPathId);
-                    }
-                    if (!string.IsNullOrEmpty(s.TargetGuid))
-                    {
-                        w.WriteString("targetGuid", s.TargetGuid);
-                    }
-                    w.WriteEndObject();
                 }
             }
+            if (!string.IsNullOrEmpty(hiddenReason))
+            {
+                w.WriteString("hiddenReason", hiddenReason);
+            }
+            w.WriteEndObject();
+        }
+
+        private static bool HasUnityShaderMetadata(ImportedUnityShaderMetadata meta)
+        {
+            return !string.IsNullOrEmpty(meta.ShaderName)
+                || !string.IsNullOrEmpty(meta.Classification)
+                || meta.RenderQueue.HasValue
+                || !string.IsNullOrEmpty(meta.RenderType)
+                || meta.Keywords.Count > 0
+                || meta.FloatProperties.Count > 0
+                || meta.ColorProperties.Count > 0
+                || meta.TextureProperties.Count > 0
+                || meta.Tags.Count > 0;
+        }
+
+        private static void WriteMaterialUnityShaderExtras(Utf8JsonWriter w, ImportedUnityShaderMetadata meta)
+        {
+            w.WriteStartObject("extras");
+            w.WriteStartObject("unityShader");
+            if (!string.IsNullOrEmpty(meta.ShaderName))
+            {
+                w.WriteString("shaderName", meta.ShaderName);
+            }
+            if (!string.IsNullOrEmpty(meta.Classification))
+            {
+                w.WriteString("classification", meta.Classification);
+            }
+            if (meta.RenderQueue.HasValue)
+            {
+                w.WriteNumber("renderQueue", meta.RenderQueue.Value);
+            }
+            if (!string.IsNullOrEmpty(meta.RenderType))
+            {
+                w.WriteString("renderType", meta.RenderType);
+            }
+            if (meta.Keywords.Count > 0)
+            {
+                w.WriteStartArray("keywords");
+                for (int i = 0; i < meta.Keywords.Count; i++)
+                {
+                    if (!string.IsNullOrEmpty(meta.Keywords[i]))
+                    {
+                        w.WriteStringValue(meta.Keywords[i]);
+                    }
+                }
+                w.WriteEndArray();
+            }
+            if (meta.FloatProperties.Count > 0)
+            {
+                w.WriteStartObject("floatProperties");
+                foreach (var kv in meta.FloatProperties)
+                {
+                    w.WriteNumber(kv.Key, SanitizeFloat(kv.Value));
+                }
+                w.WriteEndObject();
+            }
+            if (meta.ColorProperties.Count > 0)
+            {
+                w.WriteStartObject("colorProperties");
+                foreach (var kv in meta.ColorProperties)
+                {
+                    if (kv.Value == null || kv.Value.Length < 4)
+                    {
+                        continue;
+                    }
+                    w.WriteStartArray(kv.Key);
+                    for (int c = 0; c < 4; c++)
+                    {
+                        w.WriteNumberValue(SanitizeFloat(kv.Value[c]));
+                    }
+                    w.WriteEndArray();
+                }
+                w.WriteEndObject();
+            }
+            if (meta.TextureProperties.Count > 0)
+            {
+                w.WriteStartObject("textureProperties");
+                foreach (var kv in meta.TextureProperties)
+                {
+                    w.WriteString(kv.Key, kv.Value);
+                }
+                w.WriteEndObject();
+            }
+            if (meta.Tags.Count > 0)
+            {
+                w.WriteStartObject("tags");
+                foreach (var kv in meta.Tags)
+                {
+                    w.WriteString(kv.Key, kv.Value);
+                }
+                w.WriteEndObject();
+            }
+            w.WriteEndObject();
             w.WriteEndObject();
         }
 
@@ -4224,6 +4412,8 @@ namespace AssetStudio
             public System.Numerics.Vector3? Scale;
             public List<int> Children = new List<int>();
             public ImportedFrameExtras? Extras;
+            public bool IsInitiallyHidden;
+            public string? HiddenReason;
         }
 
         private sealed class GltfCamera
@@ -4303,6 +4493,10 @@ namespace AssetStudio
             public string? AlphaMode;
             public float? AlphaCutoff;
             public bool DoubleSided;
+            public float? TransmissionFactor;
+            public float? Ior;
+            public bool IsUnlit;
+            public ImportedUnityShaderMetadata? UnityShaderMetadata;
         }
 
         private sealed class GltfTextureInfo

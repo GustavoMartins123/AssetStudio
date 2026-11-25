@@ -423,6 +423,23 @@ namespace AssetStudio
             bool verifyAllContentSamples = false,
             CancellationToken cancellationToken = default)
         {
+            return RevalidateFolder(
+                path,
+                baselineScan,
+                knownDirtyPaths,
+                verifyAllContentSamples,
+                caseSensitivePaths: OperatingSystem.IsLinux(),
+                cancellationToken);
+        }
+
+        public static ProjectRevalidationResult RevalidateFolder(
+            string path,
+            ProjectScanResult baselineScan,
+            IReadOnlyCollection<string>? knownDirtyPaths,
+            bool verifyAllContentSamples,
+            bool caseSensitivePaths,
+            CancellationToken cancellationToken = default)
+        {
             ArgumentNullException.ThrowIfNull(baselineScan);
 
             var revalidation = new ProjectRevalidationResult();
@@ -445,7 +462,7 @@ namespace AssetStudio
                 return revalidation;
             }
 
-            var pathComparer = OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+            var pathComparer = caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
             var baselineByKey = new Dictionary<string, ScannedFileInfo>(baselineScan.Files.Count, pathComparer);
             foreach (var item in baselineScan.Files)
             {

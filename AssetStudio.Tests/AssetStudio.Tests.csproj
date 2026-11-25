@@ -21,6 +21,7 @@
     <ProjectReference Include="..\AssetStudio\AssetStudio.csproj" />
     <ProjectReference Include="..\AssetStudioUtility\AssetStudioUtility.csproj" />
     <ProjectReference Include="..\AssetStudio.Avalonia\AssetStudio.Avalonia.csproj" />
+    <ProjectReference Include="..\AssetStudio.CLI\AssetStudio.CLI.csproj" />
     <ProjectReference Include="..\Texture2DDecoderWrapper\Texture2DDecoderWrapper.csproj" />
   </ItemGroup>
 

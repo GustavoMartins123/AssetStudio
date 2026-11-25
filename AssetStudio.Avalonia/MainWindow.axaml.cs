@@ -407,7 +407,8 @@ public partial class MainWindow : Window
         handlers.ExportSelectedObjectsMergeAsync = () => ExportSelectedObjectsMerge(false);
         handlers.ExportSelectedObjectsMergeWithAnimationClipAsync = () => ExportSelectedObjectsMerge(true);
         handlers.ExportSceneGlbAsync = ExportSceneGlbCommandHandlerAsync;
-        handlers.ExportSelectedSubtreeGlbAsync = ExportSelectedSubtreeGlbCommandHandlerAsync;
+        handlers.ExportSelectedSubtreeGlbAsync = ExportSelectedSubtreeGlbWithLazySupportAsync;
+        WireSceneHierarchyViewModelHandlers();
 
         handlers.ExportAllAssetsAsync = () => ExportAllAssetsAsync(ExportMode.Convert);
         handlers.ExportSelectedAssetsAsync = () => ExportAssets(GetSelectedAssets(), ExportMode.Convert);
@@ -1117,6 +1118,7 @@ public partial class MainWindow : Window
                             BuildFilterTypeMenu();
                             EnsureAssetListItemsSource();
                             FilterAssetClasses();
+                            RefreshLazySceneHierarchyAsync(sessionId);
 
                             ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
                             StatusStripUpdate($"Loaded from cache. Showing {VisibleAssetCount:N0} assets.{FormatPartialCoverageSuffix()}");
@@ -1723,6 +1725,7 @@ public partial class MainWindow : Window
             }
 
             if (IsStructureAborted()) return;
+            RefreshLazySceneHierarchyAsync(structureSessionId);
             var lazyLog = $"Finished loading {assetsManager.assetsFileList.Count} files with {ExportableAssetCount:N0} exportable assets";
             var lazyObjCount = assetsManager.ProjectIndex.Count;
             if (lazyObjCount > 0)
@@ -1966,7 +1969,7 @@ public partial class MainWindow : Window
             BuildFilterTypeMenu();
             _ = FilterAssetListAsync(CancellationToken.None);
             FilterAssetClasses();
-            SceneTreeView.ItemsSource = sceneTreeNodes;
+            ApplyEagerSceneHierarchy(sceneTreeNodes);
         }
 
         var log = $"Finished loading {assetsManager.assetsFileList.Count} files with {ExportableAssetCount} exportable assets";
@@ -2257,6 +2260,7 @@ public partial class MainWindow : Window
     private async Task StopActiveBackgroundWorkForNavigationAsync()
     {
         lazyIndexingSessionId++;
+        CancelLazySceneHierarchyOperations();
         CancelProgressiveScan();
         ViewModel.LoadingService.StopIndexing();
         CancelProjectAnalysis();
@@ -2300,6 +2304,7 @@ public partial class MainWindow : Window
         }
 
         lazyIndexingSessionId++;
+        CancelLazySceneHierarchyOperations();
         CancelProgressiveScan();
         ViewModel.LoadingService.StopIndexing();
         CancelProjectAnalysis();

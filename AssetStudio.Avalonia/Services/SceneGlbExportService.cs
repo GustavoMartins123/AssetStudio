@@ -16,6 +16,8 @@ public sealed class SceneExportOptions
     public bool IncludeInactive { get; init; }
     public SceneLodExportMode LodMode { get; init; } = SceneLodExportMode.Lod0Only;
     public bool ExportCamerasAndLights { get; init; } = true;
+    public bool HideAuxiliaryAndShadowOnlyRenderers { get; init; } = true;
+    public string PreferredStagePresetName { get; init; } = string.Empty;
     public bool ResolveStaticScriptSpawns { get; init; }
     public bool WriteManifest { get; init; } = true;
     public int MaxExternalDependencyDepth { get; init; } = 4;
@@ -43,6 +45,8 @@ public sealed class SceneGlbExportOptions
 
     public SceneLodExportMode LodMode { get; init; } = SceneLodExportMode.Lod0Only;
     public bool ExportCamerasAndLights { get; init; } = true;
+    public bool HideAuxiliaryAndShadowOnlyRenderers { get; init; } = true;
+    public string PreferredStagePresetName { get; init; } = string.Empty;
     public bool ResolveStaticScriptSpawns { get; init; }
     public bool WriteManifest { get; init; } = true;
     public int MaxScriptSpawnInstances { get; init; } = SceneScriptSpawnAnalysisOptions.DefaultMaxSpawnedInstances;
@@ -88,6 +92,8 @@ public sealed class SceneGlbExportOptions
             SkipDisabledRenderers = true,
             LodMode = sceneOptions.LodMode,
             ExportCamerasAndLights = sceneOptions.ExportCamerasAndLights,
+            HideAuxiliaryAndShadowOnlyRenderers = sceneOptions.HideAuxiliaryAndShadowOnlyRenderers,
+            PreferredStagePresetName = sceneOptions.PreferredStagePresetName ?? string.Empty,
             ResolveStaticScriptSpawns = sceneOptions.ResolveStaticScriptSpawns,
             WriteManifest = sceneOptions.WriteManifest,
             MaxScriptSpawnInstances = sceneOptions.MaxScriptSpawnInstances,
@@ -124,6 +130,8 @@ public sealed class SceneExportManifestOptions
     public bool IncludeInactive { get; init; }
     public string LodMode { get; init; } = nameof(SceneLodExportMode.Lod0Only);
     public bool ExportCamerasAndLights { get; init; } = true;
+    public bool HideAuxiliaryAndShadowOnlyRenderers { get; init; } = true;
+    public string PreferredStagePresetName { get; init; } = string.Empty;
     public bool ResolveStaticScriptSpawns { get; init; }
     public bool WriteManifest { get; init; } = true;
     public bool IncludeAnimations { get; init; }
@@ -144,6 +152,7 @@ public sealed class SceneExportManifestStatistics
     public int Cameras { get; init; }
     public int Lights { get; init; }
     public int SkippedLodRenderers { get; init; }
+    public int HiddenAuxiliaryRenderers { get; init; }
     public int AttachedScriptSpawns { get; init; }
     public int SkippedInactiveObjects { get; init; }
 }
@@ -206,6 +215,7 @@ public sealed class SceneGlbExportResult
     public string SceneName { get; init; } = string.Empty;
     public int RootGameObjectCount { get; init; }
     public int SkippedLodRendererCount { get; init; }
+    public int HiddenAuxiliaryRendererCount { get; init; }
     public int AttachedScriptSpawnCount { get; init; }
     public int SkippedInactiveObjectCount { get; init; }
     public GltfExportStatistics Stats { get; init; } = new GltfExportStatistics();
@@ -255,6 +265,7 @@ public sealed class SceneGlbExportService
             ClassIDType.SkinnedMeshRenderer,
             ClassIDType.Mesh,
             ClassIDType.Material,
+            ClassIDType.Shader,
             ClassIDType.Animator,
             ClassIDType.Avatar,
             ClassIDType.Animation,
@@ -1158,6 +1169,7 @@ public sealed class SceneGlbExportService
                 IncludeCamerasAndLights = options.ExportCamerasAndLights,
                 SkipDisabledCamerasAndLights = options.SkipDisabledRenderers,
                 IncludeNodeProvenanceExtras = true,
+                HideAuxiliaryAndShadowOnlyRenderers = options.HideAuxiliaryAndShadowOnlyRenderers,
                 ScriptSpawnAttachments = spawnAttachments,
                 MaxScriptSpawnInstances = effectiveMaxSpawnInstances
             };
@@ -1220,6 +1232,7 @@ public sealed class SceneGlbExportService
                 Path.GetFileName(fullOutputPath),
                 stats,
                 converted.SkippedLodRendererCount,
+                converted.HiddenAuxiliaryRendererCount,
                 converted.AttachedScriptSpawnCount,
                 writtenManifestPath);
 
@@ -1232,6 +1245,7 @@ public sealed class SceneGlbExportService
                 SceneName = options.SceneName,
                 RootGameObjectCount = rootGameObjects.Count,
                 SkippedLodRendererCount = converted.SkippedLodRendererCount,
+                HiddenAuxiliaryRendererCount = converted.HiddenAuxiliaryRendererCount,
                 AttachedScriptSpawnCount = converted.AttachedScriptSpawnCount,
                 SkippedInactiveObjectCount = skippedInactiveObjects,
                 Stats = stats,
@@ -1460,6 +1474,8 @@ public sealed class SceneGlbExportService
                 IncludeInactive = options.IncludeInactive,
                 LodMode = options.LodMode.ToString(),
                 ExportCamerasAndLights = options.ExportCamerasAndLights,
+                HideAuxiliaryAndShadowOnlyRenderers = options.HideAuxiliaryAndShadowOnlyRenderers,
+                PreferredStagePresetName = options.PreferredStagePresetName ?? string.Empty,
                 ResolveStaticScriptSpawns = options.ResolveStaticScriptSpawns,
                 WriteManifest = options.WriteManifest,
                 IncludeAnimations = options.IncludeAnimations,
@@ -1479,6 +1495,7 @@ public sealed class SceneGlbExportService
                 Cameras = stats.CamerasCount,
                 Lights = stats.LightsCount,
                 SkippedLodRenderers = converted.SkippedLodRendererCount,
+                HiddenAuxiliaryRenderers = converted.HiddenAuxiliaryRendererCount,
                 AttachedScriptSpawns = converted.AttachedScriptSpawnCount,
                 SkippedInactiveObjects = skippedInactiveObjects
             },
@@ -1494,6 +1511,7 @@ public sealed class SceneGlbExportService
         string outputFileName,
         GltfExportStatistics stats,
         int skippedLodRenderers,
+        int hiddenAuxiliaryRenderers,
         int attachedScriptSpawns,
         string? manifestPath)
     {
@@ -1510,6 +1528,10 @@ public sealed class SceneGlbExportService
         if (skippedLodRenderers > 0)
         {
             extras.Add($"{skippedLodRenderers:N0} LOD renderer(s) filtered");
+        }
+        if (hiddenAuxiliaryRenderers > 0)
+        {
+            extras.Add($"{hiddenAuxiliaryRenderers:N0} proxy/shadow node(s) hidden");
         }
         if (attachedScriptSpawns > 0)
         {
@@ -2027,12 +2049,110 @@ public sealed class SceneGlbExportService
         return score;
     }
 
+    public static bool IsAutoStagePresetSelection(string? preferredPresetName)
+    {
+        if (string.IsNullOrWhiteSpace(preferredPresetName))
+        {
+            return true;
+        }
+
+        var trimmed = preferredPresetName.Trim();
+        return trimmed.Equals("Auto", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Equals("Auto (Day / Normal)", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Equals("Auto (Default)", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static int ScoreStagePresetName(string? nameOrSuffix, string? preferredPresetName)
+    {
+        return ScoreStagePresetName(nameOrSuffix, nameOrSuffix, preferredPresetName, out _);
+    }
+
+    private static int ScoreStagePresetName(
+        string? fullName,
+        string? suffix,
+        string? preferredPresetName,
+        out bool matchedPreferred)
+    {
+        matchedPreferred = false;
+        var baseScore = ScoreStagePresetName(suffix);
+        if (IsAutoStagePresetSelection(preferredPresetName))
+        {
+            return baseScore;
+        }
+
+        var wanted = preferredPresetName!.Trim();
+        var candidateFull = fullName?.Trim() ?? string.Empty;
+        var candidateSuffix = suffix?.Trim() ?? string.Empty;
+
+        if ((!string.IsNullOrEmpty(candidateFull) && candidateFull.Equals(wanted, StringComparison.OrdinalIgnoreCase))
+            || (!string.IsNullOrEmpty(candidateSuffix) && candidateSuffix.Equals(wanted, StringComparison.OrdinalIgnoreCase)))
+        {
+            matchedPreferred = true;
+            return 10000 + baseScore;
+        }
+
+        var wantedTokens = wanted.Split(new[] { '_', '-', ' ', '.', '/' }, StringSplitOptions.RemoveEmptyEntries);
+        if (wantedTokens.Length == 0)
+        {
+            return baseScore;
+        }
+
+        var candidateTokens = (!string.IsNullOrEmpty(candidateSuffix) ? candidateSuffix : candidateFull)
+            .Split(new[] { '_', '-', ' ', '.', '/' }, StringSplitOptions.RemoveEmptyEntries);
+
+        var exactMatches = 0;
+        var substringMatches = 0;
+        for (var i = 0; i < wantedTokens.Length; i++)
+        {
+            var wt = wantedTokens[i];
+            var foundExact = false;
+            var foundSub = false;
+            for (var c = 0; c < candidateTokens.Length; c++)
+            {
+                if (candidateTokens[c].Equals(wt, StringComparison.OrdinalIgnoreCase))
+                {
+                    foundExact = true;
+                    break;
+                }
+                if (candidateTokens[c].Contains(wt, StringComparison.OrdinalIgnoreCase))
+                {
+                    foundSub = true;
+                }
+            }
+
+            if (foundExact)
+            {
+                exactMatches++;
+            }
+            else if (foundSub || candidateFull.Contains(wt, StringComparison.OrdinalIgnoreCase))
+            {
+                substringMatches++;
+            }
+        }
+
+        var totalMatched = exactMatches + substringMatches;
+        if (totalMatched == wantedTokens.Length)
+        {
+            matchedPreferred = true;
+            return 5000 + exactMatches * 250 + substringMatches * 100 + baseScore;
+        }
+
+        if (totalMatched > 0)
+        {
+            matchedPreferred = true;
+            return exactMatches * 400 + substringMatches * 150 + baseScore;
+        }
+
+        return baseScore;
+    }
+
     public static List<SceneScriptSpawnAttachment> ResolveCompanionStagePresetAttachments(
         IReadOnlyList<GameObject> sceneRootGameObjects,
         IReadOnlyList<(string StageStem, IReadOnlyList<SerializedFile> CompanionFiles)> stageCompanionGroups,
         AssemblyLoader? assemblyLoader = null,
         CancellationToken cancellationToken = default,
-        Func<MonoBehaviour, OrderedDictionary?>? customFieldProvider = null)
+        Func<MonoBehaviour, OrderedDictionary?>? customFieldProvider = null,
+        string? preferredStagePresetName = null)
     {
         var attachments = new List<SceneScriptSpawnAttachment>();
         if (sceneRootGameObjects == null || sceneRootGameObjects.Count == 0 || stageCompanionGroups == null || stageCompanionGroups.Count == 0)
@@ -2393,7 +2513,8 @@ public sealed class SceneGlbExportService
                         && mb.m_Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                     {
                         var suffix = mb.m_Name.Substring(prefix.Length);
-                        candidatePresets.Add((mb, ScoreStagePresetName(suffix)));
+                        var score = ScoreStagePresetName(mb.m_Name, suffix, preferredStagePresetName, out _);
+                        candidatePresets.Add((mb, score));
                     }
                 }
 
@@ -2442,8 +2563,8 @@ public sealed class SceneGlbExportService
                         var suffix = rName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
                             ? rName.Substring(prefix.Length)
                             : rName;
-                        var score = ScoreStagePresetName(suffix);
-                        if (score < -50)
+                        var score = ScoreStagePresetName(rName, suffix, preferredStagePresetName, out var matchedPreferred);
+                        if (!matchedPreferred && score < -50)
                         {
                             continue;
                         }

@@ -18,6 +18,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AssetStudio.Avalonia", "Ass
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AssetStudio.Tests", "AssetStudio.Tests\AssetStudio.Tests.csproj", "{3577804E-AD36-4BB0-8C8F-5229585D921B}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AssetStudio.CLI", "AssetStudio.CLI\AssetStudio.CLI.csproj", "{70751B2B-53B6-45B6-A87A-C8F334106838}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -100,6 +102,18 @@ Global
 		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|x64.Build.0 = Release|Any CPU
 		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|x86.ActiveCfg = Release|Any CPU
 		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|x86.Build.0 = Release|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Debug|x64.Build.0 = Debug|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Debug|x86.Build.0 = Debug|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Release|Any CPU.Build.0 = Release|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Release|x64.ActiveCfg = Release|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Release|x64.Build.0 = Release|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Release|x86.ActiveCfg = Release|Any CPU
+		{70751B2B-53B6-45B6-A87A-C8F334106838}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

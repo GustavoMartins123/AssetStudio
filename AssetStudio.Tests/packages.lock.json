@@ -404,6 +404,13 @@
           "OpenTK": "[4.8.2, )"
         }
       },
+      "assetstudio.cli": {
+        "type": "Project",
+        "dependencies": {
+          "AssetStudio": "[0.17.1, )",
+          "AssetStudioUtility": "[0.17.1, )"
+        }
+      },
       "assetstudioutility": {
         "type": "Project",
         "dependencies": {

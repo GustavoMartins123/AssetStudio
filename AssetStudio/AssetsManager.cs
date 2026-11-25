@@ -2865,6 +2865,8 @@ namespace AssetStudio
                     return new TextAsset(objectReader);
                 case ClassIDType.Texture2D:
                     return new Texture2D(objectReader);
+                case ClassIDType.Texture2DArray:
+                    return new Texture2DArray(objectReader);
                 case ClassIDType.Cubemap when objectReader.version is [5, 3, ..] or [2019, 3, ..]:
                     return new Cubemap(objectReader);
                 case ClassIDType.Transform:

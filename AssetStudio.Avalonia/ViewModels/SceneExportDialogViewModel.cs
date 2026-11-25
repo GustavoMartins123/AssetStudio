@@ -21,6 +21,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool IsPreselected { get; init; }
         public int GameObjectCount { get; init; } = -1;
         public int RendererCount { get; init; } = -1;
+        public IReadOnlyList<string> AvailableStagePresets { get; init; } = Array.Empty<string>();
     }
 
     public sealed class SceneExportDialogRequest
@@ -140,10 +141,21 @@ namespace AssetStudio.Avalonia.ViewModels
 
     public sealed class SceneExportDialogViewModel : ViewModelBase
     {
+        public const string AutoStagePresetLabel = "Auto (Day / Normal)";
+
         private static readonly string[] LodModeChoices =
         {
             "LOD0 Only (Recommended)",
             "All LODs"
+        };
+
+        private static readonly string[] DefaultStagePresetSuggestions =
+        {
+            "Noon",
+            "Morning",
+            "Evening",
+            "Night",
+            "Rain"
         };
 
         private readonly List<SceneSelectionItemViewModel> _allScenes;
@@ -157,6 +169,8 @@ namespace AssetStudio.Avalonia.ViewModels
         private SceneLodExportMode _lodMode;
         private bool _includeInactive;
         private bool _exportCamerasAndLights;
+        private bool _hideAuxiliaryAndShadowOnlyRenderers;
+        private string _preferredStagePresetName = string.Empty;
         private bool _resolveStaticScriptSpawns;
         private bool _writeManifest;
 
@@ -175,6 +189,8 @@ namespace AssetStudio.Avalonia.ViewModels
             _lodMode = initial.LodMode;
             _includeInactive = initial.IncludeInactive;
             _exportCamerasAndLights = initial.ExportCamerasAndLights;
+            _hideAuxiliaryAndShadowOnlyRenderers = initial.HideAuxiliaryAndShadowOnlyRenderers;
+            _preferredStagePresetName = initial.PreferredStagePresetName?.Trim() ?? string.Empty;
             _resolveStaticScriptSpawns = initial.ResolveStaticScriptSpawns;
             _writeManifest = initial.WriteManifest;
 
@@ -193,6 +209,8 @@ namespace AssetStudio.Avalonia.ViewModels
             }
 
             FilteredScenes = new ObservableCollection<SceneSelectionItemViewModel>(_allScenes);
+            StagePresetOptions = new ObservableCollection<string>();
+            RefreshStagePresetOptions();
 
             _confirmCommand = new RelayCommand(Confirm, () => HasSelection);
             _cancelCommand = new RelayCommand(Cancel);
@@ -212,6 +230,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public ObservableCollection<SceneSelectionItemViewModel> FilteredScenes { get; }
 
         public IReadOnlyList<string> LodModeOptions => LodModeChoices;
+
+        public ObservableCollection<string> StagePresetOptions { get; }
 
         public string SearchText
         {
@@ -255,6 +275,56 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             get => _exportCamerasAndLights;
             set => SetProperty(ref _exportCamerasAndLights, value);
+        }
+
+        public bool HideAuxiliaryAndShadowOnlyRenderers
+        {
+            get => _hideAuxiliaryAndShadowOnlyRenderers;
+            set => SetProperty(ref _hideAuxiliaryAndShadowOnlyRenderers, value);
+        }
+
+        public string PreferredStagePresetName
+        {
+            get => _preferredStagePresetName;
+            set
+            {
+                var normalized = value ?? string.Empty;
+                if (SetProperty(ref _preferredStagePresetName, normalized))
+                {
+                    OnPropertyChanged(nameof(SelectedStagePresetIndex));
+                }
+            }
+        }
+
+        public int SelectedStagePresetIndex
+        {
+            get
+            {
+                var trimmed = _preferredStagePresetName.Trim();
+                if (string.IsNullOrEmpty(trimmed) || SceneGlbExportService.IsAutoStagePresetSelection(trimmed))
+                {
+                    return 0;
+                }
+
+                for (var i = 1; i < StagePresetOptions.Count; i++)
+                {
+                    if (string.Equals(StagePresetOptions[i], trimmed, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return i;
+                    }
+                }
+
+                return -1;
+            }
+            set
+            {
+                if (value < 0 || value >= StagePresetOptions.Count)
+                {
+                    return;
+                }
+
+                PreferredStagePresetName = value == 0 ? string.Empty : StagePresetOptions[value];
+            }
         }
 
         public bool ResolveStaticScriptSpawns
@@ -312,6 +382,8 @@ namespace AssetStudio.Avalonia.ViewModels
                 IncludeInactive = IncludeInactive,
                 LodMode = LodMode,
                 ExportCamerasAndLights = ExportCamerasAndLights,
+                HideAuxiliaryAndShadowOnlyRenderers = HideAuxiliaryAndShadowOnlyRenderers,
+                PreferredStagePresetName = PreferredStagePresetName.Trim(),
                 ResolveStaticScriptSpawns = ResolveStaticScriptSpawns,
                 WriteManifest = WriteManifest
             };
@@ -376,11 +448,73 @@ namespace AssetStudio.Avalonia.ViewModels
 
         private void OnItemSelectionChanged()
         {
+            RefreshStagePresetOptions();
             OnPropertyChanged(nameof(SelectedCount));
             OnPropertyChanged(nameof(HasSelection));
             OnPropertyChanged(nameof(SelectionSummaryText));
             _confirmCommand.NotifyCanExecuteChanged();
             _clearSelectionCommand.NotifyCanExecuteChanged();
+        }
+
+        private void RefreshStagePresetOptions()
+        {
+            var desired = new List<string> { AutoStagePresetLabel };
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { AutoStagePresetLabel };
+
+            var selected = _allScenes.Where(static s => s.IsSelected).ToList();
+            var sourceScenes = selected.Count > 0 ? selected : _allScenes;
+            for (var i = 0; i < sourceScenes.Count; i++)
+            {
+                var presets = sourceScenes[i].Candidate.AvailableStagePresets;
+                if (presets == null)
+                {
+                    continue;
+                }
+
+                for (var p = 0; p < presets.Count; p++)
+                {
+                    var preset = presets[p]?.Trim();
+                    if (!string.IsNullOrEmpty(preset) && seen.Add(preset))
+                    {
+                        desired.Add(preset);
+                    }
+                }
+            }
+
+            for (var i = 0; i < DefaultStagePresetSuggestions.Length; i++)
+            {
+                var suggestion = DefaultStagePresetSuggestions[i];
+                if (seen.Add(suggestion))
+                {
+                    desired.Add(suggestion);
+                }
+            }
+
+            if (StagePresetOptions.Count == desired.Count)
+            {
+                var identical = true;
+                for (var i = 0; i < desired.Count; i++)
+                {
+                    if (!string.Equals(StagePresetOptions[i], desired[i], StringComparison.Ordinal))
+                    {
+                        identical = false;
+                        break;
+                    }
+                }
+
+                if (identical)
+                {
+                    return;
+                }
+            }
+
+            StagePresetOptions.Clear();
+            for (var i = 0; i < desired.Count; i++)
+            {
+                StagePresetOptions.Add(desired[i]);
+            }
+
+            OnPropertyChanged(nameof(SelectedStagePresetIndex));
         }
 
         private void Confirm()

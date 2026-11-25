@@ -6,9 +6,9 @@
         x:DataType="vm:SceneExportDialogViewModel"
         Title="{Binding DialogTitle}"
         Width="660"
-        Height="640"
-        MinWidth="520"
-        MinHeight="500"
+        Height="700"
+        MinWidth="540"
+        MinHeight="560"
         WindowStartupLocation="CenterOwner">
 
     <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" Margin="14" RowSpacing="10">
@@ -126,6 +126,23 @@
                               SelectedIndex="{Binding SelectedLodModeIndex, Mode=TwoWay}" />
                 </StackPanel>
 
+                <Grid ColumnDefinitions="110,180,*" ColumnSpacing="10">
+                    <TextBlock Grid.Column="0"
+                               Text="Stage Preset"
+                               VerticalAlignment="Center" />
+                    <ComboBox Grid.Column="1"
+                              ItemsSource="{Binding StagePresetOptions}"
+                              SelectedIndex="{Binding SelectedStagePresetIndex, Mode=TwoWay}"
+                              ToolTip.Tip="Optional companion stage preset (e.g. Noon, Evening, Night). Leave on Auto (Day / Normal) for default daytime selection." />
+                    <TextBox Grid.Column="2"
+                             PlaceholderText="Auto (Day / Normal) or custom preset..."
+                             Text="{Binding PreferredStagePresetName, Mode=TwoWay}"
+                             ToolTip.Tip="Optional stage preset name or keyword filter (e.g. Night, Evening, Rain, or exact preset suffix). Empty = Auto Day/Normal." />
+                </Grid>
+
+                <CheckBox Content="Hide shadow-only &amp; collision proxy meshes (KHR_node_visibility)"
+                          IsChecked="{Binding HideAuxiliaryAndShadowOnlyRenderers, Mode=TwoWay}"
+                          ToolTip.Tip="Keeps ShadowsOnly, invisible-shader, and untextured collider/navigation proxy GameObjects and meshes intact in the glTF hierarchy while marking them hidden by default via KHR_node_visibility." />
                 <CheckBox Content="Include inactive objects"
                           IsChecked="{Binding IncludeInactive, Mode=TwoWay}" />
                 <CheckBox Content="Export cameras &amp; lights (glTF)"

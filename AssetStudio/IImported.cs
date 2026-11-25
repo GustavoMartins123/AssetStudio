@@ -111,6 +111,8 @@ namespace AssetStudio
         public Vector3 LocalScale { get; set; }
         public ImportedFrame? Parent { get; set; }
         public ImportedFrameExtras? Extras { get; set; }
+        public bool IsInitiallyHidden { get; set; }
+        public string? HiddenReason { get; set; }
 
         private List<ImportedFrame> children;
 
@@ -293,6 +295,19 @@ namespace AssetStudio
         public Matrix4x4 Matrix { get; set; }
     }
 
+    public sealed class ImportedUnityShaderMetadata
+    {
+        public string ShaderName { get; set; } = string.Empty;
+        public string Classification { get; set; } = string.Empty;
+        public int? RenderQueue { get; set; }
+        public string? RenderType { get; set; }
+        public List<string> Keywords { get; set; } = new List<string>();
+        public Dictionary<string, float> FloatProperties { get; set; } = new Dictionary<string, float>(StringComparer.Ordinal);
+        public Dictionary<string, float[]> ColorProperties { get; set; } = new Dictionary<string, float[]>(StringComparer.Ordinal);
+        public Dictionary<string, string> TextureProperties { get; set; } = new Dictionary<string, string>(StringComparer.Ordinal);
+        public Dictionary<string, string> Tags { get; set; } = new Dictionary<string, string>(StringComparer.Ordinal);
+    }
+
     public class ImportedMaterial
     {
         public string Name { get; set; } = string.Empty;
@@ -310,7 +325,11 @@ namespace AssetStudio
         public float? SurfaceMode { get; set; }
         public float? BumpScale { get; set; }
         public float? OcclusionStrength { get; set; }
+        public float? TransmissionFactor { get; set; }
+        public float? Ior { get; set; }
+        public bool IsUnlit { get; set; }
         public bool DoubleSided { get; set; }
+        public ImportedUnityShaderMetadata? UnityShaderMetadata { get; set; }
         public List<ImportedMaterialTexture> Textures { get; set; } = new List<ImportedMaterialTexture>();
     }
 
