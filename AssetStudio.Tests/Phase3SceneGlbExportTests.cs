@@ -258,14 +258,14 @@ namespace AssetStudio.Tests
             Assert.Equal(1, subtreeCalls);
         }
 
-        [Fact]
+        [SkippableFact]
         public void SceneGlbExportService_OptionalLocalSceneFile_ExportsValidInstancedGlbWhenConfigured()
         {
             var levelPath = Environment.GetEnvironmentVariable("ASSETSTUDIO_TEST_SCENE_FILE");
             if (string.IsNullOrWhiteSpace(levelPath) || !File.Exists(levelPath))
             {
                 _output.WriteLine("Skipping optional external scene file test (ASSETSTUDIO_TEST_SCENE_FILE not set).");
-                return;
+                throw new SkipException("Set ASSETSTUDIO_TEST_SCENE_FILE to an existing scene file to run this test.");
             }
 
             var tempDir = CreateTempDirectory();

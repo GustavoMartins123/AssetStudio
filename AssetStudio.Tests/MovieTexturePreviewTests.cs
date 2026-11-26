@@ -334,7 +334,7 @@ namespace AssetStudio.Tests
             Assert.Equal(typeof(bool), parameters[10].ParameterType);
         }
 
-        [Fact]
+        [SkippableFact]
         public void RealGameReadOnlyProbe_AnimaGateOfMemories_ChecksMovieTextureAndEmbeddedAviVideo()
         {
             var sourceDbPath = Path.Combine(
@@ -347,7 +347,7 @@ namespace AssetStudio.Tests
             if (!File.Exists(sourceDbPath) || !Directory.Exists(gameDataDir))
             {
                 _output.WriteLine("Skipping real-game read-only MovieTexture check (Anima Gate of Memories DB/game folder not present).");
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             using var conn = new SqliteConnection($"Data Source={sourceDbPath};Mode=ReadOnly;Pooling=False");

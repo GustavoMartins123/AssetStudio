@@ -324,14 +324,14 @@ namespace AssetStudio.Tests
         // Real Unity Corpus Read-Only Verification (Anima: Gate of Memories)
         // ------------------------------------------------------------------
 
-        [Fact]
+        [SkippableFact]
         public void GltfExporter_RealUnityModel_AnimaGateOfMemories_ValidatesGlbAndGltfCleanly()
         {
             const string resPath = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\resources.assets";
             if (!File.Exists(resPath))
             {
                 _output.WriteLine("Skipping real-game glTF test (Anima Gate of Memories resources.assets not present on this host).");
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var tempDir = CreateTempDirectory("GltfRealUnity");
@@ -741,14 +741,14 @@ namespace AssetStudio.Tests
         // Headless Blender 5.x Roundtrip Validation Tests
         // ------------------------------------------------------------------
 
-        [Fact]
+        [SkippableFact]
         public void GltfExporter_BlenderHeadlessRoundtrip_SyntheticFullFidelity_ValidatesGeometryMaterialsSkinningMorphsAndAnimations()
         {
             var blenderExe = TryLocateBlenderExecutable();
             if (blenderExe == null)
             {
                 _output.WriteLine("Skipping headless Blender roundtrip test (Blender executable not found via ASSETSTUDIO_BLENDER_EXE, PATH, or SteamLibrary).");
-                return;
+                throw new SkipException("Blender was not found (set ASSETSTUDIO_BLENDER_EXE or put blender on PATH).");
             }
 
             var tempDir = CreateTempDirectory("GltfBlenderSynth");
@@ -1035,21 +1035,21 @@ namespace AssetStudio.Tests
             }
         }
 
-        [Fact]
+        [SkippableFact]
         public void GltfExporter_BlenderHeadlessRoundtrip_RealUnityModels_ValidatesRiggedAnimatedCharacters()
         {
             var blenderExe = TryLocateBlenderExecutable();
             if (blenderExe == null)
             {
                 _output.WriteLine("Skipping real-game Blender roundtrip test (Blender executable not found).");
-                return;
+                throw new SkipException("Blender was not found (set ASSETSTUDIO_BLENDER_EXE or put blender on PATH).");
             }
 
             const string resPath = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\resources.assets";
             if (!File.Exists(resPath))
             {
                 _output.WriteLine("Skipping real-game Blender roundtrip test (Anima Gate of Memories resources.assets not present on this host).");
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var tempDir = CreateTempDirectory("GltfBlenderRealUnity");

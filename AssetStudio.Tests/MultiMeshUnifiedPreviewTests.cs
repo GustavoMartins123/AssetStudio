@@ -667,13 +667,13 @@ namespace AssetStudio.Tests
             }
         }
 
-        [Fact]
+        [SkippableFact]
         public void RealGameReadOnly_AnimaGateOfMemories_MultiPartSkinnedMarionette_AndRigid63LinkChainAvatar_AssembleAndAnimateCleanly()
         {
             if (!Directory.Exists(AnimaGameDataDir))
             {
                 _output.WriteLine($"Skipping real-game test: '{AnimaGameDataDir}' not present.");
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var resourcesPath = Path.Combine(AnimaGameDataDir, "resources.assets");

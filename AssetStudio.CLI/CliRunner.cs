@@ -546,6 +546,8 @@ namespace AssetStudio.CLI
             var requestedTypes = new HashSet<ClassIDType>();
             ImageFormat imageFormat = ImageFormat.Png;
             bool dryRun = false;
+            ModelExportFormat modelFormat = ModelExportFormat.Glb;
+            string? assembliesDir = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -566,6 +568,12 @@ namespace AssetStudio.CLI
 
                     foreach (var token in typeVal!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                     {
+                        if (string.Equals(token, "all", StringComparison.OrdinalIgnoreCase))
+                        {
+                            requestedTypes.UnionWith(CliAssetExporter.AllTypes);
+                            continue;
+                        }
+
                         if (!TryParseExportableType(token, stderr, out var exportType))
                         {
                             return ExitInvalidArguments;
@@ -582,6 +590,25 @@ namespace AssetStudio.CLI
                 {
                     if (!TryReadOptionValue(args, ref i, "--image-format", stderr, out string? imgVal)
                         || !TryParseImageFormat(imgVal!, stderr, out imageFormat))
+                    {
+                        return ExitInvalidArguments;
+                    }
+                }
+                else if (string.Equals(arg, "--model-format", StringComparison.Ordinal))
+                {
+                    if (!TryReadOptionValue(args, ref i, "--model-format", stderr, out string? modelVal))
+                    {
+                        return ExitInvalidArguments;
+                    }
+
+                    if (!CliAssetExporter.TryParseModelFormat(modelVal!, out modelFormat))
+                    {
+                        return InvalidArg(stderr, $"Unsupported model format '{modelVal}'. Supported: glb, gltf, fbx.");
+                    }
+                }
+                else if (string.Equals(arg, "--assemblies", StringComparison.Ordinal))
+                {
+                    if (!TryReadOptionValue(args, ref i, "--assemblies", stderr, out assembliesDir))
                     {
                         return ExitInvalidArguments;
                     }
@@ -642,9 +669,15 @@ namespace AssetStudio.CLI
 
                 var pathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
                 var reservedPaths = new HashSet<string>(pathComparer);
+                var extraExporter = new CliAssetExporter(
+                    assetsManager,
+                    new CliExportSettings { ImageFormat = imageFormat, ModelFormat = modelFormat, AssembliesDirectory = assembliesDir, DryRun = dryRun },
+                    stdout,
+                    stderr);
 
                 int exportedCount = 0;
                 int skippedCount = 0;
+                int failedCount = 0;
 
                 foreach (var handle in handles)
                 {
@@ -784,14 +817,33 @@ namespace AssetStudio.CLI
                             break;
                         }
                         default:
-                            skippedCount++;
+                        {
+                            try
+                            {
+                                int written = extraExporter.Export(handle, obj, fullOutputRoot, baseName, reservedPaths);
+                                if (written > 0)
+                                {
+                                    exportedCount += written;
+                                }
+                                else
+                                {
+                                    skippedCount++;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                failedCount++;
+                                stderr.WriteLine($"Failed: {handle.Type} {handle.PathID} ({baseName}): {ex.Message}");
+                            }
                             break;
+                        }
                     }
                 }
 
+                string failedSuffix = failedCount > 0 ? $", {failedCount} failed" : string.Empty;
                 stdout.WriteLine(dryRun
-                    ? $"Dry-run complete: {exportedCount} planned, {skippedCount} skipped."
-                    : $"Export complete: {exportedCount} exported, {skippedCount} skipped.");
+                    ? $"Dry-run complete: {exportedCount} planned, {skippedCount} skipped{failedSuffix}."
+                    : $"Export complete: {exportedCount} exported, {skippedCount} skipped{failedSuffix}.");
                 return ExitSuccess;
             }
             catch (Exception ex)
@@ -1134,8 +1186,12 @@ namespace AssetStudio.CLI
                     classId = ClassIDType.Mesh;
                     return true;
                 default:
-                    classId = ClassIDType.UnknownType;
-                    stderr.WriteLine($"Error: unsupported export type '{raw}'. Supported: Texture2D, Texture2DArray, TextAsset, Mesh.");
+                    if (CliAssetExporter.TryParseType(raw, out classId))
+                    {
+                        return true;
+                    }
+
+                    stderr.WriteLine($"Error: unsupported export type '{raw}'. Supported: {CliAssetExporter.SupportedTypeList}.");
                     return false;
             }
         }
@@ -1184,7 +1240,8 @@ namespace AssetStudio.CLI
             writer.WriteLine("  AssetStudio.CLI scan <path> [--format text|json|jsonl|csv]");
             writer.WriteLine("  AssetStudio.CLI list <path> [--type <ClassID>] [--filter <substring>] [--format text|json|jsonl|csv]");
             writer.WriteLine("  AssetStudio.CLI inspect <path> --path-id <id> [--file <name>] [--format text|json]");
-            writer.WriteLine("  AssetStudio.CLI export <path> --output <dir> [--type Texture2D|Texture2DArray|TextAsset|Mesh] [--image-format png|webp|tga|jpeg] [--dry-run]");
+            writer.WriteLine("  AssetStudio.CLI export <path> --output <dir> [--type <type>[,<type>...]|all] [--image-format png|webp|tga|jpeg|bmp] [--model-format glb|gltf|fbx] [--assemblies <Managed folder>] [--dry-run]");
+            writer.WriteLine($"      export types: {CliAssetExporter.SupportedTypeList} (default: Texture2D, Texture2DArray, TextAsset, Mesh)");
         }
     }
 }

@@ -739,14 +739,14 @@ public class TextAssetBinaryFormatTests
         Assert.Contains("MJPG", descriptor.FormatLabel, StringComparison.Ordinal);
     }
 
-    [Fact]
+    [SkippableFact]
     public void RealGame_AnimaGateOfMemories_IntroLogos1080Avi_DetectsAviMjpg1080pUnder50Ms()
     {
         const string sharedAssetsPath = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\sharedassets0.assets";
         if (!File.Exists(sharedAssetsPath))
         {
             _output.WriteLine("Skipping real-game Anima Gate of Memories test (sharedassets0.assets not present on this host).");
-            return;
+            throw new SkipException("Local game files are not installed on this machine.");
         }
 
         // Strictly READ-ONLY open of sharedassets0.assets to read PathID 60 (intrologos1080.avi, 65,514,654 bytes)

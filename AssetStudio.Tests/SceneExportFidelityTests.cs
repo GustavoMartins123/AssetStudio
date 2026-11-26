@@ -770,13 +770,13 @@ namespace AssetStudio.Tests
         // 7. Headless Blender 5.x Roundtrip: KHR_node_visibility + Water PBR + Unlit
         // =====================================================================
 
-        [Fact]
+        [SkippableFact]
         public void BlenderHeadlessRoundtrip_KhrNodeVisibilityWaterTransmissionIorAndUnlit_ImportCleanly()
         {
             var blenderExe = TryLocateBlenderExecutable();
             if (blenderExe == null)
             {
-                return;
+                throw new SkipException("Blender was not found (set ASSETSTUDIO_BLENDER_EXE or put blender on PATH).");
             }
 
             var tempRoot = CreateTempDirectory("scene_fidelity_blender");

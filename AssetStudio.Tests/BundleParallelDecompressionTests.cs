@@ -535,13 +535,13 @@ namespace AssetStudio.Tests
             }
         }
 
-        [Fact]
+        [SkippableFact]
         public void RealGameBundle_Othercide_IfAvailable_ParallelAndSequentialMatchByteForByte()
         {
             const string othercideRoot = @"H:\SteamLibrary\steamapps\common\Othercide";
             if (!Directory.Exists(othercideRoot))
             {
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             string? targetBundle = Directory
@@ -552,7 +552,7 @@ namespace AssetStudio.Tests
 
             if (string.IsNullOrEmpty(targetBundle) || !File.Exists(targetBundle))
             {
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             byte[][] parallelPayloads;

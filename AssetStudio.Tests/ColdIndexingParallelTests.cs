@@ -317,13 +317,13 @@ namespace AssetStudio.Tests
                 $"seq={seqSw.Elapsed.TotalMilliseconds:0.##} ms, par={parSw.Elapsed.TotalMilliseconds:0.##} ms");
         }
 
-        [Fact]
+        [SkippableFact]
         public void OthercideRealBundles_ParallelMultiFileSemanticExtraction_MatchesSequentialParityAndMeasuresSpeedup()
         {
             if (!Directory.Exists(OthercideBundlesDir))
             {
                 _output.WriteLine($"Othercide directory not present at '{OthercideBundlesDir}'; skipping guarded read-only benchmark.");
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var sampleBundles = Directory.GetFiles(OthercideBundlesDir, "*.bundle", SearchOption.TopDirectoryOnly)

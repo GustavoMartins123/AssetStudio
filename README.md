@@ -10,12 +10,18 @@ This update is an independent community maintenance effort. Its purpose is to ke
 
 AssetStudio is a tool for exploring, extracting and exporting assets and AssetBundles.
 
-For a plain-language overview of what is currently supported, known limits, and features still under study, see [`SUPPORTED_FEATURES.md`](SUPPORTED_FEATURES.md).
+For a plain-language overview of what is currently supported, known limits, and features still under study, see [`SUPPORTED_FEATURES.md`](SUPPORTED_FEATURES.md). It also marks which features are in the latest release (`v0.20.0`) and which are only in the `main` branch so far.
+
+More details:
+
+* [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md): which Unity versions, build types and platforms are verified, and how.
+* [`docs/EXPORT_FORMATS.md`](docs/EXPORT_FORMATS.md): what each export format keeps and what it loses.
+* [`docs/CLI.md`](docs/CLI.md): the command-line tool.
 
 ## Features
 
 * Supported Unity versions:
-  * 3.4 – 6000.5 (Mono and IL2CPP)
+  * 3.4 – 6000.5 (Mono and IL2CPP) on `main`; release `v0.20.0` reads up to 6000.4. See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for what is verified per version.
 * Supported asset types:
   * **Texture2D**: convert to `png`, `tga`, `jpeg`, `bmp`, with preview and color channel toggles.
   * **Sprite**: crop `Texture2D` / `SpriteAtlas` to `png`, `tga`, `jpeg`, `bmp`.
@@ -135,10 +141,22 @@ When you select an asset of the `MonoBehaviour` type for the first time, AssetSt
 
 Generate dummy DLLs with [Il2CppDumper by Perfare](https://github.com/Perfare/Il2CppDumper), then select the generated dummy DLL folder when prompted for the assembly directory.
 
+### Command line
+
+`AssetStudio.CLI` (in `main`, packaged from the next release) scans, lists, inspects and exports assets without the GUI:
+
+```bash
+AssetStudio.CLI list "D:\Games\My Game\Game_Data" --type Texture2D --format csv
+AssetStudio.CLI export "D:\Games\My Game\Game_Data" --output out --type all
+```
+
+See [`docs/CLI.md`](docs/CLI.md) for every command, export type, option and exit code.
+
 ### Limitations
 
 * Games using encrypted `.assets` headers, proprietary encrypted container formats, or modified engine formats without TypeTrees are not supported out of the box.
 * Audio and video stored in third-party middleware banks (such as FMOD `.bank`, Wwise `.bnk`/`.wem`, or CRIWARE `.acb`/`.awb`/`.usm`) outside Unity assets are not extracted.
+* What each export format keeps and loses is listed in [`docs/EXPORT_FORMATS.md`](docs/EXPORT_FORMATS.md).
 
 ## Build
 

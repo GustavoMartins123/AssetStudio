@@ -19,7 +19,7 @@
                 BorderThickness="1"
                 CornerRadius="6"
                 Padding="12,10">
-            <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="110,*,Auto,Auto" RowSpacing="8" ColumnSpacing="8">
+            <Grid RowDefinitions="Auto,Auto,Auto" ColumnDefinitions="110,*,Auto,Auto" RowSpacing="8" ColumnSpacing="8">
                 <TextBlock Grid.Row="0" Grid.Column="0"
                            Text="Baseline Folder"
                            VerticalAlignment="Center"
@@ -52,6 +52,10 @@
                         Content="Cancel"
                         MinWidth="96"
                         Command="{Binding CancelDiffCommand}" />
+
+                <CheckBox Grid.Row="2" Grid.Column="1"
+                          Content="Verify content (compare the real bytes of files and assets; slower)"
+                          IsChecked="{Binding VerifyContent, Mode=TwoWay}" />
             </Grid>
         </Border>
 

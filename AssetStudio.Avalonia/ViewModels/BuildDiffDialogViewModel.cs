@@ -65,6 +65,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private int _selectedChangeFilterIndex;
         private BuildDiffViewMode _viewMode = BuildDiffViewMode.Assets;
         private bool _hideUnchanged;
+        private bool _verifyContent;
         private bool _isRunning;
         private string _statusText = "Choose a baseline folder and a target folder, then click Run Diff.";
         private string _summaryBadgeText = "No diff run yet";
@@ -229,6 +230,12 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
+        public bool VerifyContent
+        {
+            get => _verifyContent;
+            set => SetProperty(ref _verifyContent, value);
+        }
+
         public bool IsRunning
         {
             get => _isRunning;
@@ -369,7 +376,8 @@ namespace AssetStudio.Avalonia.ViewModels
             var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(commandToken);
             _activeDiffCts = linkedCts;
             IsRunning = true;
-            StatusText = "Comparing builds...";
+            var contentCheck = _verifyContent ? BuildDiffContentCheck.FullContent : BuildDiffContentCheck.MetadataOnly;
+            StatusText = _verifyContent ? "Comparing builds and verifying content..." : "Comparing builds...";
 
             try
             {
@@ -387,6 +395,7 @@ namespace AssetStudio.Avalonia.ViewModels
                         target,
                         _sqliteCache,
                         _loadedBaselineIndex,
+                        contentCheck,
                         ct);
                 }, ct);
 
@@ -486,7 +495,9 @@ namespace AssetStudio.Avalonia.ViewModels
             OnPropertyChanged(nameof(HasReport));
             OnPropertyChanged(nameof(HasAssetLevelDiff));
 
-            DiagnosticBannerText = report.AssetDiffNote ?? string.Empty;
+            DiagnosticBannerText = string.IsNullOrWhiteSpace(report.ContentScopeNote)
+                ? report.AssetDiffNote ?? string.Empty
+                : $"{report.AssetDiffNote}{Environment.NewLine}{report.ContentScopeNote}";
 
             if (!report.HasAssetLevelDiff && _viewMode == BuildDiffViewMode.Assets)
             {

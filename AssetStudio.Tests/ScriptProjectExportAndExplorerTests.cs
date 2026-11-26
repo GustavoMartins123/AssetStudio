@@ -1273,28 +1273,11 @@ namespace Game.Entry
         Assert.Equal(adjacency.Count, visited);
     }
 
-    private static async Task<(int ExitCode, string StdOut, string StdErr)> RunProcessAsync(
+    private static Task<(int ExitCode, string StdOut, string StdErr)> RunProcessAsync(
         string fileName,
         string arguments,
         string workingDirectory)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = fileName,
-            Arguments = arguments,
-            WorkingDirectory = workingDirectory,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-
-        using var proc = Process.Start(psi) ?? throw new InvalidOperationException($"Failed to start {fileName}");
-        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
-        var stderrTask = proc.StandardError.ReadToEndAsync();
-        await proc.WaitForExitAsync();
-        return (proc.ExitCode, await stdoutTask, await stderrTask);
-    }
+        => TestProcessRunner.RunAsync(fileName, arguments, workingDirectory);
 
     private static string CreateTempDirectory()
     {

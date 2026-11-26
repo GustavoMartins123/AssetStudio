@@ -448,7 +448,7 @@ namespace AssetStudio.Tests
             }
         }
 
-        [Fact]
+        [SkippableFact]
         public void RealAnimaGateOfMemories_CrackingAndSampleVorbisClips_DecodeToPlayablePcmWavViaBundledFFmpeg()
         {
             string gameDataDir = Path.Combine(
@@ -463,7 +463,7 @@ namespace AssetStudio.Tests
             if (!File.Exists(sharedAssets77))
             {
                 // Portable skip when the local Steam title is not installed on CI/Linux runners.
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var tempDir = Path.Combine(Path.GetTempPath(), "as_vorbis_real_" + Guid.NewGuid().ToString("N"));

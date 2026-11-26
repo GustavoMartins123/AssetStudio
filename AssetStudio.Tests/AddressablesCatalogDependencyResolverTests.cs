@@ -367,14 +367,14 @@ namespace AssetStudio.Tests
             }
         }
 
-        [Fact]
+        [SkippableFact]
         public void ExternalBundleSmokeProbe_WhenEnvironmentVariableProvided_ResolvesExternalMaterialMainTex()
         {
             var bundlePath = Environment.GetEnvironmentVariable("ASSETSTUDIO_SMOKE_BUNDLE_PATH");
             var materialName = Environment.GetEnvironmentVariable("ASSETSTUDIO_SMOKE_MATERIAL_NAME");
             if (string.IsNullOrWhiteSpace(bundlePath) || !File.Exists(bundlePath))
             {
-                return;
+                throw new SkipException("Set ASSETSTUDIO_SMOKE_BUNDLE_PATH to an existing bundle to run this probe.");
             }
 
             var catalogDeps = AddressablesCatalogDependencyResolver.ResolveDependencies(new[] { bundlePath });

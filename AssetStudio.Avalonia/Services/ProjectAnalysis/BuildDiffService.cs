@@ -60,6 +60,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
         public long BaselineByteSize { get; init; }
         public long TargetByteSize { get; init; }
         public long SizeDelta => TargetByteSize - BaselineByteSize;
+        public bool ContentVerified { get; init; }
         public string Detail { get; init; } = string.Empty;
     }
 
@@ -71,6 +72,10 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
         public long ElapsedMs { get; init; }
         public bool HasAssetLevelDiff { get; init; }
         public string AssetDiffNote { get; init; } = string.Empty;
+        public BuildDiffContentCheck ContentCheck { get; init; }
+        public string ContentScopeNote { get; init; } = string.Empty;
+        public int ContentVerifiedAssets { get; init; }
+        public int ContentUnverifiedAssets { get; init; }
 
         public int AddedFiles { get; init; }
         public int RemovedFiles { get; init; }
@@ -104,12 +109,29 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             Converters = { new JsonStringEnumConverter() }
         };
 
+        internal const string MetadataOnlyScopeNote =
+            "Content not verified: assets were matched by name, type, size and container only, and files by size, timestamp and a sampled hash. Turn on \"Verify content\" to compare the real bytes.";
+
+        internal const string FullContentScopeNote =
+            "Content verified: files with the same size were compared byte by byte. For assets, whole source files were compared first and only files that differ were opened; each asset's own bytes plus the texture, audio, mesh and video data it streams from .resS/.resource files were compared. A changed dependency (for example a texture used by a material) is reported on that dependency, not on the assets that reference it.";
+
         public static BuildDiffReport CompareFolders(
             string baselineFolder,
             string targetFolder,
             SQLiteProjectIndexCache? sqliteCache = null,
             ProjectIndex? loadedBaselineIndex = null,
             CancellationToken ct = default)
+        {
+            return CompareFolders(baselineFolder, targetFolder, sqliteCache, loadedBaselineIndex, BuildDiffContentCheck.MetadataOnly, ct);
+        }
+
+        public static BuildDiffReport CompareFolders(
+            string baselineFolder,
+            string targetFolder,
+            SQLiteProjectIndexCache? sqliteCache,
+            ProjectIndex? loadedBaselineIndex,
+            BuildDiffContentCheck contentCheck,
+            CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(baselineFolder))
             {
@@ -143,12 +165,14 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             var filteredBaselineFiles = FilterRelevantScanFiles(baselineScan.Files, targetScan.Files);
             var filteredTargetFiles = FilterRelevantScanFiles(targetScan.Files, baselineScan.Files);
 
+            var verifyContent = contentCheck == BuildDiffContentCheck.FullContent;
             var fileEntries = DiffScannedFiles(
                 baselineScan.RootPath,
                 filteredBaselineFiles,
                 targetScan.RootPath,
                 filteredTargetFiles,
                 caseSensitive,
+                verifyContent,
                 ct,
                 out var fileCounts,
                 out var baselineBytes,
@@ -199,7 +223,8 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
 
             if (hasAssetDiff)
             {
-                assetEntries = DiffAssetSnapshotsCore(baselineSnapshots.Snapshots, targetSnapshots.Snapshots, ct, out assetCounts);
+                var verifier = verifyContent ? new BuildDiffContentVerifier(caseSensitive) : null;
+                assetEntries = DiffAssetSnapshotsCore(baselineSnapshots.Snapshots, targetSnapshots.Snapshots, verifier, ct, out assetCounts);
                 assetDiffNote = $"Asset-level diff computed: {baselineSnapshots.Snapshots.Count:N0} baseline ({baselineSnapshots.Source}) vs {targetSnapshots.Snapshots.Count:N0} target ({targetSnapshots.Source}).";
             }
             else
@@ -226,6 +251,10 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                 ElapsedMs = sw.ElapsedMilliseconds,
                 HasAssetLevelDiff = hasAssetDiff,
                 AssetDiffNote = assetDiffNote,
+                ContentCheck = contentCheck,
+                ContentScopeNote = verifyContent ? FullContentScopeNote : MetadataOnlyScopeNote,
+                ContentVerifiedAssets = assetCounts.ContentVerified,
+                ContentUnverifiedAssets = assetCounts.ContentUnverified,
                 AddedFiles = fileCounts.Added,
                 RemovedFiles = fileCounts.Removed,
                 ModifiedFiles = fileCounts.Modified,
@@ -273,6 +302,19 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             IReadOnlyList<ScannedFileInfo>? targetFiles,
             CancellationToken ct)
         {
+            return CompareAssetSnapshots(baselineLabel, baseline, targetLabel, target, baselineFiles, targetFiles, BuildDiffContentCheck.MetadataOnly, ct);
+        }
+
+        public static BuildDiffReport CompareAssetSnapshots(
+            string baselineLabel,
+            IReadOnlyList<BuildDiffAssetSnapshot> baseline,
+            string targetLabel,
+            IReadOnlyList<BuildDiffAssetSnapshot> target,
+            IReadOnlyList<ScannedFileInfo>? baselineFiles,
+            IReadOnlyList<ScannedFileInfo>? targetFiles,
+            BuildDiffContentCheck contentCheck,
+            CancellationToken ct)
+        {
             ArgumentNullException.ThrowIfNull(baseline);
             ArgumentNullException.ThrowIfNull(target);
 
@@ -285,6 +327,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             long targetBytes = 0;
             var totalBaselineFiles = 0;
             var totalTargetFiles = 0;
+            var verifyContent = contentCheck == BuildDiffContentCheck.FullContent;
 
             if (baselineFiles != null || targetFiles != null)
             {
@@ -303,13 +346,15 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                     targetRoot,
                     filteredTarget,
                     OperatingSystem.IsLinux(),
+                    verifyContent,
                     ct,
                     out fileCounts,
                     out baselineBytes,
                     out targetBytes);
             }
 
-            var assetEntries = DiffAssetSnapshotsCore(baseline, target, ct, out var assetCounts);
+            var verifier = verifyContent ? new BuildDiffContentVerifier(OperatingSystem.IsLinux()) : null;
+            var assetEntries = DiffAssetSnapshotsCore(baseline, target, verifier, ct, out var assetCounts);
             sw.Stop();
 
             return new BuildDiffReport
@@ -320,6 +365,10 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                 ElapsedMs = sw.ElapsedMilliseconds,
                 HasAssetLevelDiff = true,
                 AssetDiffNote = $"Compared {baseline.Count:N0} baseline asset(s) vs {target.Count:N0} target asset(s).",
+                ContentCheck = contentCheck,
+                ContentScopeNote = verifyContent ? FullContentScopeNote : MetadataOnlyScopeNote,
+                ContentVerifiedAssets = assetCounts.ContentVerified,
+                ContentUnverifiedAssets = assetCounts.ContentUnverified,
                 AddedFiles = fileCounts.Added,
                 RemovedFiles = fileCounts.Removed,
                 ModifiedFiles = fileCounts.Modified,
@@ -447,6 +496,12 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             sb.AppendLine($"- **Target**: `{report.TargetLabel}`");
             sb.AppendLine($"- **Generated (UTC)**: `{report.GeneratedUtc:O}`");
             sb.AppendLine($"- **Elapsed**: {report.ElapsedMs:N0} ms");
+            sb.AppendLine($"- **Content check**: {report.ContentCheck} ({report.ContentVerifiedAssets:N0} asset(s) verified, {report.ContentUnverifiedAssets:N0} not verified)");
+            if (!string.IsNullOrWhiteSpace(report.ContentScopeNote))
+            {
+                sb.AppendLine();
+                sb.AppendLine($"> {report.ContentScopeNote}");
+            }
             sb.AppendLine();
 
             sb.AppendLine("## File Diff Summary");
@@ -526,6 +581,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             string targetRoot,
             IReadOnlyList<ScannedFileInfo> targetFiles,
             bool caseSensitive,
+            bool verifyContent,
             CancellationToken ct,
             out FileDiffCounts counts,
             out long totalBaselineBytes,
@@ -610,6 +666,21 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                     diffs.Add($"Kind {baseInfo.Kind} -> {targetInfo.Kind}");
                 }
 
+                var unchangedDetail = "Unchanged (size, timestamp and sampled hash match; full content not verified)";
+                if (verifyContent && baseInfo.Size == targetInfo.Size && baseInfo.Kind == targetInfo.Kind)
+                {
+                    var timestampOnly = baseInfo.LastWriteTimeUtcTicks != targetInfo.LastWriteTimeUtcTicks;
+                    if (BuildDiffContentVerifier.FilesHaveIdenticalBytes(baseInfo.Path, targetInfo.Path, ct))
+                    {
+                        diffs.Clear();
+                        unchangedDetail = timestampOnly ? "Identical bytes (timestamp changed)" : "Identical bytes";
+                    }
+                    else if (baseInfo.ContentSampleHash == targetInfo.ContentSampleHash)
+                    {
+                        diffs.Insert(0, "Content changed (same size and sampled hash)");
+                    }
+                }
+
                 if (diffs.Count > 0)
                 {
                     counts.Modified++;
@@ -641,7 +712,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                         TargetLastWriteUtcTicks = targetInfo.LastWriteTimeUtcTicks,
                         BaselineSampleHash = baseInfo.ContentSampleHash,
                         TargetSampleHash = targetInfo.ContentSampleHash,
-                        Detail = "Unchanged"
+                        Detail = unchangedDetail
                     });
                 }
             }
@@ -682,6 +753,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
         private static List<BuildDiffAssetEntry> DiffAssetSnapshotsCore(
             IReadOnlyList<BuildDiffAssetSnapshot> baseline,
             IReadOnlyList<BuildDiffAssetSnapshot> target,
+            BuildDiffContentVerifier? verifier,
             CancellationToken ct,
             out AssetDiffCounts counts)
         {
@@ -720,10 +792,32 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                         counts.Modified++;
                         entries.Add(BuildAssetEntry(BuildDiffChangeKind.Modified, b, t, changes));
                     }
-                    else
+                    else if (verifier == null)
                     {
                         counts.Unchanged++;
-                        entries.Add(BuildAssetEntry(BuildDiffChangeKind.Unchanged, b, t, "Unchanged"));
+                        counts.ContentUnverified++;
+                        entries.Add(BuildAssetEntry(BuildDiffChangeKind.Unchanged, b, t, "Metadata unchanged (content not verified)"));
+                    }
+                    else
+                    {
+                        switch (verifier.Compare(b, t, ct, out var reason))
+                        {
+                            case BuildDiffContentVerdict.Identical:
+                                counts.Unchanged++;
+                                counts.ContentVerified++;
+                                entries.Add(BuildAssetEntry(BuildDiffChangeKind.Unchanged, b, t, "Content identical", contentVerified: true));
+                                break;
+                            case BuildDiffContentVerdict.Different:
+                                counts.Modified++;
+                                counts.ContentVerified++;
+                                entries.Add(BuildAssetEntry(BuildDiffChangeKind.Modified, b, t, "Content changed (same name, type, size and container)", contentVerified: true));
+                                break;
+                            default:
+                                counts.Unchanged++;
+                                counts.ContentUnverified++;
+                                entries.Add(BuildAssetEntry(BuildDiffChangeKind.Unchanged, b, t, $"Metadata unchanged (content not verified: {reason})"));
+                                break;
+                        }
                     }
                 }
                 else
@@ -766,7 +860,29 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                         moveDetail = $"{moveDetail}; {extraChanges}";
                     }
 
-                    entries.Add(BuildAssetEntry(BuildDiffChangeKind.Moved, b, t, moveDetail));
+                    var moveVerified = false;
+                    if (verifier != null && extraChanges.Length == 0)
+                    {
+                        var verdict = verifier.Compare(b, t, ct, out var reason);
+                        moveVerified = verdict != BuildDiffContentVerdict.Unverified;
+                        moveDetail += verdict switch
+                        {
+                            BuildDiffContentVerdict.Identical => "; content identical",
+                            BuildDiffContentVerdict.Different => "; content changed",
+                            _ => $"; content not verified: {reason}"
+                        };
+                    }
+
+                    if (moveVerified)
+                    {
+                        counts.ContentVerified++;
+                    }
+                    else if (extraChanges.Length == 0)
+                    {
+                        counts.ContentUnverified++;
+                    }
+
+                    entries.Add(BuildAssetEntry(BuildDiffChangeKind.Moved, b, t, moveDetail, moveVerified));
                 }
                 else
                 {
@@ -804,7 +920,8 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             BuildDiffChangeKind kind,
             BuildDiffAssetSnapshot? baseline,
             BuildDiffAssetSnapshot? target,
-            string detail)
+            string detail,
+            bool contentVerified = false)
         {
             var effective = target ?? baseline!;
             var typeName = AssetItem.GetCachedTypeString(effective.Type);
@@ -831,6 +948,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                 TargetContainer = target?.Container ?? string.Empty,
                 BaselineByteSize = baseline?.ByteSize ?? 0,
                 TargetByteSize = target?.ByteSize ?? 0,
+                ContentVerified = contentVerified,
                 Detail = detail
             };
         }
@@ -964,6 +1082,8 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             public int Modified;
             public int Moved;
             public int Unchanged;
+            public int ContentVerified;
+            public int ContentUnverified;
         }
     }
 }

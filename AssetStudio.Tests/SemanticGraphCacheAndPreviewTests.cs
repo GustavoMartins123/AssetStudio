@@ -805,7 +805,7 @@ namespace AssetStudio.Tests
             }
         }
 
-        [Fact]
+        [SkippableFact]
         public void RealGameReadOnlyProbe_AnimaGateOfMemories_UpgradeCommitAndResolutionBenchmarks()
         {
             var sourceDbPath = Path.Combine(
@@ -818,7 +818,7 @@ namespace AssetStudio.Tests
             if (!File.Exists(sourceDbPath) || !Directory.Exists(gameDataDir))
             {
                 _output.WriteLine("Skipping real-game read-only probe (Anima Gate of Memories DB/game folder not present on this host).");
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var tempRoot = CreateTempDirectory("anima_readonly_probe");
@@ -1318,13 +1318,13 @@ namespace AssetStudio.Tests
                 $"Bind-pose fallback child translation mismatch: got {fbMatrices[0][1].ExtractTranslation()}, expected {restWorlds[3].ExtractTranslation()}");
         }
 
-        [Fact]
+        [SkippableFact]
         public void AnimationPreviewSkinning_RealGameBaalSdAndRedLady_ProducesTightUndistortedMesh()
         {
             const string resPath = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\resources.assets";
             if (!File.Exists(resPath))
             {
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var am = new AssetsManager();
@@ -1965,14 +1965,14 @@ namespace AssetStudio.Tests
             Assert.Contains("normalMode == 0", openGlSrc, StringComparison.Ordinal);
         }
 
-        [Fact]
+        [SkippableFact]
         public void AnimationClipPreview_NonSkeletalAndMultiClipRealGameAudit_NeverLeaksUnrelatedMesh_AndEvaluatesAllSkeletalClipsCleanly()
         {
             const string resPath = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\resources.assets";
             const string shared78Path = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\sharedassets78.assets";
             if (!File.Exists(resPath))
             {
-                return;
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var am = new AssetsManager();

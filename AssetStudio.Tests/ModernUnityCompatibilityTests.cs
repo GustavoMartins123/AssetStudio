@@ -348,7 +348,7 @@ namespace AssetStudio.Tests
         // 5. Read-Only Real-Game Integration Tests (Gracefully Skip When Absent on CI)
         // =========================================================================
 
-        [Theory]
+        [SkippableTheory]
         [InlineData(@"F:\SteamLibrary\steamapps\common\AWAKEN - Astral Blade\Awaken_Data\globalgamemanagers.assets")]
         [InlineData(@"H:\SteamLibrary\steamapps\common\AI Limit\AI-LIMIT_Data\globalgamemanagers.assets")]
         [InlineData(@"H:\SteamLibrary\steamapps\common\The Planet Crafter\Planet Crafter_Data\globalgamemanagers.assets")]
@@ -357,7 +357,7 @@ namespace AssetStudio.Tests
         {
             if (!File.Exists(assetsPath))
             {
-                return; // Skip gracefully on CI / environments without local SteamLibrary
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             using var am = new AssetsManager();
@@ -390,13 +390,13 @@ namespace AssetStudio.Tests
             Assert.True(withSubProgram > 0, $"Expected exported SubProgram blocks in {assetsPath}");
         }
 
-        [Fact]
+        [SkippableFact]
         public void RealGame_Exilium_StrippedBundleLoadsAutomaticallyViaUnityPlayerFallback_WhenPresent()
         {
             const string bundlePath = @"F:\SteamLibrary\steamapps\common\EXILIUM\GF2_Exilium_Data\StreamingAssets\aa\StandaloneWindows64\97d94d143d5e7e57ece1b6760333965b.bundle";
             if (!File.Exists(bundlePath))
             {
-                return; // Skip gracefully on CI / environments without local SteamLibrary
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             using var am = new AssetsManager();
@@ -408,13 +408,13 @@ namespace AssetStudio.Tests
             Assert.All(am.assetsFileList, sf => Assert.Equal("2019.4.40f1", sf.unityVersion));
         }
 
-        [Fact]
+        [SkippableFact]
         public void RealGame_Exilium_CatalogBin_ExtractsCleanProviderNames_WhenPresent()
         {
             const string catalogPath = @"F:\SteamLibrary\steamapps\common\EXILIUM\GF2_Exilium_Data\StreamingAssets\aa\catalog.bin";
             if (!File.Exists(catalogPath))
             {
-                return; // Skip gracefully on CI / environments without local SteamLibrary
+                throw new SkipException("Local game files are not installed on this machine.");
             }
 
             var warnings = new List<string>();
