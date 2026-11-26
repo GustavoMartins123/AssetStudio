@@ -1244,6 +1244,272 @@ namespace AssetStudio.Avalonia
             EnsurePreviewCacheSchemaUpgrades(conn);
         }
 
+        /// <summary>
+        /// O(1) transactional table reset for single-project index databases.
+        /// Dropping and recreating WITHOUT ROWID index tables inside the active ACID transaction
+        /// reclaims gigabytes of B-tree pages via SQLite's freelist in milliseconds instead of walking
+        /// millions of rows with DELETE ... WHERE and writing gigabytes to the WAL, while preserving
+        /// Projects, PreviewCacheEntries, ProjectIndexingState, IndexingReadFiles, and CacheSchema.
+        /// </summary>
+        internal static void RecreateIndexTablesInTransaction(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            bool includeSemanticTables)
+        {
+            using var dropCmd = conn.CreateCommand();
+            dropCmd.Transaction = transaction;
+            dropCmd.CommandText = includeSemanticTables
+                ? @"
+                    DROP VIEW IF EXISTS AssetHandles;
+                    DROP TABLE IF EXISTS Scenes;
+                    DROP TABLE IF EXISTS SourceFileExternals;
+                    DROP TABLE IF EXISTS AnimationClipTargets;
+                    DROP TABLE IF EXISTS CompositeAssetParts;
+                    DROP TABLE IF EXISTS CompositeAssets;
+                    DROP TABLE IF EXISTS MeshMaterialResolvedCache;
+                    DROP TABLE IF EXISTS MaterialCache;
+                    DROP TABLE IF EXISTS MaterialTextures;
+                    DROP TABLE IF EXISTS MeshMaterials;
+                    DROP TABLE IF EXISTS MeshRenderers;
+                    DROP TABLE IF EXISTS ModelGroupMeshes;
+                    DROP TABLE IF EXISTS ModelGroups;
+                    DROP TABLE IF EXISTS AssetEdges;
+                    DROP TABLE IF EXISTS Assets;
+                    DROP TABLE IF EXISTS SourceFiles;"
+                : @"
+                    DROP VIEW IF EXISTS AssetHandles;
+                    DROP TABLE IF EXISTS Scenes;
+                    DROP TABLE IF EXISTS SourceFileExternals;
+                    DROP TABLE IF EXISTS Assets;
+                    DROP TABLE IF EXISTS SourceFiles;";
+            dropCmd.ExecuteNonQuery();
+
+            using var createCoreCmd = conn.CreateCommand();
+            createCoreCmd.Transaction = transaction;
+            createCoreCmd.CommandText = @"
+                CREATE TABLE IF NOT EXISTS SourceFiles (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                    SerializedFileName TEXT NOT NULL,
+                    OriginalPath TEXT NOT NULL DEFAULT '',
+                    UnityVersion TEXT NOT NULL DEFAULT '',
+                    ObjectCount INTEGER NOT NULL DEFAULT 0,
+                    LastSeen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    RelativePath TEXT NOT NULL DEFAULT '',
+                    FileSize INTEGER NOT NULL DEFAULT 0,
+                    LastWriteUtcTicks INTEGER NOT NULL DEFAULT 0,
+                    ContentSampleHash INTEGER NOT NULL DEFAULT 0,
+                    FileKind INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS Assets (
+                    ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                    UniqueID TEXT NOT NULL,
+                    SourceFileId INTEGER REFERENCES SourceFiles(Id) ON DELETE SET NULL,
+                    Name TEXT NOT NULL,
+                    Type INTEGER NOT NULL,
+                    Container TEXT NOT NULL DEFAULT '',
+                    PathID INTEGER NOT NULL,
+                    ByteStart INTEGER NOT NULL,
+                    ByteSize INTEGER NOT NULL,
+                    PRIMARY KEY (ProjectId, UniqueID)
+                ) WITHOUT ROWID;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_source_files_unique ON SourceFiles(ProjectId, SerializedFileName, OriginalPath);";
+            createCoreCmd.ExecuteNonQuery();
+
+            if (includeSemanticTables)
+            {
+                using var createSemCmd = conn.CreateCommand();
+                createSemCmd.Transaction = transaction;
+                createSemCmd.CommandText = @"
+                    CREATE TABLE IF NOT EXISTS AssetEdges (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        SourceAssetUniqueID TEXT NOT NULL,
+                        EdgeKind TEXT NOT NULL,
+                        SlotName TEXT NOT NULL DEFAULT '',
+                        SlotIndex INTEGER NOT NULL DEFAULT -1,
+                        TargetAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        SourceFileId INTEGER NOT NULL DEFAULT 0,
+                        SourcePathID INTEGER NOT NULL DEFAULT 0,
+                        TargetFileId INTEGER NOT NULL DEFAULT 0,
+                        TargetPathID INTEGER NOT NULL DEFAULT 0,
+                        IsResolved INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetFileId, TargetPathID)
+                    ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS ModelGroups (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        GroupAssetUniqueID TEXT NOT NULL,
+                        GroupKind TEXT NOT NULL DEFAULT '',
+                        GroupName TEXT NOT NULL DEFAULT '',
+                        RootGameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        RootGameObjectName TEXT NOT NULL DEFAULT '',
+                        AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        ControllerAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        SourceFileName TEXT NOT NULL DEFAULT '',
+                        Confidence INTEGER NOT NULL DEFAULT 0,
+                        ConfidenceReason TEXT NOT NULL DEFAULT ''
+                    );
+
+                    CREATE TABLE IF NOT EXISTS ModelGroupMeshes (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        GroupAssetUniqueID TEXT NOT NULL,
+                        MeshAssetUniqueID TEXT NOT NULL,
+                        RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        RendererType TEXT NOT NULL DEFAULT '',
+                        GameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        GameObjectName TEXT NOT NULL DEFAULT '',
+                        SlotIndex INTEGER NOT NULL DEFAULT -1,
+                        TransformMatrix BLOB,
+                        Confidence INTEGER NOT NULL DEFAULT 0,
+                        ConfidenceReason TEXT NOT NULL DEFAULT ''
+                    );
+
+                    CREATE TABLE IF NOT EXISTS MeshRenderers (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        MeshAssetUniqueID TEXT NOT NULL,
+                        RendererAssetUniqueID TEXT NOT NULL,
+                        RendererType TEXT NOT NULL,
+                        GameObjectAssetUniqueID TEXT,
+                        GameObjectName TEXT,
+                        Description TEXT,
+                        PRIMARY KEY (ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, RendererType)
+                    ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS MeshMaterials (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        MeshAssetUniqueID TEXT NOT NULL,
+                        RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        SubMeshIndex INTEGER NOT NULL,
+                        MaterialSlotIndex INTEGER NOT NULL DEFAULT -1,
+                        MaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        RendererType TEXT NOT NULL DEFAULT '',
+                        MaterialScore INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID)
+                    ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS MaterialTextures (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        MaterialAssetUniqueID TEXT NOT NULL,
+                        SlotName TEXT NOT NULL,
+                        SlotIndex INTEGER NOT NULL,
+                        TextureFileId INTEGER NOT NULL DEFAULT 0,
+                        TexturePathID INTEGER NOT NULL DEFAULT 0,
+                        TextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        PreviewMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        IsResolved INTEGER NOT NULL DEFAULT 0,
+                        IsMainTexture INTEGER NOT NULL DEFAULT 0,
+                        ScaleX REAL NOT NULL DEFAULT 1.0,
+                        ScaleY REAL NOT NULL DEFAULT 1.0,
+                        OffsetX REAL NOT NULL DEFAULT 0.0,
+                        OffsetY REAL NOT NULL DEFAULT 0.0,
+                        ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                        PRIMARY KEY (ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID)
+                    ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS MaterialCache (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        MaterialAssetUniqueID TEXT NOT NULL,
+                        MaterialName TEXT NOT NULL DEFAULT '',
+                        ParentMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        MainTextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        MainTextureSlotName TEXT NOT NULL DEFAULT '',
+                        BaseColorR REAL NOT NULL DEFAULT 1.0,
+                        BaseColorG REAL NOT NULL DEFAULT 1.0,
+                        BaseColorB REAL NOT NULL DEFAULT 1.0,
+                        BaseColorA REAL NOT NULL DEFAULT 1.0,
+                        ShaderName TEXT NOT NULL DEFAULT '',
+                        TextureSlotCount INTEGER NOT NULL DEFAULT 0,
+                        ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                        PRIMARY KEY (ProjectId, MaterialAssetUniqueID)
+                    ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS MeshMaterialResolvedCache (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        MeshAssetUniqueID TEXT NOT NULL,
+                        SubMeshIndex INTEGER NOT NULL,
+                        MaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        RendererType TEXT NOT NULL DEFAULT '',
+                        MaterialName TEXT NOT NULL DEFAULT '',
+                        MainTextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        MainTextureSlotName TEXT NOT NULL DEFAULT '',
+                        BaseColorR REAL NOT NULL DEFAULT 1.0,
+                        BaseColorG REAL NOT NULL DEFAULT 1.0,
+                        BaseColorB REAL NOT NULL DEFAULT 1.0,
+                        BaseColorA REAL NOT NULL DEFAULT 1.0,
+                        ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                        PRIMARY KEY (ProjectId, MeshAssetUniqueID, SubMeshIndex)
+                    ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS CompositeAssets (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        CompositeAssetUniqueID TEXT NOT NULL,
+                        CompositeKind TEXT NOT NULL,
+                        DisplayName TEXT NOT NULL DEFAULT '',
+                        RootGameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        ControllerAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        SourceFileName TEXT NOT NULL DEFAULT '',
+                        MeshPartCount INTEGER NOT NULL DEFAULT 0,
+                        DistinctMeshCount INTEGER NOT NULL DEFAULT 0,
+                        DistinctMaterialCount INTEGER NOT NULL DEFAULT 0,
+                        Confidence INTEGER NOT NULL DEFAULT 0,
+                        ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                        PRIMARY KEY (ProjectId, CompositeAssetUniqueID)
+                    ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS CompositeAssetParts (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        CompositeAssetUniqueID TEXT NOT NULL,
+                        PartIndex INTEGER NOT NULL,
+                        MeshAssetUniqueID TEXT NOT NULL,
+                        RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        RendererType TEXT NOT NULL DEFAULT '',
+                        GameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        GameObjectName TEXT NOT NULL DEFAULT '',
+                        TransformMatrix BLOB,
+                        PrimaryMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        Confidence INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (ProjectId, CompositeAssetUniqueID, PartIndex)
+                    ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS AnimationClipTargets (
+                        ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                        ClipAssetUniqueID TEXT NOT NULL,
+                        AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        MeshAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        ModelGroupId TEXT NOT NULL DEFAULT '',
+                        RelationKind TEXT NOT NULL DEFAULT '',
+                        MatchScore INTEGER NOT NULL DEFAULT 0,
+                        MatchedBoneCount INTEGER NOT NULL DEFAULT 0,
+                        TotalClipBoneCount INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (ProjectId, ClipAssetUniqueID, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID, RelationKind)
+                    ) WITHOUT ROWID;
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_model_groups_unique ON ModelGroups(ProjectId, GroupAssetUniqueID);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_model_group_meshes_unique ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID);";
+                createSemCmd.ExecuteNonQuery();
+
+                CreateSemanticBulkSecondaryIndexes(conn, transaction);
+            }
+
+            using (var viewCmd = conn.CreateCommand())
+            {
+                viewCmd.Transaction = transaction;
+                viewCmd.CommandText = AssetHandlesCompatibilityViewSql;
+                viewCmd.ExecuteNonQuery();
+            }
+
+            EnsureV16SceneTablesAndIndexes(conn, transaction);
+        }
+
         private static void DropSemanticBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
         {
             using var cmd = conn.CreateCommand();

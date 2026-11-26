@@ -1456,6 +1456,155 @@ namespace AssetStudio.Avalonia.Services
             }
         }
 
+        internal static bool SaveIncrementalIndexDelta(
+            SQLiteProjectIndexCache sqliteCache,
+            AssetsManager assetsManager,
+            string folderPath,
+            ProjectScanResult scanResult,
+            SQLiteProjectIndexCache.IncrementalProjectDeltaPlan deltaPlan,
+            IReadOnlyCollection<string>? reindexedFilePaths,
+            Action<int, int, string>? progress = null,
+            Action<IndexingProgressUpdate, int>? showProgressPanel = null)
+        {
+            if (sqliteCache == null || assetsManager == null || scanResult == null || deltaPlan == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var signature = sqliteCache.GetFolderSignature(scanResult);
+                var unityVersion = assetsManager.SpecifyUnityVersion;
+                var rawHandles = assetsManager.ProjectIndex.GetHandles();
+                var allMergedHandles = rawHandles as IReadOnlyList<AssetHandle> ?? rawHandles.ToList();
+
+                IReadOnlyCollection<AssetHandle> updatedHandles;
+                if (reindexedFilePaths == null || reindexedFilePaths.Count == 0)
+                {
+                    updatedHandles = Array.Empty<AssetHandle>();
+                }
+                else
+                {
+                    var pathComparer = sqliteCache.CaseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+                    var reindexedSet = new HashSet<string>(pathComparer);
+                    foreach (var p in reindexedFilePaths)
+                    {
+                        if (!string.IsNullOrWhiteSpace(p))
+                        {
+                            reindexedSet.Add(p);
+                            try
+                            {
+                                reindexedSet.Add(Path.GetFullPath(p));
+                            }
+                            catch
+                            {
+                                // Keep raw path when Path.GetFullPath cannot normalize synthetic test paths.
+                            }
+                        }
+                    }
+
+                    var filtered = new List<AssetHandle>();
+                    for (var i = 0; i < allMergedHandles.Count; i++)
+                    {
+                        var h = allMergedHandles[i];
+                        var orig = h?.OriginalPath;
+                        if (!string.IsNullOrEmpty(orig) && reindexedSet.Contains(orig))
+                        {
+                            filtered.Add(h!);
+                        }
+                    }
+
+                    updatedHandles = filtered;
+                }
+
+                PublishDatabaseWriteProgress(
+                    sqliteCache,
+                    folderPath,
+                    scanResult,
+                    "saving_index",
+                    0,
+                    Math.Max(1, updatedHandles.Count + deltaPlan.DirtySourceFileIds.Count + 2),
+                    "Saving incremental index delta",
+                    persist: false,
+                    showProgressPanel);
+
+                void ReportSaveProgress(int processed, int total, string stage)
+                {
+                    progress?.Invoke(processed, total, stage);
+                    PublishDatabaseWriteProgress(
+                        sqliteCache,
+                        folderPath,
+                        scanResult,
+                        "saving_index",
+                        processed,
+                        total,
+                        stage,
+                        persist: false,
+                        showProgressPanel);
+                }
+
+                var saved = sqliteCache.SaveIncrementalIndexDelta(
+                    folderPath,
+                    signature,
+                    scanResult,
+                    unityVersion,
+                    deltaPlan,
+                    updatedHandles,
+                    allMergedHandles,
+                    markIndexingCompleted: true,
+                    progress: ReportSaveProgress);
+
+                if (saved)
+                {
+                    if (updatedHandles.Count > 0)
+                    {
+                        try
+                        {
+                            DiscoverAndPersistScenesAndExternals(
+                                sqliteCache,
+                                assetsManager,
+                                folderPath,
+                                signature,
+                                allMergedHandles);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warning($"Failed to refresh scenes/externals after incremental index update for '{folderPath}': {ex.Message}");
+                        }
+                    }
+
+                    PublishDatabaseWriteProgress(
+                        sqliteCache,
+                        folderPath,
+                        scanResult,
+                        "completed",
+                        1,
+                        1,
+                        "Incremental SQLite index cache saved",
+                        persist: false,
+                        showProgressPanel);
+                    return true;
+                }
+
+                PublishDatabaseWriteProgress(
+                    sqliteCache,
+                    folderPath,
+                    scanResult,
+                    "failed",
+                    1,
+                    1,
+                    "Incremental SQLite index cache save failed",
+                    persist: true,
+                    showProgressPanel);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to save incremental index cache: {ex.Message}");
+                return false;
+            }
+        }
+
         internal static bool TrySaveSemanticRelations(
             SQLiteProjectIndexCache sqliteCache,
             string folderPath,
@@ -1927,7 +2076,8 @@ namespace AssetStudio.Avalonia.Services
             ProjectScanResult? scanResult,
             ProjectIndex targetIndex,
             out SQLiteProjectIndexCache.IncrementalProjectDeltaPlan? deltaPlan,
-            out List<SourceFileMetadata>? unchangedSourceFiles)
+            out List<SourceFileMetadata>? unchangedSourceFiles,
+            double maxDirtyRatio = 1.0)
         {
             deltaPlan = null;
             unchangedSourceFiles = null;
@@ -1952,6 +2102,7 @@ namespace AssetStudio.Avalonia.Services
                 {
                     var plan = sqliteCache.PlanIncrementalDelta(folderPath, scanResult);
                     if (plan.CanApplyIncremental
+                        && plan.DirtyRatio <= maxDirtyRatio
                         && sqliteCache.TryLoadUnchangedAssetsForIncrementalUpdate(folderPath, plan, targetIndex, out var loadedSources))
                     {
                         deltaPlan = plan;

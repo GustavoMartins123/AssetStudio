@@ -996,6 +996,224 @@ namespace AssetStudio.Tests
             return new ObjectReader(sf.reader, sf, objInfo);
         }
 
+        [Fact]
+        public void IncrementalCacheLayer1_NonAssetOtherFiles_DoNotInvalidateUnityProjectSignature()
+        {
+            var projectDir = Path.Combine(Path.GetTempPath(), "SigUnityNoiseTest");
+            var bundlePath = Path.Combine(projectDir, "Data", "main.bundle");
+            var levelPath = Path.Combine(projectDir, "Data", "level0");
+            var resPath = Path.Combine(projectDir, "Data", "sharedassets0.resS");
+            var baseFiles = new[]
+            {
+                new ScannedFileInfo(bundlePath, 4096, ProjectFileKind.UnityBundle, lastWriteTimeUtcTicks: 1000, contentSampleHash: 0x1111),
+                new ScannedFileInfo(levelPath, 2048, ProjectFileKind.SerializedFile, lastWriteTimeUtcTicks: 1000, contentSampleHash: 0x2222),
+                new ScannedFileInfo(resPath, 8192, ProjectFileKind.ResourceFile, lastWriteTimeUtcTicks: 1000, contentSampleHash: 0x3333)
+            };
+
+            var scanBase = new ProjectScanResult(projectDir, baseFiles);
+            var sigBase = SQLiteProjectIndexCache.ComputeFolderSignature(scanBase, caseSensitive: false);
+
+            // Adding unrelated non-Unity files (exported scripts, screenshots, logs) must NOT invalidate the signature.
+            var withNoiseFiles = baseFiles.Concat(new[]
+            {
+                new ScannedFileInfo(Path.Combine(projectDir, "Debug", "Assembly-CSharp.csproj"), 512, ProjectFileKind.Other, lastWriteTimeUtcTicks: 2000, contentSampleHash: 0xAAAA),
+                new ScannedFileInfo(Path.Combine(projectDir, "ScreenShot", "shot_01.png"), 120_000, ProjectFileKind.Other, lastWriteTimeUtcTicks: 2001, contentSampleHash: 0xBBBB),
+                new ScannedFileInfo(Path.Combine(projectDir, "BepInEx", "LogOutput.log"), 4096, ProjectFileKind.Other, lastWriteTimeUtcTicks: 2002, contentSampleHash: 0xCCCC)
+            });
+            var scanWithNoise = new ProjectScanResult(projectDir, withNoiseFiles);
+            var sigWithNoise = SQLiteProjectIndexCache.ComputeFolderSignature(scanWithNoise, caseSensitive: false);
+            Assert.Equal(sigBase, sigWithNoise);
+
+            // Adding a real new Unity bundle (e.g. a new DLC folder) MUST invalidate the signature.
+            var withNewDlc = withNoiseFiles.Concat(new[]
+            {
+                new ScannedFileInfo(Path.Combine(projectDir, "DLC9", "dlc_new.bundle"), 16384, ProjectFileKind.UnityBundle, lastWriteTimeUtcTicks: 3000, contentSampleHash: 0xDDDD)
+            });
+            var sigWithDlc = SQLiteProjectIndexCache.ComputeFolderSignature(new ProjectScanResult(projectDir, withNewDlc), caseSensitive: false);
+            Assert.NotEqual(sigBase, sigWithDlc);
+
+            // Adding a .split0 file MUST also invalidate the signature.
+            var withSplit = baseFiles.Concat(new[]
+            {
+                new ScannedFileInfo(Path.Combine(projectDir, "Data", "level1.split0"), 4096, ProjectFileKind.Other, lastWriteTimeUtcTicks: 3000, contentSampleHash: 0xEEEE)
+            });
+            var sigWithSplit = SQLiteProjectIndexCache.ComputeFolderSignature(new ProjectScanResult(projectDir, withSplit), caseSensitive: false);
+            Assert.NotEqual(sigBase, sigWithSplit);
+        }
+
+        [Fact]
+        public void IncrementalCacheLayer2_MmapFilteredHydration_AndNewFolderDelta_PreserveUnchangedBundlesAndPreviews()
+        {
+            var tempRoot = CreateTempDirectory("inc_layer2_new_folder");
+            try
+            {
+                var projectDir = Path.Combine(tempRoot, "Game");
+                var cacheDir = Path.Combine(tempRoot, "Cache");
+                Directory.CreateDirectory(Path.Combine(projectDir, "Base"));
+
+                var baseUtc = DateTime.UtcNow.AddMinutes(-10);
+                var baseFiles = new List<ScannedFileInfo>();
+                var initialHandles = new List<AssetHandle>();
+                for (var i = 0; i < 4; i++)
+                {
+                    var p = Path.Combine(projectDir, "Base", $"pack_{i}.bundle");
+                    File.WriteAllBytes(p, CreateFilledBytes(4096, (byte)(0x10 + i)));
+                    File.SetLastWriteTimeUtc(p, baseUtc);
+                    baseFiles.Add(new ScannedFileInfo(p, 4096, ProjectFileKind.UnityBundle, baseUtc.Ticks, (ulong)(0x100 + i)));
+                    initialHandles.Add(CreateHandle($"CAB-BASE-{i}", p, 100 + i, $"BaseMesh_{i}", ClassIDType.Mesh));
+                }
+
+                using var cache = new SQLiteProjectIndexCache(cacheDir);
+                var scan1 = new ProjectScanResult(projectDir, baseFiles);
+                var sig1 = cache.GetFolderSignature(scan1);
+                Assert.True(cache.SaveIndexCache(projectDir, sig1, scan1, "6000.3.18f1", initialHandles, markIndexingCompleted: true));
+                Assert.True(File.Exists(cache.GetIdxPath(projectDir)));
+
+                // Seed PreviewCacheEntry for unchanged asset
+                cache.SavePreviewCachePayload(projectDir, sig1, initialHandles[0].UniqueID, "mesh-geometry", 1, "d=100", new byte[] { 7, 8, 9 });
+
+                // Add a brand-new DLC folder with 1 new bundle
+                var dlcDir = Path.Combine(projectDir, "DLC_New");
+                Directory.CreateDirectory(dlcDir);
+                var dlcBundle = Path.Combine(dlcDir, "dlc_pack.bundle");
+                var dlcUtc = baseUtc.AddMinutes(5);
+                File.WriteAllBytes(dlcBundle, CreateFilledBytes(8192, 0x77));
+                File.SetLastWriteTimeUtc(dlcBundle, dlcUtc);
+
+                var scan2Files = baseFiles.Concat(new[]
+                {
+                    new ScannedFileInfo(dlcBundle, 8192, ProjectFileKind.UnityBundle, dlcUtc.Ticks, 0x999)
+                });
+                var scan2 = new ProjectScanResult(projectDir, scan2Files);
+                var sig2 = cache.GetFolderSignature(scan2);
+                Assert.NotEqual(sig1, sig2);
+
+                // ResolveSelectiveColdIndexFiles must hydrate the 4 unchanged bundles via mmap .idx and request ONLY dlcBundle
+                using var assetsManager = new AssetsManager { LazyLoading = true, SpecifyUnityVersion = "6000.3.18f1" };
+                var filesToReindex = ProjectLoadingService.ResolveSelectiveColdIndexFiles(
+                    cache,
+                    projectDir,
+                    scan2,
+                    assetsManager.ProjectIndex,
+                    out var deltaPlan,
+                    out var unchangedSources,
+                    maxDirtyRatio: 0.50);
+
+                Assert.NotNull(deltaPlan);
+                Assert.True(deltaPlan!.CanApplyIncremental);
+                Assert.True(deltaPlan.DirtyRatio <= 0.50);
+                Assert.Single(filesToReindex, dlcBundle);
+                Assert.Equal(4, unchangedSources!.Count);
+                Assert.Equal(4, assetsManager.ProjectIndex.Count);
+
+                // Simulate indexing ONLY dlcBundle and committing via ProjectLoadingService.SaveIncrementalIndexDelta
+                var dlcHandle = CreateHandle("CAB-DLC-NEW", dlcBundle, 500, "DlcBossMesh", ClassIDType.Mesh);
+                assetsManager.ProjectIndex.AddHandle(dlcHandle);
+
+                var saved = ProjectLoadingService.SaveIncrementalIndexDelta(
+                    cache,
+                    assetsManager,
+                    projectDir,
+                    scan2,
+                    deltaPlan,
+                    reindexedFilePaths: filesToReindex);
+                Assert.True(saved);
+
+                // Reload warm from updated .idx sidecar and SQLite -> all 5 assets + unchanged preview cache preserved!
+                var reloaded = cache.LoadIndexCache(projectDir, sig2);
+                Assert.NotNull(reloaded);
+                Assert.Equal(5, reloaded!.Count);
+                Assert.Contains(reloaded, h => h.Name == "DlcBossMesh");
+                Assert.Contains(reloaded, h => h.Name == "BaseMesh_0");
+                Assert.NotNull(cache.LoadPreviewCacheEntry(projectDir, sig2, initialHandles[0].UniqueID, "mesh-geometry", 1, "d=100"));
+            }
+            finally
+            {
+                SqliteConnection.ClearAllPools();
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void IncrementalCacheLayer3_SingleProjectFullResave_UsesFastTableReset_PreservesPreviews_AndShowsStageAtZero()
+        {
+            var tempRoot = CreateTempDirectory("inc_layer3_fast_reset");
+            try
+            {
+                var projectDir = Path.Combine(tempRoot, "SingleProj");
+                var cacheDir = Path.Combine(tempRoot, "Cache");
+                Directory.CreateDirectory(projectDir);
+
+                var fileA = Path.Combine(projectDir, "pack_a.bundle");
+                var utc1 = DateTime.UtcNow.AddMinutes(-10);
+                File.WriteAllBytes(fileA, CreateFilledBytes(4096, 0x21));
+                File.SetLastWriteTimeUtc(fileA, utc1);
+
+                using var cache = new SQLiteProjectIndexCache(cacheDir);
+                var scan1 = new ProjectScanResult(projectDir, new[]
+                {
+                    new ScannedFileInfo(fileA, 4096, ProjectFileKind.UnityBundle, utc1.Ticks, 0x111)
+                });
+                var sig1 = cache.GetFolderSignature(scan1);
+                var h1 = CreateHandle("CAB-OLD", fileA, 10, "OldAsset", ClassIDType.Mesh);
+                Assert.True(cache.SaveIndexCache(projectDir, sig1, scan1, "6000.3.18f1", new[] { h1 }, markIndexingCompleted: true));
+
+                long projectIdBefore;
+                using (var conn = cache.CreateReadConnection(projectDir))
+                {
+                    projectIdBefore = ExecuteScalarInt64(conn, "SELECT Id FROM Projects LIMIT 1;");
+                }
+
+                cache.SavePreviewCachePayload(projectDir, sig1, "keep-preview-id", "mesh-geometry", 1, "d=100", new byte[] { 1, 2, 3 });
+
+                // Trigger full re-save on the same single-project DB (exercises O(1) RecreateIndexTablesInTransaction)
+                var stages = new List<string>();
+                var h2 = CreateHandle("CAB-NEW", fileA, 20, "NewAsset", ClassIDType.Texture2D);
+                Assert.True(cache.SaveIndexCache(
+                    projectDir,
+                    sig1,
+                    scan1,
+                    "6000.3.18f1",
+                    new[] { h2 },
+                    preserveSemanticRelations: false,
+                    progress: (_, _, stage) => stages.Add(stage),
+                    markIndexingCompleted: true));
+
+                Assert.Contains("Sorting & deduplicating handles", stages);
+                Assert.Contains("Clearing previous index rows", stages);
+
+                using (var conn = cache.CreateReadConnection(projectDir))
+                {
+                    Assert.Equal(projectIdBefore, ExecuteScalarInt64(conn, "SELECT Id FROM Projects LIMIT 1;"));
+                    Assert.Equal(1L, ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM Assets;"));
+                    Assert.Equal(1L, ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM AssetHandles;"));
+                    Assert.Equal(1L, ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM PreviewCacheEntries;"));
+                }
+
+                var reloaded = cache.LoadIndexCache(projectDir, sig1);
+                Assert.NotNull(reloaded);
+                Assert.Single(reloaded!);
+                Assert.Equal("NewAsset", reloaded[0].Name);
+
+                // Verify stage progress text at 0% puts the stage label upfront so narrow panels never hide it
+                var progressVm = new AssetStudio.Avalonia.ViewModels.IndexingProgressViewModel();
+                progressVm.ApplyUpdate(new IndexingProgressUpdate
+                {
+                    Status = "saving_index",
+                    ProcessedFiles = 0,
+                    TotalFiles = 7_423_588,
+                    PendingFiles = 7_423_588,
+                    CurrentFile = "Clearing previous index rows"
+                });
+                Assert.StartsWith("Saving index cache: Clearing previous index rows", progressVm.PrimaryStatusText, StringComparison.Ordinal);
+            }
+            finally
+            {
+                SqliteConnection.ClearAllPools();
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
         private static byte[] CreateFilledBytes(int length, byte value)
         {
             var bytes = new byte[length];

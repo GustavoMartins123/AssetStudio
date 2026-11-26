@@ -15,6 +15,9 @@ public sealed class Il2CppMetadataLoadOutcome
     public int MetadataVersion { get; init; }
     public int TypeCount { get; init; }
     public int ImageCount { get; init; }
+    public bool IsCompactLayout { get; init; }
+    public byte[]? DetectedBodyXorKey { get; init; }
+    public long DetectedBodyOffsetDelta { get; init; }
     public bool IsObfuscatedOrUnsupported { get; init; }
     public string DiagnosticMessage { get; init; } = string.Empty;
 }
@@ -129,6 +132,7 @@ public sealed class Il2CppMetadataReader
         public required long FileLength { get; init; }
         public required long LastWriteTicks { get; init; }
         public required int Version { get; init; }
+        public bool IsCompactLayout { get; init; }
         public long BodyOffsetDelta { get; init; }
         public byte[]? BodyXorKey { get; init; }
         public required TableSlice Strings { get; init; }
@@ -207,14 +211,25 @@ public sealed class Il2CppMetadataReader
 
     public Il2CppMetadataLoadOutcome InspectMetadata(string metadataPath, CancellationToken cancellationToken = default)
     {
-        var (index, outcome) = GetOrBuildIndex(metadataPath, cancellationToken);
+        return InspectMetadata(metadataPath, xorKey: null, cancellationToken);
+    }
+
+    public Il2CppMetadataLoadOutcome InspectMetadata(
+        string metadataPath,
+        byte[]? xorKey,
+        CancellationToken cancellationToken = default)
+    {
+        var (index, outcome) = GetOrBuildIndex(metadataPath, xorKey, cancellationToken);
         return index != null
             ? new Il2CppMetadataLoadOutcome
             {
                 Success = true,
                 MetadataVersion = index.Version,
                 TypeCount = index.Types.Length,
-                ImageCount = index.Images.Length
+                ImageCount = index.Images.Length,
+                IsCompactLayout = index.IsCompactLayout,
+                DetectedBodyXorKey = index.BodyXorKey,
+                DetectedBodyOffsetDelta = index.BodyOffsetDelta
             }
             : outcome;
     }
@@ -223,12 +238,20 @@ public sealed class Il2CppMetadataReader
         string metadataPath,
         CancellationToken cancellationToken = default)
     {
+        return TryReadCatalog(metadataPath, xorKey: null, cancellationToken);
+    }
+
+    internal MetadataCatalogResult? TryReadCatalog(
+        string metadataPath,
+        byte[]? xorKey,
+        CancellationToken cancellationToken = default)
+    {
         if (string.IsNullOrWhiteSpace(metadataPath) || !File.Exists(metadataPath))
         {
             return null;
         }
 
-        var (index, _) = GetOrBuildIndex(metadataPath, cancellationToken);
+        var (index, _) = GetOrBuildIndex(metadataPath, xorKey, cancellationToken);
         if (index == null || index.Images.Length == 0)
         {
             return null;
@@ -296,13 +319,33 @@ public sealed class Il2CppMetadataReader
         out string? diagnosticMessage,
         CancellationToken cancellationToken = default)
     {
+        return TryExtractType(metadataPath, request, xorKey: null, gameAssemblyPath, out diagnosticMessage, cancellationToken);
+    }
+
+    public ScriptDecompilationResult? TryExtractType(
+        string metadataPath,
+        ScriptLookupRequest request,
+        byte[]? xorKey,
+        CancellationToken cancellationToken = default)
+    {
+        return TryExtractType(metadataPath, request, xorKey, request.GameAssemblyPath, out _, cancellationToken);
+    }
+
+    public ScriptDecompilationResult? TryExtractType(
+        string metadataPath,
+        ScriptLookupRequest request,
+        byte[]? xorKey,
+        string? gameAssemblyPath,
+        out string? diagnosticMessage,
+        CancellationToken cancellationToken = default)
+    {
         diagnosticMessage = null;
         if (string.IsNullOrWhiteSpace(metadataPath) || !File.Exists(metadataPath) || string.IsNullOrWhiteSpace(request.ClassName))
         {
             return null;
         }
 
-        var (index, outcome) = GetOrBuildIndex(metadataPath, cancellationToken);
+        var (index, outcome) = GetOrBuildIndex(metadataPath, xorKey, cancellationToken);
         if (index == null)
         {
             diagnosticMessage = outcome.DiagnosticMessage;
@@ -371,6 +414,7 @@ public sealed class Il2CppMetadataReader
 
     private (MetadataIndex? Index, Il2CppMetadataLoadOutcome Outcome) GetOrBuildIndex(
         string metadataPath,
+        byte[]? xorKey,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(metadataPath) || !File.Exists(metadataPath))
@@ -406,10 +450,15 @@ public sealed class Il2CppMetadataReader
             });
         }
 
+        var effectiveXorKey = xorKey is { Length: > 0 } ? xorKey.ToArray() : null;
+        var cacheKey = effectiveXorKey != null
+            ? $"{fullPath}|xor:{Convert.ToHexString(effectiveXorKey)}"
+            : fullPath;
+
         var tick = Interlocked.Increment(ref _accessCounter);
         lock (_cacheLock)
         {
-            if (_indexCache.TryGetValue(fullPath, out var cached)
+            if (_indexCache.TryGetValue(cacheKey, out var cached)
                 && cached.FileLength == info.Length
                 && cached.LastWriteTicks == info.LastWriteTimeUtc.Ticks)
             {
@@ -419,11 +468,14 @@ public sealed class Il2CppMetadataReader
                     Success = true,
                     MetadataVersion = cached.Version,
                     TypeCount = cached.Types.Length,
-                    ImageCount = cached.Images.Length
+                    ImageCount = cached.Images.Length,
+                    IsCompactLayout = cached.IsCompactLayout,
+                    DetectedBodyXorKey = cached.BodyXorKey,
+                    DetectedBodyOffsetDelta = cached.BodyOffsetDelta
                 });
             }
 
-            if (_failureCache.TryGetValue(fullPath, out var failed)
+            if (_failureCache.TryGetValue(cacheKey, out var failed)
                 && failed.FileLength == info.Length
                 && failed.LastWriteTicks == info.LastWriteTimeUtc.Ticks)
             {
@@ -432,19 +484,19 @@ public sealed class Il2CppMetadataReader
             }
         }
 
-        var built = BuildIndex(fullPath, info.Length, info.LastWriteTimeUtc.Ticks, tick, cancellationToken);
+        var built = BuildIndex(fullPath, info.Length, info.LastWriteTimeUtc.Ticks, tick, effectiveXorKey, cancellationToken);
         lock (_cacheLock)
         {
             if (built.Index != null)
             {
-                _failureCache.Remove(fullPath);
-                _indexCache[fullPath] = built.Index;
+                _failureCache.Remove(cacheKey);
+                _indexCache[cacheKey] = built.Index;
                 EvictCacheIfNeededLocked();
             }
             else
             {
-                _indexCache.Remove(fullPath);
-                _failureCache[fullPath] = new CachedFailure
+                _indexCache.Remove(cacheKey);
+                _failureCache[cacheKey] = new CachedFailure
                 {
                     FilePath = fullPath,
                     FileLength = info.Length,
@@ -507,6 +559,7 @@ public sealed class Il2CppMetadataReader
         long fileLength,
         long lastWriteTicks,
         long accessTick,
+        byte[]? wholeFileXorKey,
         CancellationToken cancellationToken)
     {
         try
@@ -520,6 +573,10 @@ public sealed class Il2CppMetadataReader
             var headerReadLen = (int)Math.Min(fileLength, MaxHeaderBytes);
             var headerBuf = new byte[headerReadLen];
             ReadExactlyOrFail(stream, headerBuf, 0, headerReadLen);
+            if (wholeFileXorKey != null)
+            {
+                ApplyXorInPlace(headerBuf, 0, wholeFileXorKey);
+            }
 
             var sanity = BinaryPrimitives.ReadUInt32LittleEndian(headerBuf.AsSpan(0, 4));
             if (sanity != MetadataSanity)
@@ -542,6 +599,7 @@ public sealed class Il2CppMetadataReader
                         accessTick,
                         version,
                         compactSections,
+                        wholeFileXorKey,
                         cancellationToken);
                 }
 
@@ -627,6 +685,7 @@ public sealed class Il2CppMetadataReader
                     pairs,
                     stringsSlice,
                     typeDefsSlice,
+                    wholeFileXorKey,
                     cancellationToken,
                     out var bodyOffsetDelta,
                     out var bodyXorKey,
@@ -740,7 +799,10 @@ public sealed class Il2CppMetadataReader
                 Success = true,
                 MetadataVersion = version,
                 TypeCount = totalTypes,
-                ImageCount = images.Length
+                ImageCount = images.Length,
+                IsCompactLayout = false,
+                DetectedBodyXorKey = bodyXorKey,
+                DetectedBodyOffsetDelta = bodyOffsetDelta
             });
         }
         catch (OperationCanceledException)
@@ -1006,6 +1068,7 @@ public sealed class Il2CppMetadataReader
         long accessTick,
         int version,
         CompactSection[] sections,
+        byte[]? bodyXorKey,
         CancellationToken cancellationToken)
     {
         bool isUnity6000_5;
@@ -1089,10 +1152,10 @@ public sealed class Il2CppMetadataReader
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        var stringBytes = ReadTableBytes(stream, stringsSlice, 0, null);
+        var stringBytes = ReadTableBytes(stream, stringsSlice, 0, bodyXorKey);
         var totalTypes = typeDefsSection.Count;
         var typeDefStructSize = typeDefsSection.Size / totalTypes;
-        var typeDefBytes = ReadTableBytes(stream, typeDefsSection.Slice, 0, null);
+        var typeDefBytes = ReadTableBytes(stream, typeDefsSection.Slice, 0, bodyXorKey);
         if (!ValidateTypeDefTokens(typeDefBytes, totalTypes, typeDefStructSize))
         {
             return Fail(
@@ -1105,7 +1168,7 @@ public sealed class Il2CppMetadataReader
         var imageRowSize = imagesSection.Size / imagesSection.Count;
         var imageTypeCountOffset = 8 + w.TypeDefinition;
         var imageCustomAttributeOffset = 16 + 2 * w.TypeDefinition + w.Method + 4;
-        var imageBytes = ReadTableBytes(stream, imagesSection.Slice, 0, null);
+        var imageBytes = ReadTableBytes(stream, imagesSection.Slice, 0, bodyXorKey);
         var images = new ImageEntry[imagesSection.Count];
         for (var i = 0; i < images.Length; i++)
         {
@@ -1189,6 +1252,8 @@ public sealed class Il2CppMetadataReader
             FileLength = fileLength,
             LastWriteTicks = lastWriteTicks,
             Version = version,
+            IsCompactLayout = true,
+            BodyXorKey = bodyXorKey,
             Strings = stringsSlice,
             Events = Table(CompactTable.Events).Slice,
             Properties = Table(CompactTable.Properties).Slice,
@@ -1238,7 +1303,9 @@ public sealed class Il2CppMetadataReader
             Success = true,
             MetadataVersion = version,
             TypeCount = totalTypes,
-            ImageCount = images.Length
+            ImageCount = images.Length,
+            IsCompactLayout = true,
+            DetectedBodyXorKey = bodyXorKey
         });
     }
 
@@ -1303,6 +1370,7 @@ public sealed class Il2CppMetadataReader
         TableSlice[] pairs,
         TableSlice stringsSlice,
         TableSlice typeDefsSlice,
+        byte[]? wholeFileXorKey,
         CancellationToken cancellationToken,
         out long bodyOffsetDelta,
         out byte[]? bodyXorKey,
@@ -1327,6 +1395,35 @@ public sealed class Il2CppMetadataReader
         if (trailingDelta > 0 && trailingDelta <= 4096)
         {
             candidateShifts.Add(trailingDelta);
+        }
+
+        if (wholeFileXorKey != null)
+        {
+            foreach (var shift in candidateShifts)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (TryValidateTablesWithTransform(
+                        stream,
+                        fileLength,
+                        pairs,
+                        stringsSlice,
+                        typeDefsSlice,
+                        shift,
+                        xorKey: wholeFileXorKey,
+                        out stringBytes,
+                        out images,
+                        out imagesPairIndex,
+                        out totalTypes,
+                        out typeDefStructSize,
+                        out typeDefBytes))
+                {
+                    bodyOffsetDelta = shift;
+                    bodyXorKey = wholeFileXorKey;
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         // 1. Standard plaintext (and plaintext with post-header shift)

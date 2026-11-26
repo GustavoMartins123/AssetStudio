@@ -173,5 +173,8 @@ namespace AssetStudio.Avalonia.Services
 
         Task<ViewModels.SceneExportDialogResult?> ShowSceneExportDialogAsync(ViewModels.SceneExportDialogRequest request)
             => Task.FromResult<ViewModels.SceneExportDialogResult?>(null);
+
+        Task<ViewModels.CSharpProjectExportDialogResult?> ShowCSharpProjectExportDialogAsync(ViewModels.CSharpProjectExportDialogRequest request)
+            => Task.FromResult<ViewModels.CSharpProjectExportDialogResult?>(null);
     }
 }

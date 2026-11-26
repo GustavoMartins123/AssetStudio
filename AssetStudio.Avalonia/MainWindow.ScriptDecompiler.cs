@@ -1139,30 +1139,83 @@ public partial class MainWindow
             return;
         }
 
-        var outFolder = await ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
-            title: "Select Output Folder for C# Script Project (.sln/.csproj)"));
-        if (string.IsNullOrWhiteSpace(outFolder))
-        {
-            return;
-        }
-
         var projectRoot = ResolveEffectiveScriptProjectRoot();
         var rawProjectName = !string.IsNullOrWhiteSpace(projectContext?.Project.Name)
             ? projectContext!.Project.Name
             : (!string.IsNullOrWhiteSpace(projectRoot)
                 ? Path.GetFileName(projectRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
                 : "ExportedScripts");
-        var projectName = ScriptExportPathSanitizer.SanitizeSegment(rawProjectName, "ExportedScripts");
+        var defaultProjectName = ScriptExportPathSanitizer.SanitizeSegment(rawProjectName, "ExportedScripts");
+
+        StatusStripUpdate("Scanning script assemblies...");
+        AssemblyCatalogSnapshot catalog;
+        try
+        {
+            catalog = await Task.Run(() => _assemblyExplorerService.ScanDiscoveredSources(discovered));
+        }
+        catch (Exception ex)
+        {
+            StatusStripUpdate($"Assembly scan failed: {ex.Message}");
+            await ViewModel.DialogService.ShowErrorAsync(
+                "Export C# Script Project Failed",
+                $"Could not scan script assemblies:\n{ex.Message}");
+            return;
+        }
+
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        if (!catalog.HasAnyAssemblies)
+        {
+            await ViewModel.DialogService.ShowMessageAsync(
+                "Export C# Script Project",
+                "No readable managed assemblies, IL2CPP DummyDlls, dump.cs types, or global-metadata.dat images were found to export.");
+            return;
+        }
+
+        var isIl2CppStubMode = catalog.SourceKind == ScriptSourceKind.Il2CppDummyAssemblyDecompiled
+            || catalog.SourceKind == ScriptSourceKind.Il2CppDumpCs
+            || catalog.SourceKind == ScriptSourceKind.Il2CppGlobalMetadata;
+
+        var dialogRequest = new CSharpProjectExportDialogRequest(
+            assemblies: catalog.Assemblies,
+            sourceDescription: catalog.SourceDescription,
+            defaultProjectName: defaultProjectName,
+            isIl2CppStubMode: isIl2CppStubMode);
+
+        var dialogResult = await ViewModel.DialogService.ShowCSharpProjectExportDialogAsync(dialogRequest);
+        if (dialogResult == null || dialogResult.SelectedAssemblyNames.Count == 0 || IsWindowClosingOrClosed)
+        {
+            StatusStripUpdate("C# script project export canceled.");
+            return;
+        }
+
+        var folderPickerTitle = dialogResult.LayoutMode == CSharpProjectLayoutMode.UnityAssetsScripts
+            ? "Select Output Folder for Unity Scripts (Assets/Scripts)"
+            : "Select Output Folder for C# Script Project (.sln/.csproj)";
+        var outFolder = await ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
+            title: folderPickerTitle));
+        if (string.IsNullOrWhiteSpace(outFolder) || IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        var projectName = ScriptExportPathSanitizer.SanitizeSegment(dialogResult.ProjectName, defaultProjectName);
 
         var options = new CSharpProjectExportOptions
         {
             OutputDirectory = outFolder,
             ProjectName = projectName,
-            LayoutMode = CSharpProjectLayoutMode.StandaloneDotNetSolution,
-            IncludeEngineAndThirdPartyAssemblies = false,
-            GenerateUnityMetaFiles = true,
-            GenerateAsmdefFiles = true,
-            CopyReferenceDlls = true,
+            LayoutMode = dialogResult.LayoutMode,
+            IncludeEngineAndThirdPartyAssemblies = dialogResult.IncludeEngineAndThirdPartyAssemblies,
+            SelectedAssemblyNames = dialogResult.SelectedAssemblyNames,
+            GenerateUnityMetaFiles = dialogResult.GenerateUnityMetaFiles,
+            GenerateAsmdefFiles = dialogResult.GenerateAsmdefFiles,
+            CopyReferenceDlls = dialogResult.CopyReferenceDlls,
+            EnableConservativeDecompilerFallback = dialogResult.EnableConservativeDecompilerFallback,
+            SanitizeStrippedEditorAttributes = dialogResult.SanitizeStrippedEditorAttributes,
             ManagedDirectories = discovered.ManagedDirectories,
             DummyDllDirectories = discovered.DummyDllDirectories,
             DumpCsPath = discovered.DumpCsPath,
@@ -1178,7 +1231,7 @@ public partial class MainWindow
             StatusStripUpdate($"Exporting C# project: {p.StatusMessage} ({p.CompletedTypes:N0} types)");
         });
 
-        StatusStripUpdate($"Exporting C# script project '{projectName}'...");
+        StatusStripUpdate($"Exporting C# script project '{projectName}' ({dialogResult.SelectedAssemblyNames.Count:N0} assemblies)...");
         CSharpProjectExportResult exportResult;
         try
         {
@@ -1198,9 +1251,17 @@ public partial class MainWindow
             details.AppendLine(exportResult.SummaryMessage);
             details.AppendLine();
             details.AppendLine($"Mode: {exportResult.Mode}");
-            details.AppendLine($"Game Assemblies: {exportResult.GameAssembliesCount:N0}");
+            details.AppendLine($"Exported Assemblies: {exportResult.GameAssembliesCount:N0}");
             details.AppendLine($"Reference DLLs: {exportResult.ReferenceAssembliesCount:N0}");
             details.AppendLine($"Types Exported: {exportResult.TotalTypesExported:N0}");
+            if (exportResult.ConservativeFallbackCount > 0)
+            {
+                details.AppendLine($"Conservative Decompiler Fallbacks: {exportResult.ConservativeFallbackCount:N0}");
+            }
+            if (exportResult.SanitizedAttributeFilesCount > 0)
+            {
+                details.AppendLine($"Stripped Editor Attributes Sanitized: {exportResult.SanitizedAttributeFilesCount:N0} file(s)");
+            }
             if (exportResult.FailedTypesCount > 0)
             {
                 details.AppendLine($"Stub Fallbacks (Decompile Errors): {exportResult.FailedTypesCount:N0}");

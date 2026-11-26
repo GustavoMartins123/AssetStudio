@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Security;
@@ -12,6 +13,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using ICSharpCode.Decompiler;
@@ -179,8 +181,23 @@ public static class ScriptProjectAssemblyClassifier
         "Odin",
         "Zenject",
         "Extenject",
-        "Rewired"
+        "Rewired",
+        "nunit."
     };
+
+    public static bool IsLegacyUnityScriptAssembly(string? assemblyName)
+    {
+        var shortName = UnityProjectGuidUtility.NormalizeAssemblyShortName(assemblyName);
+        if (string.IsNullOrEmpty(shortName))
+        {
+            return false;
+        }
+
+        return shortName.Equals("Assembly-UnityScript", StringComparison.OrdinalIgnoreCase)
+            || shortName.Equals("Assembly-UnityScript-firstpass", StringComparison.OrdinalIgnoreCase)
+            || shortName.Equals("Assembly-UnityScript-Editor", StringComparison.OrdinalIgnoreCase)
+            || shortName.Equals("Assembly-UnityScript-Editor-firstpass", StringComparison.OrdinalIgnoreCase);
+    }
 
     public static bool IsUnityPredefinedAssembly(string? assemblyName)
     {
@@ -289,6 +306,8 @@ public sealed class CSharpProjectExportOptions
     public bool GenerateUnityMetaFiles { get; init; } = true;
     public bool GenerateAsmdefFiles { get; init; } = true;
     public bool CopyReferenceDlls { get; init; } = true;
+    public bool EnableConservativeDecompilerFallback { get; init; } = true;
+    public bool SanitizeStrippedEditorAttributes { get; init; } = false;
     public IReadOnlyCollection<string>? SelectedAssemblyNames { get; init; }
     public int MaxDegreeOfParallelism { get; init; } = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
 
@@ -334,6 +353,7 @@ public sealed class ExportedAssemblyReport
     public string AsmdefFilePath { get; init; } = string.Empty;
     public int TypesExported { get; init; }
     public int TypesFailed { get; init; }
+    public int ConservativeFallbackCount { get; init; }
     public List<string> ProjectReferences { get; init; } = new();
     public List<string> DllReferences { get; init; } = new();
     public List<string> UnresolvedReferences { get; init; } = new();
@@ -631,6 +651,8 @@ public sealed class CSharpProjectExportResult
     public int ReferenceAssembliesCount { get; init; }
     public int TotalTypesExported { get; init; }
     public int FailedTypesCount { get; init; }
+    public int ConservativeFallbackCount { get; init; }
+    public int SanitizedAttributeFilesCount { get; init; }
     public List<BrokenDependencyCycle> BrokenCycles { get; init; } = new();
     public List<string> UnresolvedReferences { get; init; } = new();
     public List<FailedTypeExportRecord> FailedTypes { get; init; } = new();
@@ -928,9 +950,19 @@ public sealed class CSharpProjectExporterService
             scriptJsonByType = IndexScriptJsonByType(scriptJsonPath, cancellationToken);
         }
 
+        // 6b. Optional one-time inspection for stripped UnityEngine.CoreModule CreateAssetMenuAttribute accessors
+        var sanitizeStrippedCreateAssetMenu = options.SanitizeStrippedEditorAttributes
+            && ((allDiscoveredDlls.TryGetValue("UnityEngine.CoreModule", out var coreModuleMeta)
+                    && AreCreateAssetMenuPropertiesStripped(coreModuleMeta.FilePath))
+                || (!allDiscoveredDlls.ContainsKey("UnityEngine.CoreModule")
+                    && allDiscoveredDlls.TryGetValue("UnityEngine", out var legacyUnityMeta)
+                    && AreCreateAssetMenuPropertiesStripped(legacyUnityMeta.FilePath)));
+
         // 7. Decompile each assembly in bounded parallel (each worker owns its own PEFile + CSharpDecompiler)
         var completedAssemblies = 0;
         var completedTypes = 0;
+        var totalConservativeFallbacks = 0;
+        var sanitizedAttributeFilesCount = 0;
         var estimatedTotalTypes = assembliesToExport.Sum(static a => a.EstimatedTypeCount);
         var failedTypesBag = new ConcurrentBag<FailedTypeExportRecord>();
         var assemblyReportsBag = new ConcurrentBag<ExportedAssemblyReport>();
@@ -966,6 +998,7 @@ public sealed class CSharpProjectExporterService
 
             var exportedCount = 0;
             var failedCount = 0;
+            var asmConservativeFallbacks = 0;
             var usedRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var createdDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -973,6 +1006,7 @@ public sealed class CSharpProjectExporterService
             var resolver = CreateResolver(asmMeta.FilePath, dllDirectories);
             var decompilerSettings = CreateUnityFriendlyDecompilerSettings();
             var decompiler = new CSharpDecompiler(peFile, resolver, decompilerSettings);
+            CSharpDecompiler? conservativeDecompiler = null;
 
             var topLevelTypes = decompiler.TypeSystem.MainModule.TopLevelTypeDefinitions
                 .Where(static t => !AssemblyExplorerService.IsCompilerGeneratedTopLevelTypeName(t.Name))
@@ -997,6 +1031,55 @@ public sealed class CSharpProjectExporterService
                 try
                 {
                     var code = decompiler.DecompileTypeAsString(typeDef.FullTypeName);
+                    if (options.EnableConservativeDecompilerFallback && HasLikelyDecompilerSyntaxAnomaly(code))
+                    {
+                        var usedFallback = false;
+                        var primaryAnomalies = CountLikelyDecompilerSyntaxAnomalies(code);
+                        conservativeDecompiler ??= new CSharpDecompiler(peFile, resolver, CreateConservativeDecompilerSettings());
+                        try
+                        {
+                            var conservativeCode = conservativeDecompiler.DecompileTypeAsString(typeDef.FullTypeName);
+                            var conservativeAnomalies = CountLikelyDecompilerSyntaxAnomalies(conservativeCode);
+                            if (conservativeAnomalies < primaryAnomalies)
+                            {
+                                code = conservativeCode;
+                                usedFallback = true;
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch
+                        {
+                            // Keep primary decompilation when conservative retry throws
+                        }
+
+                        if (code.Contains("set;", StringComparison.Ordinal))
+                        {
+                            code = RepairSetOnlyAutoProperties(code, out var repairedSetOnlyCount);
+                            if (repairedSetOnlyCount > 0)
+                            {
+                                usedFallback = true;
+                            }
+                        }
+
+                        if (usedFallback)
+                        {
+                            asmConservativeFallbacks++;
+                            Interlocked.Increment(ref totalConservativeFallbacks);
+                        }
+                    }
+
+                    if (sanitizeStrippedCreateAssetMenu)
+                    {
+                        code = SanitizeStrippedCreateAssetMenuAttributes(code, out var attrModified);
+                        if (attrModified)
+                        {
+                            Interlocked.Increment(ref sanitizedAttributeFilesCount);
+                        }
+                    }
+
                     if (isDummyDll)
                     {
                         sourceText = FormatDummyDllSource(asmMeta.AssemblyShortName, fullName, ns, className, code, scriptJsonByType);
@@ -1013,9 +1096,49 @@ public sealed class CSharpProjectExporterService
                 }
                 catch (Exception ex)
                 {
-                    failedCount++;
-                    failedTypesBag.Add(new FailedTypeExportRecord(asmMeta.AssemblyShortName, fullName, ex.Message));
-                    sourceText = BuildFailedTypeStub(asmMeta.AssemblyShortName, ns, className, ex.Message);
+                    var rescued = false;
+                    string? rescuedCode = null;
+                    if (options.EnableConservativeDecompilerFallback)
+                    {
+                        try
+                        {
+                            conservativeDecompiler ??= new CSharpDecompiler(peFile, resolver, CreateConservativeDecompilerSettings());
+                            rescuedCode = conservativeDecompiler.DecompileTypeAsString(typeDef.FullTypeName);
+                            if (sanitizeStrippedCreateAssetMenu)
+                            {
+                                rescuedCode = SanitizeStrippedCreateAssetMenuAttributes(rescuedCode, out var attrModified);
+                                if (attrModified)
+                                {
+                                    Interlocked.Increment(ref sanitizedAttributeFilesCount);
+                                }
+                            }
+                            rescued = true;
+                            asmConservativeFallbacks++;
+                            Interlocked.Increment(ref totalConservativeFallbacks);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch
+                        {
+                            rescued = false;
+                        }
+                    }
+
+                    if (rescued && rescuedCode != null)
+                    {
+                        sourceText = isDummyDll
+                            ? FormatDummyDllSource(asmMeta.AssemblyShortName, fullName, ns, className, rescuedCode, scriptJsonByType)
+                            : rescuedCode;
+                        exportedCount++;
+                    }
+                    else
+                    {
+                        failedCount++;
+                        failedTypesBag.Add(new FailedTypeExportRecord(asmMeta.AssemblyShortName, fullName, ex.Message));
+                        sourceText = BuildFailedTypeStub(asmMeta.AssemblyShortName, ns, className, ex.Message);
+                    }
                 }
 
                 File.WriteAllText(targetFile, sourceText, Utf8NoBom);
@@ -1079,6 +1202,7 @@ public sealed class CSharpProjectExporterService
                 AsmdefFilePath = asmdefPath,
                 TypesExported = exportedCount,
                 TypesFailed = failedCount,
+                ConservativeFallbackCount = asmConservativeFallbacks,
                 ProjectReferences = projRefs.ToList(),
                 DllReferences = dllRefs,
                 UnresolvedReferences = unresolved
@@ -1126,6 +1250,8 @@ public sealed class CSharpProjectExporterService
             ReferenceAssembliesCount = copiedRefDllNames.Count,
             TotalTypesExported = sortedReports.Sum(static r => r.TypesExported),
             FailedTypesCount = failedTypesBag.Count,
+            ConservativeFallbackCount = Volatile.Read(ref totalConservativeFallbacks),
+            SanitizedAttributeFilesCount = Volatile.Read(ref sanitizedAttributeFilesCount),
             BrokenCycles = graphResolution.BrokenCycles,
             UnresolvedReferences = unresolvedRefsGlobal.Keys.OrderBy(static k => k, StringComparer.OrdinalIgnoreCase).ToList(),
             FailedTypes = failedTypesBag.OrderBy(static f => f.AssemblyName, StringComparer.OrdinalIgnoreCase).ThenBy(static f => f.TypeFullName, StringComparer.OrdinalIgnoreCase).ToList(),
@@ -1794,6 +1920,1054 @@ public sealed class CSharpProjectExporterService
         };
     }
 
+    private static DecompilerSettings CreateConservativeDecompilerSettings()
+    {
+        return new DecompilerSettings(LanguageVersion.CSharp7_3)
+        {
+            TupleTypes = false,
+            TupleConversions = false,
+            TupleComparisons = false,
+            UseExpressionBodyForCalculatedGetterOnlyProperties = false,
+            UseEnhancedUsing = false,
+            PatternMatching = false,
+            SwitchExpressions = false,
+            ThrowOnAssemblyResolveErrors = false,
+            UseDebugSymbols = false,
+            ShowXmlDocumentation = false,
+            FileScopedNamespaces = false,
+            RemoveDeadCode = false
+        };
+    }
+
+    private static readonly Regex CreateAssetMenuLineRegex = new(
+        @"^(?<indent>[ \t]*)(?<attr>\[(?:global::)?(?:UnityEngine\.)?CreateAssetMenu(?:Attribute)?\s*\([^\r\n]*\)\])(?<tail>[ \t]*)$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Fast, zero-dependency syntax/sanity validator for decompiled C# code.
+    /// Detects unbalanced braces (ignoring strings/chars/comments), unescaped compiler-generated
+    /// identifier tokens (e.g. &lt;&gt;c, &lt;Run&gt;d__5), and invalid C# set-only auto-properties (CS8051).
+    /// </summary>
+    public static bool HasLikelyDecompilerSyntaxAnomaly(string? csharpCode)
+    {
+        return CountLikelyDecompilerSyntaxAnomalies(csharpCode) > 0;
+    }
+
+    /// <summary>
+    /// Counts syntax/decompiler anomalies in decompiled C# output so conservative fallback can
+    /// choose the cleaner output deterministically.
+    /// </summary>
+    public static int CountLikelyDecompilerSyntaxAnomalies(string? csharpCode)
+    {
+        if (string.IsNullOrWhiteSpace(csharpCode))
+        {
+            return 0;
+        }
+
+        var len = csharpCode.Length;
+        var braceDepth = 0;
+        var unbalancedBraceAnomalies = 0;
+        var compilerGenAnomalies = 0;
+        var setOnlyAutoPropAnomalies = 0;
+
+        var frames = new List<BraceFrame>(16);
+        var headerStart = 0;
+        var atLineStart = true;
+
+        var i = 0;
+        while (i < len)
+        {
+            var c = csharpCode[i];
+
+            if (c == '\r' || c == '\n')
+            {
+                atLineStart = true;
+                i++;
+                continue;
+            }
+
+            if (c == ' ' || c == '\t')
+            {
+                i++;
+                continue;
+            }
+
+            // Skip preprocessor directives (#if, #region, #pragma, etc.)
+            if (atLineStart && c == '#')
+            {
+                while (i < len && csharpCode[i] != '\n')
+                {
+                    i++;
+                }
+                atLineStart = true;
+                continue;
+            }
+
+            atLineStart = false;
+
+            // Single-line comment
+            if (c == '/' && i + 1 < len && csharpCode[i + 1] == '/')
+            {
+                i += 2;
+                while (i < len && csharpCode[i] != '\n')
+                {
+                    i++;
+                }
+                continue;
+            }
+
+            // Multi-line comment
+            if (c == '/' && i + 1 < len && csharpCode[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < len && !(csharpCode[i] == '*' && csharpCode[i + 1] == '/'))
+                {
+                    i++;
+                }
+                i = i + 1 < len ? i + 2 : len;
+                continue;
+            }
+
+            // Char literal
+            if (c == '\'')
+            {
+                i = SkipCharLiteral(csharpCode, i);
+                continue;
+            }
+
+            // String literals (regular, verbatim, interpolated, raw)
+            if (c == '"' || c == '@' || c == '$')
+            {
+                var nextIdx = TrySkipStringLiteral(csharpCode, i);
+                if (nextIdx > i)
+                {
+                    i = nextIdx;
+                    continue;
+                }
+            }
+
+            if (c == ';')
+            {
+                headerStart = i + 1;
+                i++;
+                continue;
+            }
+
+            if (c == '{')
+            {
+                var headerSpan = csharpCode.AsSpan(headerStart, i - headerStart);
+                var opensInterface = HeaderDeclaresInterface(headerSpan);
+                var headerAbstractOrExtern = HeaderContainsAbstractOrExtern(headerSpan);
+                var parentIsInterface = frames.Count > 0 && frames[frames.Count - 1].IsInterface;
+
+                if (frames.Count > 0)
+                {
+                    var parent = frames[frames.Count - 1];
+                    parent.HasNestedBrace = true;
+                    frames[frames.Count - 1] = parent;
+                }
+
+                frames.Add(new BraceFrame(
+                    OpenIndex: i,
+                    IsInterface: opensInterface,
+                    ParentIsInterface: parentIsInterface,
+                    HeaderHasAbstractOrExtern: headerAbstractOrExtern,
+                    HasNestedBrace: false));
+                braceDepth++;
+                headerStart = i + 1;
+                i++;
+                continue;
+            }
+
+            if (c == '}')
+            {
+                if (braceDepth == 0)
+                {
+                    unbalancedBraceAnomalies++;
+                }
+                else
+                {
+                    braceDepth--;
+                    if (frames.Count > 0)
+                    {
+                        var frame = frames[frames.Count - 1];
+                        frames.RemoveAt(frames.Count - 1);
+                        if (!frame.HasNestedBrace
+                            && !frame.ParentIsInterface
+                            && !frame.HeaderHasAbstractOrExtern
+                            && IsSetOnlyAutoPropertyBody(csharpCode.AsSpan(frame.OpenIndex + 1, i - frame.OpenIndex - 1)))
+                        {
+                            setOnlyAutoPropAnomalies++;
+                        }
+                    }
+                }
+                headerStart = i + 1;
+                i++;
+                continue;
+            }
+
+            if (c == '?')
+            {
+                // Detect ILSpy unresolved type placeholder at statement start (e.g. "? item = (...);")
+                var prevNonWs = FindPreviousNonWhitespaceChar(csharpCode, i - 1);
+                if ((prevNonWs == '\0' || prevNonWs == '{' || prevNonWs == '}' || prevNonWs == ';')
+                    && IsUnknownTypePlaceholderAt(csharpCode, i))
+                {
+                    compilerGenAnomalies++;
+                    i++;
+                    continue;
+                }
+            }
+
+            if (c == '<')
+            {
+                if (i + 1 < len && csharpCode[i + 1] == '>')
+                {
+                    // Check for compiler-generated <> tokens (e.g. <>c, <>4__this, .<>, = <>;)
+                    // while allowing valid C# open generic typeof(List<>) / typeof(Outer<>.Inner)
+                    var afterIdx = i + 2;
+                    var followedByIdent = afterIdx < len && IsIdentifierPart(csharpCode[afterIdx]);
+                    var prevNonWs = FindPreviousNonWhitespaceChar(csharpCode, i - 1);
+                    var precededByDot = prevNonWs == '.';
+                    var validOpenGeneric = !followedByIdent
+                        && !precededByDot
+                        && prevNonWs != '\0'
+                        && IsIdentifierPart(prevNonWs);
+
+                    if (!validOpenGeneric)
+                    {
+                        compilerGenAnomalies++;
+                    }
+                    i += 2;
+                    continue;
+                }
+
+                // Check for unescaped compiler-generated <Name>suffix tokens (e.g. <Run>d__5, <Value>k__BackingField, <PrivateImplementationDetails>)
+                var endAngle = ScanCompilerGeneratedAngleToken(csharpCode, i);
+                if (endAngle > i)
+                {
+                    var innerSpan = csharpCode.AsSpan(i + 1, endAngle - i - 1);
+                    var followedByIdent = endAngle + 1 < len && IsIdentifierPart(csharpCode[endAngle + 1]);
+                    if (followedByIdent
+                        || innerSpan.Equals("PrivateImplementationDetails", StringComparison.Ordinal)
+                        || innerSpan.Equals("Module", StringComparison.Ordinal))
+                    {
+                        compilerGenAnomalies++;
+                        i = endAngle + 1;
+                        continue;
+                    }
+                }
+            }
+
+            i++;
+        }
+
+        if (braceDepth > 0)
+        {
+            unbalancedBraceAnomalies += braceDepth;
+        }
+
+        return unbalancedBraceAnomalies + compilerGenAnomalies + setOnlyAutoPropAnomalies;
+    }
+
+    /// <summary>
+    /// Inspects UnityEngine.CoreModule.dll (or monolithic UnityEngine.dll) metadata once per export
+    /// to determine whether CreateAssetMenuAttribute lacks writable fileName/menuName members (IL2CPP stripping).
+    /// </summary>
+    public static bool AreCreateAssetMenuPropertiesStripped(string? coreModulePath)
+    {
+        if (string.IsNullOrWhiteSpace(coreModulePath) || !File.Exists(coreModulePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var stream = new FileStream(coreModulePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            if (stream.Length < 64)
+            {
+                return false;
+            }
+
+            using var peReader = new PEReader(stream, PEStreamOptions.PrefetchMetadata | PEStreamOptions.LeaveOpen);
+            if (!peReader.HasMetadata)
+            {
+                return false;
+            }
+
+            var md = peReader.GetMetadataReader(MetadataReaderOptions.None);
+            foreach (var tdHandle in md.TypeDefinitions)
+            {
+                var td = md.GetTypeDefinition(tdHandle);
+                if (!string.Equals(md.GetString(td.Name), "CreateAssetMenuAttribute", StringComparison.Ordinal)
+                    || !string.Equals(md.GetString(td.Namespace), "UnityEngine", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var hasReadWriteFileName = false;
+                var hasReadWriteMenuName = false;
+                var hasReadWriteOrder = false;
+
+                foreach (var propHandle in td.GetProperties())
+                {
+                    var prop = md.GetPropertyDefinition(propHandle);
+                    var propName = md.GetString(prop.Name);
+                    var accessors = prop.GetAccessors();
+                    var getterHandle = accessors.Getter;
+                    var setterHandle = accessors.Setter;
+                    if (getterHandle.IsNil || setterHandle.IsNil)
+                    {
+                        continue;
+                    }
+
+                    var getterDef = md.GetMethodDefinition(getterHandle);
+                    var setterDef = md.GetMethodDefinition(setterHandle);
+                    var isPublicReadWrite = (getterDef.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public
+                        && (setterDef.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public;
+                    if (!isPublicReadWrite)
+                    {
+                        continue;
+                    }
+
+                    if (string.Equals(propName, "fileName", StringComparison.Ordinal))
+                    {
+                        hasReadWriteFileName = true;
+                    }
+                    else if (string.Equals(propName, "menuName", StringComparison.Ordinal))
+                    {
+                        hasReadWriteMenuName = true;
+                    }
+                    else if (string.Equals(propName, "order", StringComparison.Ordinal))
+                    {
+                        hasReadWriteOrder = true;
+                    }
+                }
+
+                foreach (var fieldHandle in td.GetFields())
+                {
+                    var field = md.GetFieldDefinition(fieldHandle);
+                    var isWritablePublicField = (field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public
+                        && (field.Attributes & (FieldAttributes.InitOnly | FieldAttributes.Literal | FieldAttributes.Static)) == 0;
+                    if (!isWritablePublicField)
+                    {
+                        continue;
+                    }
+
+                    var fieldName = md.GetString(field.Name);
+                    if (string.Equals(fieldName, "fileName", StringComparison.Ordinal))
+                    {
+                        hasReadWriteFileName = true;
+                    }
+                    else if (string.Equals(fieldName, "menuName", StringComparison.Ordinal))
+                    {
+                        hasReadWriteMenuName = true;
+                    }
+                    else if (string.Equals(fieldName, "order", StringComparison.Ordinal))
+                    {
+                        hasReadWriteOrder = true;
+                    }
+                }
+
+                return !(hasReadWriteFileName && hasReadWriteMenuName && hasReadWriteOrder);
+            }
+
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Comments out [CreateAssetMenu(...)] attribute lines when UnityEngine.CoreModule has stripped
+    /// its named argument setters in IL2CPP builds, preserving the exact original attribute in comments.
+    /// </summary>
+    public static string SanitizeStrippedCreateAssetMenuAttributes(string csharpCode, out bool modified)
+    {
+        modified = false;
+        if (string.IsNullOrEmpty(csharpCode)
+            || !csharpCode.Contains("CreateAssetMenu", StringComparison.Ordinal))
+        {
+            return csharpCode;
+        }
+
+        var sb = new StringBuilder(csharpCode.Length + 96);
+        var pos = 0;
+        var len = csharpCode.Length;
+
+        while (pos < len)
+        {
+            var lineEnd = pos;
+            while (lineEnd < len && csharpCode[lineEnd] != '\r' && csharpCode[lineEnd] != '\n')
+            {
+                lineEnd++;
+            }
+
+            var line = csharpCode.Substring(pos, lineEnd - pos);
+            var newlineStart = lineEnd;
+            if (lineEnd < len && csharpCode[lineEnd] == '\r')
+            {
+                lineEnd++;
+            }
+            if (lineEnd < len && csharpCode[lineEnd] == '\n')
+            {
+                lineEnd++;
+            }
+
+            if (line.Contains("CreateAssetMenu", StringComparison.Ordinal))
+            {
+                var match = CreateAssetMenuLineRegex.Match(line);
+                if (match.Success)
+                {
+                    sb.Append(match.Groups["indent"].Value);
+                    sb.Append("// ");
+                    sb.Append(match.Groups["attr"].Value);
+                    sb.Append(" // Stripped in IL2CPP CoreModule; uncomment in Unity Editor");
+                    modified = true;
+                }
+                else
+                {
+                    sb.Append(line);
+                }
+            }
+            else
+            {
+                sb.Append(line);
+            }
+
+            if (lineEnd > newlineStart)
+            {
+                sb.Append(csharpCode, newlineStart, lineEnd - newlineStart);
+            }
+
+            pos = lineEnd;
+        }
+
+        return modified ? sb.ToString() : csharpCode;
+    }
+
+    /// <summary>
+    /// Repairs invalid C# set-only auto-properties (CS8051) emitted by ILSpy when Unity managed
+    /// stripping removed an unused property getter (e.g. <c>public Transform Sender { set; }</c>).
+    /// Never modifies interface, abstract, or extern property declarations.
+    /// </summary>
+    public static string RepairSetOnlyAutoProperties(string csharpCode, out int repairedCount)
+    {
+        repairedCount = 0;
+        if (string.IsNullOrWhiteSpace(csharpCode)
+            || !csharpCode.Contains("set;", StringComparison.Ordinal))
+        {
+            return csharpCode;
+        }
+
+        var len = csharpCode.Length;
+        var frames = new List<BraceFrame>(16);
+        var replacements = new List<(int Start, int Length, string Replacement)>();
+        var headerStart = 0;
+        var atLineStart = true;
+
+        var i = 0;
+        while (i < len)
+        {
+            var c = csharpCode[i];
+            if (c == '\r' || c == '\n')
+            {
+                atLineStart = true;
+                i++;
+                continue;
+            }
+            if (c == ' ' || c == '\t')
+            {
+                i++;
+                continue;
+            }
+            if (atLineStart && c == '#')
+            {
+                while (i < len && csharpCode[i] != '\n') i++;
+                atLineStart = true;
+                continue;
+            }
+            atLineStart = false;
+
+            if (c == '/' && i + 1 < len && csharpCode[i + 1] == '/')
+            {
+                i += 2;
+                while (i < len && csharpCode[i] != '\n') i++;
+                continue;
+            }
+            if (c == '/' && i + 1 < len && csharpCode[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < len && !(csharpCode[i] == '*' && csharpCode[i + 1] == '/')) i++;
+                i = i + 1 < len ? i + 2 : len;
+                continue;
+            }
+            if (c == '\'')
+            {
+                i = SkipCharLiteral(csharpCode, i);
+                continue;
+            }
+            if (c == '"' || c == '@' || c == '$')
+            {
+                var nextIdx = TrySkipStringLiteral(csharpCode, i);
+                if (nextIdx > i)
+                {
+                    i = nextIdx;
+                    continue;
+                }
+            }
+            if (c == ';')
+            {
+                headerStart = i + 1;
+                i++;
+                continue;
+            }
+            if (c == '{')
+            {
+                var headerSpan = csharpCode.AsSpan(headerStart, i - headerStart);
+                var opensInterface = HeaderDeclaresInterface(headerSpan);
+                var headerAbstractOrExtern = HeaderContainsAbstractOrExtern(headerSpan);
+                var headerOverride = ContainsStandaloneKeyword(headerSpan, "override");
+                var parentIsInterface = frames.Count > 0 && frames[frames.Count - 1].IsInterface;
+
+                if (frames.Count > 0)
+                {
+                    var parent = frames[frames.Count - 1];
+                    parent.HasNestedBrace = true;
+                    frames[frames.Count - 1] = parent;
+                }
+
+                frames.Add(new BraceFrame(
+                    OpenIndex: i,
+                    IsInterface: opensInterface,
+                    ParentIsInterface: parentIsInterface,
+                    HeaderHasAbstractOrExtern: headerAbstractOrExtern,
+                    HasNestedBrace: false,
+                    HeaderHasOverride: headerOverride));
+                headerStart = i + 1;
+                i++;
+                continue;
+            }
+            if (c == '}')
+            {
+                if (frames.Count > 0)
+                {
+                    var frame = frames[frames.Count - 1];
+                    frames.RemoveAt(frames.Count - 1);
+                    var bodyStart = frame.OpenIndex + 1;
+                    var bodyLen = i - bodyStart;
+                    if (!frame.HasNestedBrace
+                        && !frame.ParentIsInterface
+                        && !frame.HeaderHasAbstractOrExtern
+                        && bodyLen > 0
+                        && IsSetOnlyAutoPropertyBody(csharpCode.AsSpan(bodyStart, bodyLen)))
+                    {
+                        var bodyText = csharpCode.Substring(bodyStart, bodyLen);
+                        string repairedBody;
+                        if (frame.HeaderHasOverride)
+                        {
+                            // For override properties, base may lack a get accessor; emit empty setter body instead of CS8051.
+                            var setIdx = bodyText.IndexOf("set;", StringComparison.Ordinal);
+                            repairedBody = setIdx >= 0
+                                ? bodyText.Substring(0, setIdx) + "set { }" + bodyText.Substring(setIdx + 4)
+                                : " set { } ";
+                        }
+                        else
+                        {
+                            // Synthesize auto-getter for stripped get_ accessor (CS8051)
+                            var trimmedBody = bodyText.Trim();
+                            repairedBody = bodyText.Contains('\n', StringComparison.Ordinal)
+                                ? " get;" + bodyText
+                                : $" get; {trimmedBody} ";
+                        }
+
+                        replacements.Add((bodyStart, bodyLen, repairedBody));
+                    }
+                }
+                headerStart = i + 1;
+                i++;
+                continue;
+            }
+
+            i++;
+        }
+
+        if (replacements.Count == 0)
+        {
+            return csharpCode;
+        }
+
+        repairedCount = replacements.Count;
+        var sb = new StringBuilder(csharpCode.Length + replacements.Count * 12);
+        var cursor = 0;
+        for (var r = 0; r < replacements.Count; r++)
+        {
+            var rep = replacements[r];
+            if (rep.Start > cursor)
+            {
+                sb.Append(csharpCode, cursor, rep.Start - cursor);
+            }
+            sb.Append(rep.Replacement);
+            cursor = rep.Start + rep.Length;
+        }
+        if (cursor < csharpCode.Length)
+        {
+            sb.Append(csharpCode, cursor, csharpCode.Length - cursor);
+        }
+
+        return sb.ToString();
+    }
+
+    private static bool IsUnknownTypePlaceholderAt(string code, int qIndex)
+    {
+        var len = code.Length;
+        var j = qIndex + 1;
+        // Must have at least one horizontal space/tab after '?'
+        if (j >= len || (code[j] != ' ' && code[j] != '\t'))
+        {
+            return false;
+        }
+        while (j < len && (code[j] == ' ' || code[j] == '\t'))
+        {
+            j++;
+        }
+        if (j >= len)
+        {
+            return false;
+        }
+
+        // Expect identifier (optionally @-prefixed)
+        if (code[j] == '@')
+        {
+            j++;
+        }
+        if (j >= len || !((code[j] >= 'a' && code[j] <= 'z') || (code[j] >= 'A' && code[j] <= 'Z') || code[j] == '_'))
+        {
+            return false;
+        }
+        while (j < len && IsIdentifierPart(code[j]))
+        {
+            j++;
+        }
+        while (j < len && (code[j] == ' ' || code[j] == '\t'))
+        {
+            j++;
+        }
+
+        // Followed by '=' or ';' (local variable declaration with unresolved ILSpy type '?')
+        return j < len && (code[j] == '=' || code[j] == ';');
+    }
+
+    private struct BraceFrame
+    {
+        public BraceFrame(int OpenIndex, bool IsInterface, bool ParentIsInterface, bool HeaderHasAbstractOrExtern, bool HasNestedBrace, bool HeaderHasOverride = false)
+        {
+            this.OpenIndex = OpenIndex;
+            this.IsInterface = IsInterface;
+            this.ParentIsInterface = ParentIsInterface;
+            this.HeaderHasAbstractOrExtern = HeaderHasAbstractOrExtern;
+            this.HasNestedBrace = HasNestedBrace;
+            this.HeaderHasOverride = HeaderHasOverride;
+        }
+
+        public int OpenIndex;
+        public bool IsInterface;
+        public bool ParentIsInterface;
+        public bool HeaderHasAbstractOrExtern;
+        public bool HasNestedBrace;
+        public bool HeaderHasOverride;
+    }
+
+    private static int SkipCharLiteral(string code, int start)
+    {
+        var i = start + 1;
+        var len = code.Length;
+        while (i < len)
+        {
+            if (code[i] == '\\')
+            {
+                i += 2;
+                continue;
+            }
+            if (code[i] == '\'' || code[i] == '\n')
+            {
+                return i + 1;
+            }
+            i++;
+        }
+        return len;
+    }
+
+    private static int TrySkipStringLiteral(string code, int start)
+    {
+        var len = code.Length;
+        var i = start;
+        var isVerbatim = false;
+        var isInterpolated = false;
+
+        // Parse leading $ and @ prefixes (including $$""" raw interpolated strings)
+        while (i < len && (code[i] == '$' || code[i] == '@'))
+        {
+            if (code[i] == '$') isInterpolated = true;
+            else if (code[i] == '@') isVerbatim = true;
+            i++;
+        }
+
+        if (i >= len || code[i] != '"')
+        {
+            return start;
+        }
+
+        // Check for raw string literal (3+ consecutive quotes, only valid when not verbatim '@')
+        if (!isVerbatim && i + 2 < len && code[i + 1] == '"' && code[i + 2] == '"')
+        {
+            var quoteCount = 0;
+            while (i < len && code[i] == '"')
+            {
+                quoteCount++;
+                i++;
+            }
+
+            while (i < len)
+            {
+                if (code[i] == '"')
+                {
+                    var run = 0;
+                    while (i + run < len && code[i + run] == '"')
+                    {
+                        run++;
+                    }
+                    i += run;
+                    if (run >= quoteCount)
+                    {
+                        return i;
+                    }
+                }
+                else
+                {
+                    i++;
+                }
+            }
+            return len;
+        }
+
+        // Regular, verbatim, or interpolated string literal
+        i++; // skip opening quote
+        if (isInterpolated)
+        {
+            var interpBraceDepth = 0;
+            while (i < len)
+            {
+                var ch = code[i];
+                if (interpBraceDepth == 0)
+                {
+                    if (isVerbatim)
+                    {
+                        if (ch == '"')
+                        {
+                            if (i + 1 < len && code[i + 1] == '"')
+                            {
+                                i += 2;
+                                continue;
+                            }
+                            return i + 1;
+                        }
+                    }
+                    else
+                    {
+                        if (ch == '\\')
+                        {
+                            i += 2;
+                            continue;
+                        }
+                        if (ch == '"')
+                        {
+                            return i + 1;
+                        }
+                    }
+
+                    if (ch == '{')
+                    {
+                        if (i + 1 < len && code[i + 1] == '{')
+                        {
+                            i += 2;
+                            continue;
+                        }
+                        interpBraceDepth++;
+                        i++;
+                        continue;
+                    }
+
+                    if (ch == '}' && i + 1 < len && code[i + 1] == '}')
+                    {
+                        i += 2;
+                        continue;
+                    }
+
+                    i++;
+                }
+                else
+                {
+                    // Inside an interpolation expression { ... }
+                    if (ch == '\'')
+                    {
+                        i = SkipCharLiteral(code, i);
+                        continue;
+                    }
+                    if (ch == '"' || ch == '@' || ch == '$')
+                    {
+                        var nested = TrySkipStringLiteral(code, i);
+                        if (nested > i)
+                        {
+                            i = nested;
+                            continue;
+                        }
+                    }
+                    if (ch == '{')
+                    {
+                        interpBraceDepth++;
+                    }
+                    else if (ch == '}')
+                    {
+                        interpBraceDepth--;
+                    }
+                    i++;
+                }
+            }
+            return len;
+        }
+
+        if (isVerbatim)
+        {
+            while (i < len)
+            {
+                if (code[i] == '"')
+                {
+                    if (i + 1 < len && code[i + 1] == '"')
+                    {
+                        i += 2;
+                        continue;
+                    }
+                    return i + 1;
+                }
+                i++;
+            }
+            return len;
+        }
+
+        while (i < len)
+        {
+            if (code[i] == '\\')
+            {
+                i += 2;
+                continue;
+            }
+            if (code[i] == '"' || code[i] == '\n')
+            {
+                return i + 1;
+            }
+            i++;
+        }
+        return len;
+    }
+
+    private static bool IsIdentifierPart(char c)
+    {
+        return (c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9')
+            || c == '_';
+    }
+
+    private static char FindPreviousNonWhitespaceChar(string code, int index)
+    {
+        for (var k = index; k >= 0; k--)
+        {
+            var ch = code[k];
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+            {
+                return ch;
+            }
+        }
+        return '\0';
+    }
+
+    private static int ScanCompilerGeneratedAngleToken(string code, int openAngleIndex)
+    {
+        var len = code.Length;
+        var limit = Math.Min(len, openAngleIndex + 128);
+        for (var j = openAngleIndex + 1; j < limit; j++)
+        {
+            var ch = code[j];
+            if (ch == '>')
+            {
+                return j > openAngleIndex + 1 ? j : -1;
+            }
+
+            if (!IsIdentifierPart(ch) && ch != '$' && ch != '.' && ch != '|')
+            {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    private static bool HeaderDeclaresInterface(ReadOnlySpan<char> header)
+    {
+        return ContainsStandaloneKeyword(header, "interface")
+            && !ContainsStandaloneKeyword(header, "class")
+            && !ContainsStandaloneKeyword(header, "struct");
+    }
+
+    private static bool HeaderContainsAbstractOrExtern(ReadOnlySpan<char> header)
+    {
+        return ContainsStandaloneKeyword(header, "abstract")
+            || ContainsStandaloneKeyword(header, "extern");
+    }
+
+    private static bool ContainsStandaloneKeyword(ReadOnlySpan<char> span, ReadOnlySpan<char> keyword)
+    {
+        var i = 0;
+        while (i < span.Length)
+        {
+            var c = span[i];
+            if (c == '/' && i + 1 < span.Length && span[i + 1] == '/')
+            {
+                while (i < span.Length && span[i] != '\n') i++;
+                continue;
+            }
+            if (c == '/' && i + 1 < span.Length && span[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < span.Length && !(span[i] == '*' && span[i + 1] == '/')) i++;
+                i = i + 1 < span.Length ? i + 2 : span.Length;
+                continue;
+            }
+            if (IsIdentifierPart(c))
+            {
+                var start = i;
+                while (i < span.Length && IsIdentifierPart(span[i])) i++;
+                var word = span.Slice(start, i - start);
+                if (word.Equals(keyword, StringComparison.Ordinal)
+                    && (start == 0 || span[start - 1] != '@'))
+                {
+                    return true;
+                }
+                continue;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    private static bool IsSetOnlyAutoPropertyBody(ReadOnlySpan<char> body)
+    {
+        var i = 0;
+        var sawSet = false;
+        var sawSemicolon = false;
+
+        while (i < body.Length)
+        {
+            SkipWhitespaceAndComments(body, ref i);
+            if (i >= body.Length)
+            {
+                break;
+            }
+
+            // Skip optional accessor attributes like [CompilerGenerated]
+            if (!sawSet && body[i] == '[')
+            {
+                var bracketDepth = 1;
+                i++;
+                while (i < body.Length && bracketDepth > 0)
+                {
+                    if (body[i] == '[') bracketDepth++;
+                    else if (body[i] == ']') bracketDepth--;
+                    i++;
+                }
+                continue;
+            }
+
+            if (sawSemicolon)
+            {
+                // More tokens after "set;" (e.g. "set; get;") -> not set-only
+                return false;
+            }
+
+            if (sawSet)
+            {
+                if (body[i] == ';')
+                {
+                    sawSemicolon = true;
+                    i++;
+                    continue;
+                }
+                return false;
+            }
+
+            if (!IsIdentifierPart(body[i]))
+            {
+                return false;
+            }
+
+            var start = i;
+            while (i < body.Length && IsIdentifierPart(body[i]))
+            {
+                i++;
+            }
+
+            var token = body.Slice(start, i - start);
+            if (token.Equals("set", StringComparison.Ordinal))
+            {
+                sawSet = true;
+            }
+            else if (token.Equals("private", StringComparison.Ordinal)
+                || token.Equals("protected", StringComparison.Ordinal)
+                || token.Equals("internal", StringComparison.Ordinal)
+                || token.Equals("public", StringComparison.Ordinal)
+                || token.Equals("readonly", StringComparison.Ordinal)
+                || token.Equals("unsafe", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        return sawSet && sawSemicolon;
+    }
+
+    private static void SkipWhitespaceAndComments(ReadOnlySpan<char> span, ref int i)
+    {
+        while (i < span.Length)
+        {
+            var c = span[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+            {
+                i++;
+                continue;
+            }
+            if (c == '/' && i + 1 < span.Length && span[i + 1] == '/')
+            {
+                i += 2;
+                while (i < span.Length && span[i] != '\n') i++;
+                continue;
+            }
+            if (c == '/' && i + 1 < span.Length && span[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < span.Length && !(span[i] == '*' && span[i + 1] == '/')) i++;
+                i = i + 1 < span.Length ? i + 2 : span.Length;
+                continue;
+            }
+            break;
+        }
+    }
+
     private static string BuildCsprojXml(
         string assemblyName,
         string detectedTargetFramework,
@@ -2171,6 +3345,8 @@ public sealed class CSharpProjectExporterService
             referenceAssembliesCount = result.ReferenceAssembliesCount,
             totalTypesExported = result.TotalTypesExported,
             failedTypesCount = result.FailedTypesCount,
+            conservativeFallbackCount = result.ConservativeFallbackCount,
+            sanitizedAttributeFilesCount = result.SanitizedAttributeFilesCount,
             solutionPath = result.SolutionPath,
             brokenCycles = result.BrokenCycles,
             unresolvedReferences = result.UnresolvedReferences,

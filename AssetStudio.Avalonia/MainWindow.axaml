@@ -567,7 +567,7 @@
                     <Grid x:Name="PreviewTabContent" RowDefinitions="Auto,*" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}" IsVisible="{Binding PreviewSession.IsPreviewTabActive}">
                         <Border x:Name="IndexingProgressPanel" Grid.Row="0" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="0,0,0,1" Padding="10,7" IsVisible="{Binding IndexingProgress.IsPanelVisible}">
                             <Grid RowDefinitions="Auto,4" ColumnDefinitions="*,Auto" RowSpacing="5" ColumnSpacing="12">
-                                <TextBlock x:Name="IndexingProgressText" Text="{Binding IndexingProgress.PrimaryStatusText}" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                <TextBlock x:Name="IndexingProgressText" Text="{Binding IndexingProgress.PrimaryStatusText}" ToolTip.Tip="{Binding IndexingProgress.PrimaryStatusText}" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
                                 <TextBlock x:Name="IndexingProgressPercentText" Grid.Column="1" Text="{Binding IndexingProgress.FormattedPercentText}" FontSize="12" FontFamily="Monospace" Opacity="0.82" VerticalAlignment="Center" />
                                 <ProgressBar x:Name="IndexingProgressBar" Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="{Binding IndexingProgress.ProgressPercent}" Height="4" />
                             </Grid>
@@ -1465,6 +1465,12 @@
                                                 Margin="0,0,4,4"
                                                 Command="{Binding ExportGhidraScriptCommand}"
                                                 ToolTip.Tip="Export symbols JSON and a ready-to-run Python apply script for Ghidra" />
+                                        <Button x:Name="ScriptAuditIl2CppButton"
+                                                Classes="toolbar-btn"
+                                                Content="Audit IL2CPP"
+                                                Margin="0,0,4,4"
+                                                Command="{Binding AuditIl2CppMetadataCommand}"
+                                                ToolTip.Tip="Inspect global-metadata.dat version, entropy, XOR masking, symbol obfuscation, and native binary indicators" />
                                         <Button x:Name="ScriptSelectFolderButton"
                                                 Classes="toolbar-btn"
                                                 Content="Scripts Folder..."

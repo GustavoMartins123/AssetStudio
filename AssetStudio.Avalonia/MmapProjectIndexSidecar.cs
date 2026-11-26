@@ -467,6 +467,140 @@ namespace AssetStudio.Avalonia
             return records.Length;
         }
 
+        internal int PopulateArenaFiltered(
+            ProjectIndex targetIndex,
+            HashSet<(string SerializedFileName, string OriginalPath)> allowedSources,
+            out List<SourceFileMetadata> sourceFiles)
+        {
+            ArgumentNullException.ThrowIfNull(targetIndex);
+            ArgumentNullException.ThrowIfNull(allowedSources);
+            EnsureNotDisposed();
+
+            var stringPool = StringPool;
+            var poolLen = stringPool.Length;
+            var sourceRecords = SourceFiles;
+            sourceFiles = new List<SourceFileMetadata>(allowedSources.Count);
+
+            var recordCount = Header.RecordCount;
+            var origins = new AssetHandleOrigin[sourceRecords.Length];
+            var originPrefixUtf8 = new byte[sourceRecords.Length][];
+            var sourceAllowed = new bool[sourceRecords.Length];
+            var matchedSourceCount = 0;
+
+            for (var i = 0; i < sourceRecords.Length; i++)
+            {
+                ref readonly var src = ref sourceRecords[i];
+                ValidateSlice(src.SerializedFileNameOffset, src.SerializedFileNameLength, poolLen);
+                ValidateSlice(src.OriginalPathOffset, src.OriginalPathLength, poolLen);
+
+                var serializedFileName = src.SerializedFileNameLength > 0
+                    ? Encoding.UTF8.GetString(stringPool.Slice(src.SerializedFileNameOffset, src.SerializedFileNameLength))
+                    : string.Empty;
+                var originalPath = src.OriginalPathLength > 0
+                    ? Encoding.UTF8.GetString(stringPool.Slice(src.OriginalPathOffset, src.OriginalPathLength))
+                    : string.Empty;
+
+                if (!allowedSources.Contains((serializedFileName, originalPath)))
+                {
+                    continue;
+                }
+
+                sourceAllowed[i] = true;
+                matchedSourceCount++;
+                sourceFiles.Add(new SourceFileMetadata(serializedFileName, originalPath));
+                var origin = AssetHandleOrigin.Intern(serializedFileName, originalPath);
+                origins[i] = origin;
+                originPrefixUtf8[i] = Encoding.UTF8.GetBytes(origin.UniqueIdPrefix);
+            }
+
+            if (recordCount == 0 || matchedSourceCount == 0)
+            {
+                return 0;
+            }
+
+            var records = Records;
+            var stringCache = new DecodedStringSlot[16384];
+            Span<byte> pathIdUtf8Scratch = stackalloc byte[32];
+
+            var lastSourceIndex = int.MinValue;
+            var lastAllowed = false;
+            var lastOrigin = AssetHandleOrigin.Empty;
+            var lastPrefixBytes = Array.Empty<byte>();
+            var addedCount = 0;
+
+            for (var i = 0; i < records.Length; i++)
+            {
+                ref readonly var rec = ref records[i];
+                var srcIndex = rec.SourceFileIndex;
+                if (srcIndex != lastSourceIndex)
+                {
+                    lastSourceIndex = srcIndex;
+                    lastAllowed = (uint)srcIndex < (uint)sourceAllowed.Length && sourceAllowed[srcIndex];
+                    if (lastAllowed)
+                    {
+                        lastOrigin = origins[srcIndex];
+                        lastPrefixBytes = originPrefixUtf8[srcIndex];
+                    }
+                    else
+                    {
+                        lastOrigin = AssetHandleOrigin.Empty;
+                        lastPrefixBytes = Array.Empty<byte>();
+                    }
+                }
+
+                if (!lastAllowed)
+                {
+                    continue;
+                }
+
+                ValidateSlice(rec.UniqueIdOffset, rec.UniqueIdLength, poolLen);
+
+                var name = DecodePooledString16384(stringPool, poolLen, stringCache, rec.NameOffset, rec.NameLength);
+                var container = DecodePooledString16384(stringPool, poolLen, stringCache, rec.ContainerOffset, rec.ContainerLength);
+                var uidBytes = rec.UniqueIdLength > 0
+                    ? stringPool.Slice(rec.UniqueIdOffset, rec.UniqueIdLength)
+                    : ReadOnlySpan<byte>.Empty;
+
+                if (IsCanonicalUniqueIdUtf8(uidBytes, lastPrefixBytes, rec.PathID, pathIdUtf8Scratch))
+                {
+                    targetIndex.AddRecord(
+                        serializedFileName: lastOrigin.SerializedFileName,
+                        originalPath: lastOrigin.OriginalPath,
+                        pathId: rec.PathID,
+                        name: name,
+                        type: (ClassIDType)rec.ClassID,
+                        container: container,
+                        byteStart: rec.ByteStart,
+                        byteSize: rec.ByteSize,
+                        sourceHash: lastOrigin.SourceHash,
+                        unityVersion: lastOrigin.UnityVersion);
+                }
+                else
+                {
+                    var uniqueId = uidBytes.Length > 0
+                        ? Encoding.UTF8.GetString(uidBytes)
+                        : string.Empty;
+
+                    targetIndex.AddRecord(
+                        serializedFileName: lastOrigin.SerializedFileName,
+                        originalPath: lastOrigin.OriginalPath,
+                        pathId: rec.PathID,
+                        name: name,
+                        type: (ClassIDType)rec.ClassID,
+                        container: container,
+                        byteStart: rec.ByteStart,
+                        byteSize: rec.ByteSize,
+                        sourceHash: lastOrigin.SourceHash,
+                        unityVersion: lastOrigin.UnityVersion,
+                        customUniqueId: uniqueId);
+                }
+
+                addedCount++;
+            }
+
+            return addedCount;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool IsCanonicalUniqueIdUtf8(
             ReadOnlySpan<byte> uidBytes,
@@ -1119,6 +1253,50 @@ namespace AssetStudio.Avalonia
                 targetIndex.Clear();
                 sourceFiles = null;
                 hasMissingOriginalPaths = false;
+                return false;
+            }
+        }
+
+        internal static bool TryLoadFilteredIntoArena(
+            string idxPath,
+            string expectedSignature,
+            int expectedSchemaVersion,
+            HashSet<(string SerializedFileName, string OriginalPath)> allowedSources,
+            ProjectIndex targetIndex,
+            out List<SourceFileMetadata>? sourceFiles)
+        {
+            ArgumentNullException.ThrowIfNull(targetIndex);
+            sourceFiles = null;
+
+            if (string.IsNullOrWhiteSpace(expectedSignature)
+                || allowedSources == null
+                || allowedSources.Count == 0
+                || !TryOpenSnapshot(idxPath, expectedSignature, expectedSchemaVersion, out var snapshot)
+                || snapshot == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                using (snapshot)
+                {
+                    var added = snapshot.PopulateArenaFiltered(targetIndex, allowedSources, out var loadedSources);
+                    if (added <= 0)
+                    {
+                        targetIndex.Clear();
+                        sourceFiles = null;
+                        return false;
+                    }
+
+                    sourceFiles = loadedSources;
+                    return true;
+                }
+            }
+            catch
+            {
+                targetIndex.Clear();
+                sourceFiles = null;
                 return false;
             }
         }

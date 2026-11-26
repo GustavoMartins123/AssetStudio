@@ -626,8 +626,12 @@ namespace AssetStudio.Avalonia.ViewModels
             var title = _encryptedFileCount > 0 && resolvedStatus == IndexingStatus.Completed
                 ? BuildPartialCompletedTitle(rawStatus)
                 : BuildIndexingProgressTitle(rawStatus, resolvedStatus);
-            var primaryText = $"{title}: {countText}{pendingText}{encryptedText}{fileText}{updatedText}";
-            var detailText = $"{countText}{pendingText}{encryptedText}{fileText}{updatedText}";
+            var primaryText = isStageProgress && safeProcessed == 0 && !string.IsNullOrWhiteSpace(progressDetail)
+                ? $"{title}: {progressDetail} ({countText}){encryptedText}{updatedText}"
+                : $"{title}: {countText}{pendingText}{encryptedText}{fileText}{updatedText}";
+            var detailText = isStageProgress && safeProcessed == 0 && !string.IsNullOrWhiteSpace(progressDetail)
+                ? $"{progressDetail} ({countText}){encryptedText}{updatedText}"
+                : $"{countText}{pendingText}{encryptedText}{fileText}{updatedText}";
             var decimals = Math.Max(0, snapshot.PercentDecimals);
             var formattedPercent = percent.ToString("0." + new string('#', decimals), CultureInfo.InvariantCulture) + "%";
 

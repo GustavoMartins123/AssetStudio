@@ -87,6 +87,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? ExportGhidraScriptAsync { get; set; }
         public Func<Task>? SelectScriptsFolderAsync { get; set; }
         public Func<Task>? ExportCSharpProjectAsync { get; set; }
+        public Func<Task>? AuditIl2CppMetadataAsync { get; set; }
         public Func<AssemblyTypeEntry?, Task>? SelectAssemblyExplorerTypeAsync { get; set; }
         public Func<ScriptUsageItem?, Task>? NavigateToScriptUsageAsync { get; set; }
 
@@ -182,6 +183,7 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportGhidraScriptAsync = null;
             SelectScriptsFolderAsync = null;
             ExportCSharpProjectAsync = null;
+            AuditIl2CppMetadataAsync = null;
             SelectAssemblyExplorerTypeAsync = null;
             NavigateToScriptUsageAsync = null;
 
@@ -391,6 +393,10 @@ namespace AssetStudio.Avalonia.ViewModels
                 ExecuteExportCSharpProjectAsync,
                 canExecute: () => !_disposed,
                 onException: HandleCommandException);
+            AuditIl2CppMetadataCommand = new AsyncRelayCommand(
+                ExecuteAuditIl2CppMetadataAsync,
+                canExecute: () => !_disposed,
+                onException: HandleCommandException);
             ToggleAssemblyExplorerCommand = new RelayCommand(
                 ExecuteToggleAssemblyExplorer,
                 canExecute: () => !_disposed);
@@ -529,6 +535,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand ExportGhidraScriptCommand { get; }
         public AsyncRelayCommand SelectScriptsFolderCommand { get; }
         public AsyncRelayCommand ExportCSharpProjectCommand { get; }
+        public AsyncRelayCommand AuditIl2CppMetadataCommand { get; }
         public RelayCommand ToggleAssemblyExplorerCommand { get; }
         public AsyncRelayCommand<AssemblyTypeEntry> SelectAssemblyExplorerTypeCommand { get; }
         public AsyncRelayCommand<ScriptUsageItem> NavigateToScriptUsageCommand { get; }
@@ -1604,6 +1611,23 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
+        private async Task ExecuteAuditIl2CppMetadataAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.AuditIl2CppMetadataAsync != null)
+            {
+                await CommandHandlers.AuditIl2CppMetadataAsync();
+                return;
+            }
+
+            PreviewSession.ActiveRightTab = RightPanelTab.Script;
+            StatusText = "Ready to audit IL2CPP metadata.";
+        }
+
         private void ExecuteToggleAssemblyExplorer()
         {
             if (_disposed)
@@ -1875,6 +1899,7 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportGhidraScriptCommand.NotifyCanExecuteChanged();
             SelectScriptsFolderCommand.NotifyCanExecuteChanged();
             ExportCSharpProjectCommand.NotifyCanExecuteChanged();
+            AuditIl2CppMetadataCommand.NotifyCanExecuteChanged();
             ToggleAssemblyExplorerCommand.NotifyCanExecuteChanged();
             SelectAssemblyExplorerTypeCommand.NotifyCanExecuteChanged();
             NavigateToScriptUsageCommand.NotifyCanExecuteChanged();

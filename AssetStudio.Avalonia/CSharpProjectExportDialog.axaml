@@ -1,0 +1,200 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
+        x:Class="AssetStudio.Avalonia.CSharpProjectExportDialog"
+        x:CompileBindings="True"
+        x:DataType="vm:CSharpProjectExportDialogViewModel"
+        Title="{Binding DialogTitle}"
+        Width="720"
+        Height="740"
+        MinWidth="580"
+        MinHeight="580"
+        WindowStartupLocation="CenterOwner">
+
+    <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" Margin="14" RowSpacing="10">
+        <!-- Header Banner -->
+        <Border Grid.Row="0"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="12,10">
+            <StackPanel Spacing="4">
+                <TextBlock Text="Select Assemblies to Export as C# Project"
+                           FontSize="14"
+                           FontWeight="SemiBold" />
+                <TextBlock Text="{Binding SourceDescription}"
+                           FontSize="11"
+                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                           TextWrapping="Wrap" />
+                <TextBlock Text="{Binding Il2CppNoticeText}"
+                           IsVisible="{Binding IsIl2CppStubMode}"
+                           FontSize="11"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource SystemAccentColor}"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+        </Border>
+
+        <!-- Search & Selection Controls -->
+        <StackPanel Grid.Row="1" Spacing="6">
+            <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto" ColumnSpacing="6">
+                <TextBox Grid.Column="0"
+                         PlaceholderText="Filter assemblies by name or category..."
+                         Text="{Binding SearchText, Mode=TwoWay}" />
+                <Button Grid.Column="1"
+                        Content="Clear"
+                        Command="{Binding ClearSearchCommand}" />
+                <Button Grid.Column="2"
+                        Content="Select Visible"
+                        Command="{Binding SelectAllVisibleCommand}" />
+                <Button Grid.Column="3"
+                        Content="Game Only"
+                        Command="{Binding SelectGameOnlyCommand}" />
+                <Button Grid.Column="4"
+                        Content="Deselect All"
+                        Command="{Binding DeselectAllCommand}" />
+            </Grid>
+
+            <CheckBox Content="Show Engine, Framework &amp; Third-Party assemblies"
+                      IsChecked="{Binding ShowEngineAndThirdParty, Mode=TwoWay}" />
+        </StackPanel>
+
+        <!-- Assembly List -->
+        <Border Grid.Row="2"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="4">
+            <Grid>
+                <ListBox ItemsSource="{Binding FilteredAssemblies}"
+                         Background="Transparent"
+                         BorderThickness="0"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                    <ListBox.Styles>
+                        <Style Selector="ListBoxItem">
+                            <Setter Property="Padding" Value="0" />
+                            <Setter Property="Margin" Value="0,0,0,2" />
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                        </Style>
+                    </ListBox.Styles>
+                    <ListBox.ItemTemplate>
+                        <DataTemplate x:DataType="vm:CSharpExportAssemblyRowViewModel" x:CompileBindings="True">
+                            <Border Padding="8,6"
+                                    CornerRadius="4"
+                                    Background="{DynamicResource SystemControlBackgroundBaseLowBrush}">
+                                <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+                                    <CheckBox Grid.Column="0"
+                                              IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                              VerticalAlignment="Center" />
+                                    <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding AssemblyName}"
+                                                   FontWeight="SemiBold"
+                                                   TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{Binding SubtitleDisplay}"
+                                                   FontSize="11"
+                                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                   TextTrimming="CharacterEllipsis" />
+                                    </StackPanel>
+                                    <Border Grid.Column="2"
+                                            VerticalAlignment="Center"
+                                            Padding="7,2"
+                                            CornerRadius="10"
+                                            BorderThickness="1"
+                                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                            Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}">
+                                        <TextBlock Text="{Binding CategoryLabel}"
+                                                   FontSize="10"
+                                                   FontWeight="SemiBold" />
+                                    </Border>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <TextBlock Text="No assemblies match the current filter."
+                           IsVisible="{Binding HasNoFilteredAssemblies}"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+            </Grid>
+        </Border>
+
+        <!-- Export Options -->
+        <Border Grid.Row="3"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="12,10">
+            <StackPanel Spacing="8">
+                <TextBlock Text="C# Project Export Options"
+                           FontWeight="SemiBold" />
+
+                <Grid ColumnDefinitions="115,*" ColumnSpacing="10">
+                    <TextBlock Grid.Column="0"
+                               Text="Project Name"
+                               VerticalAlignment="Center" />
+                    <TextBox Grid.Column="1"
+                             PlaceholderText="ExportedScripts"
+                             Text="{Binding ProjectName, Mode=TwoWay}" />
+                </Grid>
+
+                <Grid ColumnDefinitions="115,*" ColumnSpacing="10">
+                    <TextBlock Grid.Column="0"
+                               Text="Layout Mode"
+                               VerticalAlignment="Center" />
+                    <ComboBox Grid.Column="1"
+                              HorizontalAlignment="Stretch"
+                              ItemsSource="{Binding LayoutModeOptions}"
+                              SelectedIndex="{Binding SelectedLayoutModeIndex, Mode=TwoWay}" />
+                </Grid>
+
+                <Grid ColumnDefinitions="*,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="12" RowSpacing="4">
+                    <CheckBox Grid.Row="0" Grid.Column="0"
+                              Content="Generate Unity .meta files"
+                              IsChecked="{Binding GenerateUnityMetaFiles, Mode=TwoWay}"
+                              ToolTip.Tip="Writes deterministic .cs.meta, .asmdef.meta, and folder .meta files matching UnityProjectGuidUtility." />
+                    <CheckBox Grid.Row="0" Grid.Column="1"
+                              Content="Generate .asmdef files"
+                              IsChecked="{Binding GenerateAsmdefFiles, Mode=TwoWay}"
+                              ToolTip.Tip="Generates Unity Assembly Definition (.asmdef) files for custom assemblies in Unity Assets/Scripts layout." />
+                    <CheckBox Grid.Row="1" Grid.Column="0"
+                              Content="Copy reference DLLs (_References/)"
+                              IsChecked="{Binding CopyReferenceDlls, Mode=TwoWay}"
+                              IsEnabled="{Binding IsStandaloneLayout}"
+                              ToolTip.Tip="Copies required UnityEngine, third-party, and unstripped reference DLLs alongside the standalone .sln/.csproj." />
+                    <CheckBox Grid.Row="1" Grid.Column="1"
+                              Content="Conservative decompiler fallback"
+                              IsChecked="{Binding EnableConservativeDecompilerFallback, Mode=TwoWay}"
+                              ToolTip.Tip="Re-decompiles individual types using conservative C# 7.3 settings if syntax anomalies (unbalanced braces, set-only auto-properties, or compiler-generated tokens) are detected." />
+                    <CheckBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2"
+                              Content="Sanitize stripped IL2CPP Editor attributes ([CreateAssetMenu])"
+                              IsChecked="{Binding SanitizeStrippedEditorAttributes, Mode=TwoWay}"
+                              ToolTip.Tip="When IL2CPP stripped UnityEngine.CoreModule lacks CreateAssetMenuAttribute setters, comments out [CreateAssetMenu(...)] lines so standalone dotnet build compiles without CS0617." />
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <!-- Footer Summary & Buttons -->
+        <Grid Grid.Row="4" ColumnDefinitions="*,Auto" ColumnSpacing="10">
+            <TextBlock Grid.Column="0"
+                       Text="{Binding SelectionSummaryText}"
+                       VerticalAlignment="Center"
+                       TextTrimming="CharacterEllipsis"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+            <StackPanel Grid.Column="1"
+                        Orientation="Horizontal"
+                        Spacing="8">
+                <Button Content="Export..."
+                        MinWidth="92"
+                        IsDefault="True"
+                        Command="{Binding ConfirmCommand}" />
+                <Button Content="Cancel"
+                        MinWidth="84"
+                        IsCancel="True"
+                        Command="{Binding CancelCommand}" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

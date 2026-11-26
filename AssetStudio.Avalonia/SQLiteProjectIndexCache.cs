@@ -239,25 +239,68 @@ namespace AssetStudio.Avalonia
                     }
                 }
 
-                AppendText("manifest-v2\0C|");
-                AppendInt64(scanResult.TotalFiles);
-                AppendText("|");
-                AppendInt64(scanResult.TotalBytes);
-                AppendText("|");
-                AppendInt64(scanResult.UnityBundleCount);
-                AppendText("|");
-                AppendInt64(scanResult.SerializedFileCount);
-                AppendText("|");
-                AppendInt64(scanResult.ResourceFileCount);
-                AppendText("|");
-                AppendInt64(scanResult.EncryptedFileCount);
-                AppendText("|");
-                AppendInt64(scanResult.OtherFileCount);
-                AppendText("|");
-                AppendInt64(scanResult.ErrorCount);
-                AppendText("\0D|");
-                AppendText(scanResult.DecryptionContextDigest ?? string.Empty);
-                AppendText("\0");
+                var hasIndexRelevantFiles = false;
+                var relevantCount = 0;
+                long relevantBytes = 0;
+                if (scanResult.Files.Count > 0)
+                {
+                    for (var i = 0; i < scanResult.Files.Count; i++)
+                    {
+                        var file = scanResult.Files[i];
+                        if (IsIndexRelevantScanFile(file))
+                        {
+                            hasIndexRelevantFiles = true;
+                            relevantCount++;
+                            relevantBytes += file.Size;
+                        }
+                    }
+                }
+
+                if (hasIndexRelevantFiles)
+                {
+                    // Real Unity project folders: ignore non-asset noise (ProjectFileKind.Other such as screenshots,
+                    // logs, exported scripts, or README files) so adding/removing unrelated folders never invalidates
+                    // multi-gigabyte SQLite/mmap index caches.
+                    AppendText("manifest-v2-assets\0C|");
+                    AppendInt64(relevantCount);
+                    AppendText("|");
+                    AppendInt64(relevantBytes);
+                    AppendText("|");
+                    AppendInt64(scanResult.UnityBundleCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.SerializedFileCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.ResourceFileCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.EncryptedFileCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.ErrorCount);
+                    AppendText("\0D|");
+                    AppendText(scanResult.DecryptionContextDigest ?? string.Empty);
+                    AppendText("\0");
+                }
+                else
+                {
+                    AppendText("manifest-v2\0C|");
+                    AppendInt64(scanResult.TotalFiles);
+                    AppendText("|");
+                    AppendInt64(scanResult.TotalBytes);
+                    AppendText("|");
+                    AppendInt64(scanResult.UnityBundleCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.SerializedFileCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.ResourceFileCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.EncryptedFileCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.OtherFileCount);
+                    AppendText("|");
+                    AppendInt64(scanResult.ErrorCount);
+                    AppendText("\0D|");
+                    AppendText(scanResult.DecryptionContextDigest ?? string.Empty);
+                    AppendText("\0");
+                }
 
                 if (scanResult.Files.Count > 0)
                 {
@@ -265,10 +308,16 @@ namespace AssetStudio.Avalonia
                         ? string.Empty
                         : TrimTrailingDirectorySeparatorsPreservingRoot(GetFullPathOrOriginal(scanResult.RootPath));
 
-                    var entries = new List<(string RelativePath, long Size, int Kind, long LastWriteTicks, ulong SampleHash, string AppliedProvider)>(scanResult.Files.Count);
+                    var entries = new List<(string RelativePath, long Size, int Kind, long LastWriteTicks, ulong SampleHash, string AppliedProvider)>(
+                        hasIndexRelevantFiles ? relevantCount : scanResult.Files.Count);
                     for (var i = 0; i < scanResult.Files.Count; i++)
                     {
                         var file = scanResult.Files[i];
+                        if (hasIndexRelevantFiles && !IsIndexRelevantScanFile(file))
+                        {
+                            continue;
+                        }
+
                         var relPath = NormalizeRelativeManifestPath(rootFull, file.Path, caseSensitive);
                         entries.Add((
                             relPath,
@@ -326,6 +375,41 @@ namespace AssetStudio.Avalonia
             {
                 ArrayPool<byte>.Shared.Return(utf8Buf);
             }
+        }
+
+        internal static bool IsIndexRelevantScanFile(ScannedFileInfo? file)
+        {
+            if (file == null)
+            {
+                return false;
+            }
+
+            return file.Kind != ProjectFileKind.Other || IsSplitAssetFilePath(file.Path);
+        }
+
+        private static bool IsSplitAssetFilePath(string? path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return false;
+            }
+
+            var splitIdx = path.LastIndexOf(".split", StringComparison.OrdinalIgnoreCase);
+            if (splitIdx < 0 || splitIdx + 6 >= path.Length)
+            {
+                return false;
+            }
+
+            for (var i = splitIdx + 6; i < path.Length; i++)
+            {
+                var ch = path[i];
+                if (ch < '0' || ch > '9')
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         internal static string NormalizeRelativeManifestPath(string rootFullPath, string? filePath, bool caseSensitive)

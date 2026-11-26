@@ -464,6 +464,7 @@ public partial class MainWindow : Window
         handlers.ExportGhidraScriptAsync = ExportGhidraScriptCommandHandlerAsync;
         handlers.SelectScriptsFolderAsync = SelectScriptsFolderCommandHandlerAsync;
         handlers.ExportCSharpProjectAsync = ExportCSharpProjectCommandHandlerAsync;
+        handlers.AuditIl2CppMetadataAsync = AuditIl2CppMetadataCommandHandlerAsync;
         handlers.SelectAssemblyExplorerTypeAsync = SelectAssemblyExplorerTypeCommandHandlerAsync;
         handlers.NavigateToScriptUsageAsync = NavigateToScriptUsageCommandHandlerAsync;
         WireScriptExplorerEvents();
@@ -1173,13 +1174,200 @@ public partial class MainWindow : Window
                     }
                 }
 
-                // Cold indexing path: reuse scanResult.Files whenever there are no .split0 files to merge.
-                var coldFiles = await Task.Run(() => ResolveColdIndexFiles(folderPath, currentScanResult));
+                // Cold indexing path: attempt incremental per-bundle delta first (hydrating unchanged bundles
+                // directly from .idx/SQLite and only indexing added/modified files when <= 50% changed).
+                var incDisplayAll = ViewModel.Options.DisplayAll;
+                var incClassFilter = classFilterOverride;
+                var incFilterTypeChecked = filterTypeAll.IsChecked != true;
+                var incSelectedTypes = incFilterTypeChecked ? GetFilterTypeItems()
+                    .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+                    .Select(x => (ClassIDType)x.Tag!)
+                    .ToHashSet() : null;
+                var incFilterText = listSearch?.Text?.Trim();
+                var incSortMember = assetListSortMember;
+                var incSortDescending = assetListSortDescending;
+                var incScanSnapshot = currentScanResult;
+
+                StatusStripUpdate("Checking incremental index cache delta...");
+                var coldPlanResult = await Task.Run(() =>
+                {
+                    SQLiteProjectIndexCache.IncrementalProjectDeltaPlan? plan = null;
+                    List<SourceFileMetadata>? unchangedSources = null;
+                    List<string> filesToIndex;
+
+                    if (incScanSnapshot != null)
+                    {
+                        filesToIndex = ProjectLoadingService.ResolveSelectiveColdIndexFiles(
+                            _sqliteCache,
+                            folderPath,
+                            incScanSnapshot,
+                            assetsManager.ProjectIndex,
+                            out plan,
+                            out unchangedSources,
+                            maxDirtyRatio: 0.50);
+                    }
+                    else
+                    {
+                        filesToIndex = ResolveColdIndexFiles(folderPath, incScanSnapshot);
+                    }
+
+                    if (plan == null || !plan.CanApplyIncremental || assetsManager.ProjectIndex.Count == 0)
+                    {
+                        return (
+                            FilesToIndex: filesToIndex,
+                            DeltaPlan: (SQLiteProjectIndexCache.IncrementalProjectDeltaPlan?)null,
+                            HasHydratedUnchanged: false,
+                            ExportableIndices: (List<int>?)null,
+                            ExportableBitset: (ulong[]?)null,
+                            ExportableTypes: (HashSet<ClassIDType>?)null,
+                            ClassItems: (List<AssetClassItem>?)null,
+                            VisibleIndices: (int[]?)null);
+                    }
+
+                    if (unchangedSources != null)
+                    {
+                        for (var i = 0; i < unchangedSources.Count; i++)
+                        {
+                            var src = unchangedSources[i];
+                            if (!string.IsNullOrWhiteSpace(src.OriginalPath))
+                            {
+                                RememberLazySourcePathForSerializedFile(src.SerializedFileName, src.OriginalPath);
+                                RememberLazySourcePathForSerializedFile(GetSafeFileName(src.OriginalPath), src.OriginalPath);
+                            }
+                        }
+                    }
+
+                    if (incScanSnapshot != null)
+                    {
+                        for (var i = 0; i < incScanSnapshot.Files.Count; i++)
+                        {
+                            RememberLazySourcePath(incScanSnapshot.Files[i].Path);
+                        }
+                    }
+
+                    // Drain unchanged handles before progressive workers start so UI streaming only appends new delta handles.
+                    _ = assetsManager.ProjectIndex.DrainPendingIndices();
+
+                    var arena = assetsManager.ProjectIndex.Arena;
+                    var totalCount = arena.Count;
+                    var localExportable = new List<int>(totalCount);
+                    var bitset = new ulong[(totalCount + 63) >> 6];
+                    var localTypes = new HashSet<ClassIDType>();
+
+                    for (var idx = 0; idx < totalCount; idx++)
+                    {
+                        var type = arena.GetType(idx);
+                        if (!incDisplayAll && !IsLazyExportableType(type))
+                        {
+                            continue;
+                        }
+
+                        localExportable.Add(idx);
+                        bitset[idx >> 6] |= 1UL << (idx & 63);
+                        localTypes.Add(type);
+                    }
+
+                    var classItems = AssetListQuery.BuildArenaAssetClassItems(arena);
+                    var exportableSnapshot = localExportable.ToArray();
+                    var visible = AssetListQuery.FilterArena(arena, exportableSnapshot, exportableSnapshot.Length, incClassFilter, incSelectedTypes, incFilterText, CancellationToken.None);
+                    AssetListQuery.SortArenaInPlace(arena, visible, visible.Length, incSortMember, incSortDescending);
+
+                    return (
+                        FilesToIndex: filesToIndex,
+                        DeltaPlan: plan,
+                        HasHydratedUnchanged: true,
+                        ExportableIndices: (List<int>?)localExportable,
+                        ExportableBitset: (ulong[]?)bitset,
+                        ExportableTypes: (HashSet<ClassIDType>?)localTypes,
+                        ClassItems: (List<AssetClassItem>?)classItems,
+                        VisibleIndices: (int[]?)visible);
+                });
+
                 if (sessionId != lazyIndexingSessionId)
                 {
                     return;
                 }
 
+                if (coldPlanResult.HasHydratedUnchanged
+                    && coldPlanResult.DeltaPlan != null
+                    && coldPlanResult.ExportableIndices != null
+                    && coldPlanResult.VisibleIndices != null)
+                {
+                    var isSorted = !string.IsNullOrEmpty(incSortMember);
+                    var isIdentity = !isSorted && IsIdentityArenaIndices(coldPlanResult.VisibleIndices, coldPlanResult.VisibleIndices.Length);
+                    var isStrictlyIncreasing = !isSorted && (isIdentity || IsStrictlyIncreasingIndices(coldPlanResult.VisibleIndices, coldPlanResult.VisibleIndices.Length));
+
+                    ViewModel.AssetList.ApplyWarmArenaState(
+                        assetsManager.ProjectIndex,
+                        coldPlanResult.ExportableIndices,
+                        coldPlanResult.ExportableBitset!,
+                        coldPlanResult.ExportableTypes!,
+                        coldPlanResult.ClassItems!,
+                        coldPlanResult.VisibleIndices,
+                        isStrictlyIncreasing,
+                        isIdentity);
+
+                    BuildFilterTypeMenu();
+                    EnsureAssetListItemsSource();
+                    FilterAssetClasses();
+                    RefreshLazySceneHierarchyAsync(sessionId);
+
+                    // Deletion-only delta: all remaining files were unchanged, no new/modified bundles to parse.
+                    if (coldPlanResult.FilesToIndex.Count == 0 && incScanSnapshot != null)
+                    {
+                        ViewModel.IsIndexingActive = true;
+                        ViewModel.IsPauseEnabled = false;
+                        ViewModel.IsResumeEnabled = false;
+                        ViewModel.IsStopEnabled = false;
+                        try
+                        {
+                            StatusStripUpdate($"Updating index cache incrementally ({coldPlanResult.DeltaPlan.DeletedFilePaths.Count:N0} removed file(s))...");
+                            await Task.Run(() => ProjectLoadingService.SaveIncrementalIndexDelta(
+                                _sqliteCache,
+                                assetsManager,
+                                folderPath,
+                                incScanSnapshot,
+                                coldPlanResult.DeltaPlan,
+                                reindexedFilePaths: Array.Empty<string>(),
+                                showProgressPanel: ShowIndexingProgressPanel));
+
+                            if (sessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                            {
+                                return;
+                            }
+
+                            ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
+                            StatusStripUpdate($"Updated index incrementally. Showing {VisibleAssetCount:N0} assets.{FormatPartialCoverageSuffix()}");
+
+                            if (coldPlanResult.DeltaPlan.RequiresFullSemanticRebuild)
+                            {
+                                await BuildLazyConnectionsIfNeededAsync(paths, force: true);
+                            }
+
+                            if (sessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                            {
+                                return;
+                            }
+
+                            await BuildAssetStructuresAsync(incremental: true, showStructureProgress: true);
+                            return;
+                        }
+                        finally
+                        {
+                            if (!IsWindowClosingOrClosed)
+                            {
+                                ViewModel.IsIndexingActive = false;
+                                ViewModel.IsPauseEnabled = false;
+                                ViewModel.IsResumeEnabled = false;
+                                ViewModel.IsStopEnabled = false;
+                            }
+                        }
+                    }
+
+                    StatusStripUpdate($"Reusing {coldPlanResult.DeltaPlan.UnchangedFilePaths.Count:N0} cached file(s); indexing {coldPlanResult.FilesToIndex.Count:N0} new/changed file(s)...");
+                }
+
+                var coldFiles = coldPlanResult.FilesToIndex;
                 if (coldFiles.Count == 0)
                 {
                     StatusStripUpdate("No Unity files found.");
@@ -1191,7 +1379,7 @@ public partial class MainWindow : Window
                     RememberLazySourcePath(file);
                 }
 
-                StartProgressiveIndexing(coldFiles, paths);
+                StartProgressiveIndexing(coldFiles, paths, coldPlanResult.DeltaPlan, coldPlanResult.DeltaPlan != null ? coldFiles : null);
                 return;
             }
 
@@ -1238,7 +1426,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private void StartProgressiveIndexing(List<string> files, string[] paths)
+    private void StartProgressiveIndexing(
+        List<string> files,
+        string[] paths,
+        SQLiteProjectIndexCache.IncrementalProjectDeltaPlan? incrementalDeltaPlan = null,
+        IReadOnlyCollection<string>? incrementalTargetFiles = null)
     {
         ViewModel.IsIndexingActive = true;
         ViewModel.IsPauseEnabled = true;
@@ -1311,7 +1503,21 @@ public partial class MainWindow : Window
                 }
 
                 currentScanResult = scanResult;
-                SaveIndexCache(folderPath, scanResult);
+                if (incrementalDeltaPlan != null)
+                {
+                    ProjectLoadingService.SaveIncrementalIndexDelta(
+                        _sqliteCache,
+                        assetsManager,
+                        folderPath,
+                        scanResult,
+                        incrementalDeltaPlan,
+                        incrementalTargetFiles,
+                        showProgressPanel: ShowIndexingProgressPanel);
+                }
+                else
+                {
+                    SaveIndexCache(folderPath, scanResult);
+                }
                 Volatile.Write(ref committedIndexSignature, _sqliteCache.GetFolderSignature(scanResult));
             },
             update =>
@@ -1456,15 +1662,29 @@ public partial class MainWindow : Window
                 }
 
                 currentScanResult = validatedScanResult;
-                ProjectLoadingService.SaveIndexCache(
-                    _sqliteCache,
-                    assetsManager,
-                    folderPath,
-                    validatedScanResult,
-                    preserveSemanticRelations: false,
-                    progress: null,
-                    showProgressPanel: ShowIndexingProgressPanel,
-                    handlesOverride: reconciledHandles);
+                if (incrementalDeltaPlan != null && reconciledHandles == null)
+                {
+                    ProjectLoadingService.SaveIncrementalIndexDelta(
+                        _sqliteCache,
+                        assetsManager,
+                        folderPath,
+                        validatedScanResult,
+                        incrementalDeltaPlan,
+                        incrementalTargetFiles,
+                        showProgressPanel: ShowIndexingProgressPanel);
+                }
+                else
+                {
+                    ProjectLoadingService.SaveIndexCache(
+                        _sqliteCache,
+                        assetsManager,
+                        folderPath,
+                        validatedScanResult,
+                        preserveSemanticRelations: false,
+                        progress: null,
+                        showProgressPanel: ShowIndexingProgressPanel,
+                        handlesOverride: reconciledHandles);
+                }
                 Volatile.Write(ref committedIndexSignature, _sqliteCache.GetFolderSignature(validatedScanResult));
             });
     }

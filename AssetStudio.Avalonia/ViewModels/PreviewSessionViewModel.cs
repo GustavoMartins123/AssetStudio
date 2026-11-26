@@ -195,6 +195,10 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _scriptUsageHeaderText = DefaultScriptUsageHeader;
         private ScriptUsageItem? _selectedScriptUsageItem;
 
+        // Track 2: Static IL2CPP Metadata & Obfuscation Audit state
+        private Il2CppMetadataAuditReport? _lastIl2CppAuditReport;
+        private string _il2CppAuditSummaryBanner = string.Empty;
+
         public const string DefaultReferencesTargetTitle = "No asset selected";
         public const string DefaultReferencesSummary = "Select an asset to inspect references.";
         public const string DefaultReferencedByHeader = "Referenced By / Used By (0)";
@@ -1157,6 +1161,36 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public AssemblyCatalogSnapshot AssemblyCatalog => _assemblyCatalog;
 
+        public Il2CppMetadataAuditReport? LastIl2CppAuditReport
+        {
+            get => _lastIl2CppAuditReport;
+            private set
+            {
+                if (SetProperty(ref _lastIl2CppAuditReport, value))
+                {
+                    OnPropertyChanged(nameof(HasIl2CppAuditReport));
+                }
+            }
+        }
+
+        public bool HasIl2CppAuditReport => _lastIl2CppAuditReport != null;
+
+        public string Il2CppAuditSummaryBanner
+        {
+            get => _il2CppAuditSummaryBanner;
+            private set
+            {
+                var normalized = value ?? string.Empty;
+                var prevHas = HasIl2CppAuditSummaryBanner;
+                if (SetProperty(ref _il2CppAuditSummaryBanner, normalized) && HasIl2CppAuditSummaryBanner != prevHas)
+                {
+                    OnPropertyChanged(nameof(HasIl2CppAuditSummaryBanner));
+                }
+            }
+        }
+
+        public bool HasIl2CppAuditSummaryBanner => !string.IsNullOrWhiteSpace(_il2CppAuditSummaryBanner);
+
         public static string TruncatePreviewText(string? text, string fallbackText = "")
         {
             if (text == null)
@@ -1673,6 +1707,71 @@ namespace AssetStudio.Avalonia.ViewModels
             });
         }
 
+        public void ShowScriptAuditReport(Il2CppMetadataAuditReport report)
+        {
+            ArgumentNullException.ThrowIfNull(report);
+            _scriptCoordinator.CancelCurrent();
+            var formatted = report.FormatSummaryReport();
+            var summary = BuildIl2CppAuditSummaryLine(report);
+            var diagnostic = report.ProtectionKind is Il2CppMetadataProtectionKind.HighEntropyEncrypted
+                or Il2CppMetadataProtectionKind.HeaderShiftedOrCustomLayout
+                or Il2CppMetadataProtectionKind.InvalidOrTruncated
+                or Il2CppMetadataProtectionKind.NoneOrMissing
+                ? report.DiagnosticDetail
+                : (report.SymbolObfuscationKind == Il2CppSymbolObfuscationKind.HeavilyObfuscated
+                    ? string.Create(CultureInfo.InvariantCulture, $"Heavy symbol obfuscation detected ({report.ObfuscatedTypeRatio * 100.0:F1}% of game types).")
+                    : string.Empty);
+
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    LastIl2CppAuditReport = report;
+                    Il2CppAuditSummaryBanner = report.ShortStatusBadge;
+                    IsScriptLoading = false;
+                    HasScriptSource = true;
+                    ScriptTitle = "IL2CPP Metadata Audit";
+                    ScriptSummaryText = summary;
+                    ScriptBackendBadge = report.ShortStatusBadge;
+                    ScriptDiagnosticText = diagnostic;
+                    ScriptAssemblyName = string.Empty;
+                    ScriptNamespace = string.Empty;
+                    ScriptClassName = "Il2CppMetadataAudit";
+                    _scriptMethodSymbols = Array.Empty<ScriptMethodSymbol>();
+                    ScriptFullSourceCode = formatted;
+                    ApplyScriptSearchCore();
+                    ClearScriptUsagesCore();
+                    ActiveRightTab = RightPanelTab.Script;
+                }
+            });
+        }
+
+        private static string BuildIl2CppAuditSummaryLine(Il2CppMetadataAuditReport report)
+        {
+            var parts = new List<string>(4)
+            {
+                report.ProtectionKind.ToString()
+            };
+
+            if (report.DetectedMetadataVersion > 0)
+            {
+                parts.Add(string.Create(CultureInfo.InvariantCulture, $"v{report.DetectedMetadataVersion}"));
+            }
+
+            if (report.TypeCount > 0)
+            {
+                parts.Add(string.Create(CultureInfo.InvariantCulture, $"{report.AssemblyCount:N0} assemblies / {report.TypeCount:N0} types"));
+            }
+
+            if (report.SymbolObfuscationKind != Il2CppSymbolObfuscationKind.Unknown)
+            {
+                parts.Add(string.Create(CultureInfo.InvariantCulture, $"Symbols: {report.SymbolObfuscationKind} ({report.ObfuscatedTypeRatio * 100.0:F1}%)"));
+            }
+
+            parts.Add(string.Create(CultureInfo.InvariantCulture, $"{report.ElapsedMs:N0} ms"));
+            return string.Join(" • ", parts);
+        }
+
         public void CancelPendingScript()
         {
             _scriptCoordinator.CancelCurrent();
@@ -1728,6 +1827,8 @@ namespace AssetStudio.Avalonia.ViewModels
             ScriptSearchMatchSummary = string.Empty;
             ScriptFullSourceCode = string.Empty;
             ScriptSourceCode = string.Empty;
+            LastIl2CppAuditReport = null;
+            Il2CppAuditSummaryBanner = string.Empty;
             ClearScriptUsagesCore();
         }
 
