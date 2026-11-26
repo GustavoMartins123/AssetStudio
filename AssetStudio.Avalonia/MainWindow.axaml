@@ -170,6 +170,21 @@
                         <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
+                <MenuItem x:Name="exportSceneUnityPackageMenuItem" Header="Export Scene to .unitypackage (with Scripts)..." Command="{Binding ExportSceneToUnityPackageCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem x:Name="exportSelectedPrefabMenuItem" Header="Export Selected as Unity Prefab (.prefab)..." Command="{Binding ExportSelectedPrefabToUnityProjectCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem x:Name="exportSelectedPrefabPackageMenuItem" Header="Export Selected Prefab as .unitypackage..." Command="{Binding ExportSelectedPrefabToUnityPackageCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
             <MenuItem Header="_Export">
                 <MenuItem Header="All assets" Command="{Binding ExportAllAssetsCommand}">
@@ -233,6 +248,22 @@
                     </MenuItem.Icon>
                 </MenuItem>
                 <Separator />
+                <MenuItem x:Name="exportTextureMipChainMenuItem"
+                          Header="Export Texture2D Mipmap Chain..."
+                          Command="{Binding ExportCurrentTextureMipChainCommand}" />
+                <MenuItem x:Name="exportTextureHdrExrMenuItem"
+                          Header="Export Texture2D as HDR OpenEXR (.exr)..."
+                          Command="{Binding ExportCurrentTextureHdrExrCommand}" />
+                <MenuItem x:Name="exportTextureHdrTiffMenuItem"
+                          Header="Export Texture2D as HDR Float32 TIFF (.tif)..."
+                          Command="{Binding ExportCurrentTextureHdrTiffCommand}" />
+                <MenuItem x:Name="exportSpriteAtlasMetadataMenuItem"
+                          Header="Export Selected SpriteAtlas Batch &amp; JSON..."
+                          Command="{Binding ExportSelectedSpriteAtlasMetadataCommand}" />
+                <MenuItem x:Name="exportAnimationClipMetadataMenuItem"
+                          Header="Export Selected AnimationClip Metadata (.json)..."
+                          Command="{Binding ExportSelectedAnimationClipMetadataCommand}" />
+                <Separator />
                 <MenuItem Header="Error log" Command="{Binding ExportErrorLogCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_info}" Width="16" Height="16" />
@@ -241,6 +272,30 @@
             </MenuItem>
             <MenuItem x:Name="filterTypeMenu" Header="Filter _Type">
                 <MenuItem x:Name="filterTypeAll" Header="All" ToggleType="CheckBox" IsChecked="True" Command="{Binding FilterTypeAllCommand}" />
+            </MenuItem>
+            <MenuItem Header="_Analysis">
+                <MenuItem x:Name="globalProjectSearchMenuItem" Header="Global Project Search (PathID / GUID / TextAsset)..." Command="{Binding OpenGlobalSearchDialogCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_info}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem x:Name="semanticUsageGraphMenuItem" Header="Find Who Uses Selected Asset (Usage Graph)..." Command="{Binding QuerySelectedAssetGraphUsageCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_info}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <Separator />
+                <MenuItem x:Name="compareBuildsDiffMenuItem" Header="Compare Builds (Build Diff)..." Command="{Binding OpenBuildDiffDialogCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <Separator />
+                <MenuItem x:Name="openAnimatorGraphMenuItem" Header="Open Interactive Animator Graph..." Command="{Binding OpenAnimatorGraphDialogCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_preview}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
             <MenuItem Header="_Debug">
                 <MenuItem x:Name="showErrorMessageMenu" Header="Show error message" ToggleType="CheckBox" IsChecked="{Binding Options.ShowErrorMessage, Mode=TwoWay}">
@@ -384,6 +439,10 @@
                                                   Command="{Binding SceneHierarchy.ExportSelectedSceneGlbCommand}" />
                                         <MenuItem Header="Export Selected Subtree to .glb (Instanced)..."
                                                   Command="{Binding ExportSelectedSubtreeGlbCommand}" />
+                                        <MenuItem Header="Export Selected as Unity Prefab (.prefab)..."
+                                                  Command="{Binding ExportSelectedPrefabToUnityProjectCommand}" />
+                                        <MenuItem Header="Export Selected Prefab as .unitypackage..."
+                                                  Command="{Binding ExportSelectedPrefabToUnityPackageCommand}" />
                                         <Separator />
                                         <MenuItem Header="Export Scene(s) Dialog..."
                                                   Command="{Binding ExportSceneGlbCommand}" />
@@ -490,6 +549,11 @@
                                     <MenuItem Header="Export selected assets" Command="{Binding ExportSelectedAssetsCommand}" />
                                     <MenuItem x:Name="exportModelGroupFbxMenuItem" Header="Export Model Group..." Command="{Binding ExportModelGroupFbxCommand}" />
                                     <MenuItem x:Name="exportAnimatorWithSelectedAnimationClipMenuItem" Header="Export Model / Animator + selected AnimationClips" Command="{Binding ExportAnimatorWithSelectedAnimationClipCommand}" />
+                                    <MenuItem x:Name="exportSelectedAssetPrefabMenuItem" Header="Export Selected as Unity Prefab (.prefab)..." Command="{Binding ExportSelectedPrefabToUnityProjectCommand}" />
+                                    <MenuItem x:Name="querySelectedAssetUsageMenuItem" Header="Find Who Uses This Asset (Usage Graph)..." Command="{Binding QuerySelectedAssetGraphUsageCommand}" />
+                                    <MenuItem x:Name="openAnimatorGraphContextMenuItem" Header="Open Interactive Animator Graph..." Command="{Binding OpenAnimatorGraphDialogCommand}" />
+                                    <MenuItem x:Name="exportAnimationClipMetaContextMenuItem" Header="Export AnimationClip Metadata (.json)..." Command="{Binding ExportSelectedAnimationClipMetadataCommand}" />
+                                    <MenuItem x:Name="exportSpriteAtlasContextMenuItem" Header="Export SpriteAtlas Batch &amp; JSON..." Command="{Binding ExportSelectedSpriteAtlasMetadataCommand}" />
                                     <MenuItem x:Name="goToSceneHierarchyMenuItem" Header="Go to scene hierarchy" Command="{Binding GoToSceneHierarchyCommand}" />
                                     <MenuItem x:Name="showOriginalFileMenuItem" Header="Show original file" Command="{Binding ShowOriginalFileCommand}" />
                                 </ContextMenu>
@@ -982,6 +1046,38 @@
                                         Value="{Binding $parent[local:MainWindow].TextureArraySlice.SliceIndex, Mode=TwoWay}" />
                                 <Button Content="▶" Width="26" Height="24" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" Command="{Binding $parent[local:MainWindow].TextureArraySlice.NextSliceCommand}" ToolTip.Tip="Next slice" />
                                 <TextBlock x:Name="TextureArraySliceText" MinWidth="90" VerticalAlignment="Center" Foreground="{DynamicResource AppOverlayTextBrush}" FontSize="11" Text="{Binding $parent[local:MainWindow].TextureArraySlice.SliceText}" />
+                            </StackPanel>
+                        </Border>
+                        <Border x:Name="TextureMipmapBar" Classes="overlay-panel" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,8,0,0" IsVisible="{Binding $parent[local:MainWindow].TextureMipmap.IsVisible}">
+                            <StackPanel Orientation="Horizontal" Spacing="6" Margin="8,4">
+                                <Border Classes="badge-chip" VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding $parent[local:MainWindow].TextureMipmap.FormatBadgeText}" FontSize="10" FontWeight="SemiBold" Foreground="{DynamicResource AppOverlayTextBrush}" />
+                                </Border>
+                                <Button Content="◀" Width="26" Height="24" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                                        IsVisible="{Binding $parent[local:MainWindow].TextureMipmap.HasMultipleMips}"
+                                        Command="{Binding $parent[local:MainWindow].TextureMipmap.PreviousMipCommand}"
+                                        ToolTip.Tip="Higher resolution mip level" />
+                                <Slider x:Name="TextureMipmapSlider" Width="120" Minimum="0" TickFrequency="1" IsSnapToTickEnabled="True" Focusable="False" VerticalAlignment="Center"
+                                        IsVisible="{Binding $parent[local:MainWindow].TextureMipmap.HasMultipleMips}"
+                                        Maximum="{Binding $parent[local:MainWindow].TextureMipmap.MaxMipIndex}"
+                                        Value="{Binding $parent[local:MainWindow].TextureMipmap.MipIndex, Mode=TwoWay}" />
+                                <Button Content="▶" Width="26" Height="24" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                                        IsVisible="{Binding $parent[local:MainWindow].TextureMipmap.HasMultipleMips}"
+                                        Command="{Binding $parent[local:MainWindow].TextureMipmap.NextMipCommand}"
+                                        ToolTip.Tip="Lower resolution mip level" />
+                                <TextBlock x:Name="TextureMipmapText" VerticalAlignment="Center" Foreground="{DynamicResource AppOverlayTextBrush}" FontSize="11" Text="{Binding $parent[local:MainWindow].TextureMipmap.MipText}" />
+                                <Button Content="Mips" Height="24" Padding="7,1" FontSize="11"
+                                        IsVisible="{Binding $parent[local:MainWindow].TextureMipmap.HasMultipleMips}"
+                                        Command="{Binding $parent[local:MainWindow].TextureMipmap.ExportAllMipsCommand}"
+                                        ToolTip.Tip="Export all mipmap levels + JSON manifest" />
+                                <Button Content="EXR" Height="24" Padding="7,1" FontSize="11"
+                                        IsVisible="{Binding $parent[local:MainWindow].TextureMipmap.CanExportHdr}"
+                                        Command="{Binding $parent[local:MainWindow].TextureMipmap.ExportHdrExrCommand}"
+                                        ToolTip.Tip="Export HDR OpenEXR (.exr) preserving linear float values" />
+                                <Button Content="TIFF" Height="24" Padding="7,1" FontSize="11"
+                                        IsVisible="{Binding $parent[local:MainWindow].TextureMipmap.CanExportHdr}"
+                                        Command="{Binding $parent[local:MainWindow].TextureMipmap.ExportHdrTiffCommand}"
+                                        ToolTip.Tip="Export 32-bit Float TIFF (.tif) preserving linear float values" />
                             </StackPanel>
                         </Border>
                         <Border x:Name="PreviewInfoBorder" Classes="overlay-panel" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="{Binding PreviewSession.IsInfoOverlayVisible}">

@@ -1,0 +1,222 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
+        x:Class="AssetStudio.Avalonia.BuildDiffDialog"
+        x:CompileBindings="True"
+        x:DataType="vm:BuildDiffDialogViewModel"
+        Title="{Binding DialogTitle}"
+        Width="980"
+        Height="700"
+        MinWidth="760"
+        MinHeight="540"
+        WindowStartupLocation="CenterOwner">
+
+    <Grid RowDefinitions="Auto,Auto,Auto,Auto,*,Auto" Margin="14" RowSpacing="10">
+        <!-- Folder Inputs -->
+        <Border Grid.Row="0"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="12,10">
+            <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="110,*,Auto,Auto" RowSpacing="8" ColumnSpacing="8">
+                <TextBlock Grid.Row="0" Grid.Column="0"
+                           Text="Baseline Folder"
+                           VerticalAlignment="Center"
+                           FontWeight="SemiBold" />
+                <TextBox Grid.Row="0" Grid.Column="1"
+                         PlaceholderText="Select baseline build folder..."
+                         Text="{Binding BaselineFolder, Mode=TwoWay}" />
+                <Button Grid.Row="0" Grid.Column="2"
+                        Content="Browse..."
+                        MinWidth="84"
+                        Command="{Binding PickBaselineCommand}" />
+                <Button Grid.Row="0" Grid.Column="3"
+                        Content="Run Diff"
+                        MinWidth="96"
+                        IsDefault="True"
+                        Command="{Binding RunDiffCommand}" />
+
+                <TextBlock Grid.Row="1" Grid.Column="0"
+                           Text="Target Folder"
+                           VerticalAlignment="Center"
+                           FontWeight="SemiBold" />
+                <TextBox Grid.Row="1" Grid.Column="1"
+                         PlaceholderText="Select target / newer build folder..."
+                         Text="{Binding TargetFolder, Mode=TwoWay}" />
+                <Button Grid.Row="1" Grid.Column="2"
+                        Content="Browse..."
+                        MinWidth="84"
+                        Command="{Binding PickTargetCommand}" />
+                <Button Grid.Row="1" Grid.Column="3"
+                        Content="Cancel"
+                        MinWidth="96"
+                        Command="{Binding CancelDiffCommand}" />
+            </Grid>
+        </Border>
+
+        <!-- Summary Badge -->
+        <Border Grid.Row="1"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="10,8"
+                Background="{DynamicResource SystemControlBackgroundBaseLowBrush}">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                <TextBlock Grid.Column="0"
+                           Text="{Binding SummaryBadgeText}"
+                           FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis"
+                           VerticalAlignment="Center" />
+                <ProgressBar Grid.Column="1"
+                             Width="120"
+                             Height="6"
+                             IsIndeterminate="True"
+                             IsVisible="{Binding IsRunning}"
+                             VerticalAlignment="Center" />
+            </Grid>
+        </Border>
+
+        <!-- Diagnostic Note -->
+        <Border Grid.Row="2"
+                IsVisible="{Binding HasDiagnosticBanner}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="10,6"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}">
+            <TextBlock Text="{Binding DiagnosticBannerText}"
+                       FontSize="11"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                       TextWrapping="Wrap" />
+        </Border>
+
+        <!-- Filters & View Toggle -->
+        <Grid Grid.Row="3" ColumnDefinitions="Auto,Auto,*,Auto" ColumnSpacing="8">
+            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                <TextBlock Text="View" VerticalAlignment="Center" />
+                <ComboBox Width="110"
+                          ItemsSource="{Binding ViewModeOptions}"
+                          SelectedIndex="{Binding SelectedViewModeIndex, Mode=TwoWay}" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                <TextBlock Text="Change" VerticalAlignment="Center" />
+                <ComboBox Width="125"
+                          ItemsSource="{Binding ChangeFilterOptions}"
+                          SelectedIndex="{Binding SelectedChangeFilterIndex, Mode=TwoWay}" />
+            </StackPanel>
+
+            <TextBox Grid.Column="2"
+                     PlaceholderText="Filter results by name, path, type, file, or detail..."
+                     Text="{Binding SearchText, Mode=TwoWay}" />
+
+            <CheckBox Grid.Column="3"
+                      Content="Hide unchanged"
+                      IsChecked="{Binding HideUnchanged, Mode=TwoWay}"
+                      VerticalAlignment="Center" />
+        </Grid>
+
+        <!-- Results Table -->
+        <Border Grid.Row="4"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="4">
+            <Grid RowDefinitions="Auto,*">
+                <!-- Header Row -->
+                <Border Grid.Row="0"
+                        Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                        BorderThickness="0,0,0,1"
+                        Padding="10,6">
+                    <Grid ColumnDefinitions="96,110,220,160,96,*" ColumnSpacing="8">
+                        <TextBlock Grid.Column="0" Text="Change" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="1" Text="Type" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="2" Text="Name / Relative Path" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="3" Text="Source File" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="4" Text="Size Delta" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="5" Text="Details" FontWeight="SemiBold" FontSize="11" />
+                    </Grid>
+                </Border>
+
+                <Grid Grid.Row="1">
+                    <ListBox ItemsSource="{Binding FilteredResults}"
+                             SelectedItem="{Binding SelectedResult, Mode=TwoWay}"
+                             Background="Transparent"
+                             BorderThickness="0">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="vm:BuildDiffResultRow" x:CompileBindings="True">
+                                <Grid ColumnDefinitions="96,110,220,160,96,*" ColumnSpacing="8" Margin="2,2">
+                                    <TextBlock Grid.Column="0"
+                                               Text="{Binding ChangeBadge}"
+                                               FontWeight="SemiBold"
+                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                               FontSize="11"
+                                               VerticalAlignment="Center" />
+                                    <TextBlock Grid.Column="1"
+                                               Text="{Binding TypeName}"
+                                               FontSize="12"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center" />
+                                    <TextBlock Grid.Column="2"
+                                               Text="{Binding NameOrPath}"
+                                               FontSize="12"
+                                               FontWeight="Medium"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center"
+                                               ToolTip.Tip="{Binding NameOrPath}" />
+                                    <TextBlock Grid.Column="3"
+                                               Text="{Binding SourceFile}"
+                                               FontSize="11"
+                                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center"
+                                               ToolTip.Tip="{Binding SourceFile}" />
+                                    <TextBlock Grid.Column="4"
+                                               Text="{Binding SizeDeltaText}"
+                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                               FontSize="11"
+                                               VerticalAlignment="Center" />
+                                    <TextBlock Grid.Column="5"
+                                               Text="{Binding Detail}"
+                                               FontSize="11"
+                                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center"
+                                               ToolTip.Tip="{Binding Detail}" />
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <TextBlock Text="No diff entries match the current filter."
+                               IsVisible="{Binding HasNoResults}"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                </Grid>
+            </Grid>
+        </Border>
+
+        <!-- Footer -->
+        <Grid Grid.Row="5" ColumnDefinitions="*,Auto" ColumnSpacing="10">
+            <TextBlock Grid.Column="0"
+                       Text="{Binding StatusText}"
+                       VerticalAlignment="Center"
+                       TextTrimming="CharacterEllipsis"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                <Button Content="Export JSON..."
+                        MinWidth="104"
+                        Command="{Binding ExportJsonCommand}" />
+                <Button Content="Export CSV..."
+                        MinWidth="104"
+                        Command="{Binding ExportCsvCommand}" />
+                <Button Content="Close"
+                        MinWidth="84"
+                        IsCancel="True"
+                        Command="{Binding CloseCommand}" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

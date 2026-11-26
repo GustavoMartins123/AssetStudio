@@ -198,6 +198,7 @@ public partial class MainWindow
         currentPreviewTexture = null;
         currentPreviewSprite = null;
         ResetTextureArrayPreview();
+        ResetTextureMipmapPreview();
         Volatile.Write(ref _spriteDependenciesLoadedFor, null);
         currentPreviewMesh = null;
         currentPreviewAvatar = null;

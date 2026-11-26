@@ -723,16 +723,27 @@ namespace AssetStudio.Tests
                 Assert.Contains($"guid: {expectedAlbedoGuid}", matAText);
                 Assert.Contains($"guid: {expectedNormalGuid}", matAText);
 
-                // 6) Multi-submesh .obj + .obj.meta
+                // 6) Multi-submesh .obj + companion .mtl + .obj.meta (Unity 6 internalIDToNameTable + legacy recycle table)
                 var meshPath = Path.Combine(tempRoot, "Assets", "Meshes", "SM_Tower.obj");
+                var mtlPath = Path.Combine(tempRoot, "Assets", "Meshes", "SM_Tower.mtl");
                 Assert.True(File.Exists(meshPath));
                 Assert.True(File.Exists(meshPath + ".meta"));
+                Assert.True(File.Exists(mtlPath));
+                Assert.True(File.Exists(mtlPath + ".meta"));
                 var objText = File.ReadAllText(meshPath);
-                Assert.Contains("g submesh_0", objText);
+                Assert.Contains("mtllib SM_Tower.mtl", objText);
+                Assert.Contains("g SM_Tower", objText);
+                Assert.DoesNotContain("g submesh_", objText);
                 Assert.Contains("usemtl mat_0", objText);
-                Assert.Contains("g submesh_1", objText);
                 Assert.Contains("usemtl mat_1", objText);
-                Assert.Contains("4300000: SM_Tower", File.ReadAllText(meshPath + ".meta"));
+                var mtlText = File.ReadAllText(mtlPath);
+                Assert.Contains("newmtl mat_0", mtlText);
+                Assert.Contains("newmtl mat_1", mtlText);
+                var meshMetaText = File.ReadAllText(meshPath + ".meta");
+                Assert.Contains("internalIDToNameTable:", meshMetaText);
+                Assert.Contains("43: 4300000", meshMetaText);
+                Assert.Contains("second: SM_Tower", meshMetaText);
+                Assert.Contains("4300000: SM_Tower", meshMetaText);
 
                 // 7) Textures .png + .png.meta (normal map has textureType: 1, albedo has textureType: 0)
                 var albedoMeta = File.ReadAllText(Path.Combine(tempRoot, "Assets", "Textures", "T_Brick_Albedo.png.meta"));

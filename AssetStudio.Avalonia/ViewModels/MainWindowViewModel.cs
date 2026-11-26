@@ -31,6 +31,19 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? ExportSceneGlbAsync { get; set; }
         public Func<Task>? ExportSelectedSubtreeGlbAsync { get; set; }
         public Func<Task>? ExportSceneToUnityProjectAsync { get; set; }
+        public Func<Task>? ExportSceneToUnityPackageAsync { get; set; }
+        public Func<Task>? ExportSelectedPrefabToUnityProjectAsync { get; set; }
+        public Func<Task>? ExportSelectedPrefabToUnityPackageAsync { get; set; }
+
+        public Func<Task>? OpenBuildDiffDialogAsync { get; set; }
+        public Func<Task>? OpenGlobalSearchDialogAsync { get; set; }
+        public Func<Task>? QuerySelectedAssetGraphUsageAsync { get; set; }
+        public Func<Task>? OpenAnimatorGraphDialogAsync { get; set; }
+        public Func<Task>? ExportSelectedAnimationClipMetadataAsync { get; set; }
+        public Func<Task>? ExportCurrentTextureMipChainAsync { get; set; }
+        public Func<Task>? ExportCurrentTextureHdrExrAsync { get; set; }
+        public Func<Task>? ExportCurrentTextureHdrTiffAsync { get; set; }
+        public Func<Task>? ExportSelectedSpriteAtlasMetadataAsync { get; set; }
 
         public Func<Task>? ExportAllAssetsAsync { get; set; }
         public Func<Task>? ExportSelectedAssetsAsync { get; set; }
@@ -127,6 +140,19 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportSceneGlbAsync = null;
             ExportSelectedSubtreeGlbAsync = null;
             ExportSceneToUnityProjectAsync = null;
+            ExportSceneToUnityPackageAsync = null;
+            ExportSelectedPrefabToUnityProjectAsync = null;
+            ExportSelectedPrefabToUnityPackageAsync = null;
+
+            OpenBuildDiffDialogAsync = null;
+            OpenGlobalSearchDialogAsync = null;
+            QuerySelectedAssetGraphUsageAsync = null;
+            OpenAnimatorGraphDialogAsync = null;
+            ExportSelectedAnimationClipMetadataAsync = null;
+            ExportCurrentTextureMipChainAsync = null;
+            ExportCurrentTextureHdrExrAsync = null;
+            ExportCurrentTextureHdrTiffAsync = null;
+            ExportSelectedSpriteAtlasMetadataAsync = null;
 
             ExportAllAssetsAsync = null;
             ExportSelectedAssetsAsync = null;
@@ -284,6 +310,19 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportSceneGlbCommand = new AsyncRelayCommand(ExecuteExportSceneGlbAsync, onException: HandleCommandException);
             ExportSelectedSubtreeGlbCommand = new AsyncRelayCommand(ExecuteExportSelectedSubtreeGlbAsync, onException: HandleCommandException);
             ExportSceneToUnityProjectCommand = new AsyncRelayCommand(ExecuteExportSceneToUnityProjectAsync, onException: HandleCommandException);
+            ExportSceneToUnityPackageCommand = new AsyncRelayCommand(ExecuteExportSceneToUnityPackageAsync, onException: HandleCommandException);
+            ExportSelectedPrefabToUnityProjectCommand = new AsyncRelayCommand(ExecuteExportSelectedPrefabToUnityProjectAsync, onException: HandleCommandException);
+            ExportSelectedPrefabToUnityPackageCommand = new AsyncRelayCommand(ExecuteExportSelectedPrefabToUnityPackageAsync, onException: HandleCommandException);
+
+            OpenBuildDiffDialogCommand = new AsyncRelayCommand(ExecuteOpenBuildDiffDialogAsync, canExecute: () => !_disposed, onException: HandleCommandException);
+            OpenGlobalSearchDialogCommand = new AsyncRelayCommand(ExecuteOpenGlobalSearchDialogAsync, canExecute: () => !_disposed, onException: HandleCommandException);
+            QuerySelectedAssetGraphUsageCommand = new AsyncRelayCommand(ExecuteQuerySelectedAssetGraphUsageAsync, canExecute: () => !_disposed, onException: HandleCommandException);
+            OpenAnimatorGraphDialogCommand = new AsyncRelayCommand(ExecuteOpenAnimatorGraphDialogAsync, canExecute: () => !_disposed, onException: HandleCommandException);
+            ExportSelectedAnimationClipMetadataCommand = new AsyncRelayCommand(ExecuteExportSelectedAnimationClipMetadataAsync, canExecute: () => !_disposed, onException: HandleCommandException);
+            ExportCurrentTextureMipChainCommand = new AsyncRelayCommand(ExecuteExportCurrentTextureMipChainAsync, canExecute: () => !_disposed, onException: HandleCommandException);
+            ExportCurrentTextureHdrExrCommand = new AsyncRelayCommand(ExecuteExportCurrentTextureHdrExrAsync, canExecute: () => !_disposed, onException: HandleCommandException);
+            ExportCurrentTextureHdrTiffCommand = new AsyncRelayCommand(ExecuteExportCurrentTextureHdrTiffAsync, canExecute: () => !_disposed, onException: HandleCommandException);
+            ExportSelectedSpriteAtlasMetadataCommand = new AsyncRelayCommand(ExecuteExportSelectedSpriteAtlasMetadataAsync, canExecute: () => !_disposed, onException: HandleCommandException);
 
             ExportAllAssetsCommand = new AsyncRelayCommand(ExecuteExportAllAssetsAsync, onException: HandleCommandException);
             ExportSelectedAssetsCommand = new AsyncRelayCommand(ExecuteExportSelectedAssetsAsync, onException: HandleCommandException);
@@ -468,6 +507,19 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand ExportSceneGlbCommand { get; }
         public AsyncRelayCommand ExportSelectedSubtreeGlbCommand { get; }
         public AsyncRelayCommand ExportSceneToUnityProjectCommand { get; }
+        public AsyncRelayCommand ExportSceneToUnityPackageCommand { get; }
+        public AsyncRelayCommand ExportSelectedPrefabToUnityProjectCommand { get; }
+        public AsyncRelayCommand ExportSelectedPrefabToUnityPackageCommand { get; }
+
+        public AsyncRelayCommand OpenBuildDiffDialogCommand { get; }
+        public AsyncRelayCommand OpenGlobalSearchDialogCommand { get; }
+        public AsyncRelayCommand QuerySelectedAssetGraphUsageCommand { get; }
+        public AsyncRelayCommand OpenAnimatorGraphDialogCommand { get; }
+        public AsyncRelayCommand ExportSelectedAnimationClipMetadataCommand { get; }
+        public AsyncRelayCommand ExportCurrentTextureMipChainCommand { get; }
+        public AsyncRelayCommand ExportCurrentTextureHdrExrCommand { get; }
+        public AsyncRelayCommand ExportCurrentTextureHdrTiffCommand { get; }
+        public AsyncRelayCommand ExportSelectedSpriteAtlasMetadataCommand { get; }
 
         public AsyncRelayCommand ExportAllAssetsCommand { get; }
         public AsyncRelayCommand ExportSelectedAssetsCommand { get; }
@@ -1015,6 +1067,159 @@ namespace AssetStudio.Avalonia.ViewModels
 
         private Task ExecuteExportSceneToUnityProjectAsync() =>
             InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportSceneToUnityProjectAsync, "Exporting scene to Unity project...");
+
+        private Task ExecuteExportSceneToUnityPackageAsync() =>
+            InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportSceneToUnityPackageAsync, "Exporting scene to .unitypackage...");
+
+        private Task ExecuteExportSelectedPrefabToUnityProjectAsync() =>
+            InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportSelectedPrefabToUnityProjectAsync, "Exporting selected prefab to Unity project...");
+
+        private Task ExecuteExportSelectedPrefabToUnityPackageAsync() =>
+            InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportSelectedPrefabToUnityPackageAsync, "Exporting selected prefab to .unitypackage...");
+
+        private async Task ExecuteOpenBuildDiffDialogAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.OpenBuildDiffDialogAsync != null)
+            {
+                await CommandHandlers.OpenBuildDiffDialogAsync();
+                return;
+            }
+
+            StatusText = "Ready to compare builds.";
+        }
+
+        private async Task ExecuteOpenGlobalSearchDialogAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.OpenGlobalSearchDialogAsync != null)
+            {
+                await CommandHandlers.OpenGlobalSearchDialogAsync();
+                return;
+            }
+
+            StatusText = "Ready for global project search.";
+        }
+
+        private async Task ExecuteQuerySelectedAssetGraphUsageAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.QuerySelectedAssetGraphUsageAsync != null)
+            {
+                await CommandHandlers.QuerySelectedAssetGraphUsageAsync();
+                return;
+            }
+
+            StatusText = "Ready to query semantic asset usage graph.";
+        }
+
+        private async Task ExecuteOpenAnimatorGraphDialogAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.OpenAnimatorGraphDialogAsync != null)
+            {
+                await CommandHandlers.OpenAnimatorGraphDialogAsync();
+                return;
+            }
+
+            StatusText = "Ready to open interactive Animator Graph.";
+        }
+
+        private async Task ExecuteExportSelectedAnimationClipMetadataAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.ExportSelectedAnimationClipMetadataAsync != null)
+            {
+                await CommandHandlers.ExportSelectedAnimationClipMetadataAsync();
+                return;
+            }
+
+            StatusText = "Ready to export AnimationClip metadata JSON.";
+        }
+
+        private async Task ExecuteExportCurrentTextureMipChainAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.ExportCurrentTextureMipChainAsync != null)
+            {
+                await CommandHandlers.ExportCurrentTextureMipChainAsync();
+                return;
+            }
+
+            StatusText = "Ready to export Texture2D mipmap chain.";
+        }
+
+        private async Task ExecuteExportCurrentTextureHdrExrAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.ExportCurrentTextureHdrExrAsync != null)
+            {
+                await CommandHandlers.ExportCurrentTextureHdrExrAsync();
+                return;
+            }
+
+            StatusText = "Ready to export HDR OpenEXR texture.";
+        }
+
+        private async Task ExecuteExportCurrentTextureHdrTiffAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.ExportCurrentTextureHdrTiffAsync != null)
+            {
+                await CommandHandlers.ExportCurrentTextureHdrTiffAsync();
+                return;
+            }
+
+            StatusText = "Ready to export HDR Float32 TIFF texture.";
+        }
+
+        private async Task ExecuteExportSelectedSpriteAtlasMetadataAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.ExportSelectedSpriteAtlasMetadataAsync != null)
+            {
+                await CommandHandlers.ExportSelectedSpriteAtlasMetadataAsync();
+                return;
+            }
+
+            StatusText = "Ready to export SpriteAtlas batch and JSON manifest.";
+        }
 
         private Task ExecuteExportAllAssetsAsync() =>
             InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportAllAssetsAsync, "Exporting all assets...");
@@ -1903,6 +2108,9 @@ namespace AssetStudio.Avalonia.ViewModels
             ToggleAssemblyExplorerCommand.NotifyCanExecuteChanged();
             SelectAssemblyExplorerTypeCommand.NotifyCanExecuteChanged();
             NavigateToScriptUsageCommand.NotifyCanExecuteChanged();
+            OpenBuildDiffDialogCommand.NotifyCanExecuteChanged();
+            OpenGlobalSearchDialogCommand.NotifyCanExecuteChanged();
+            QuerySelectedAssetGraphUsageCommand.NotifyCanExecuteChanged();
         }
 
         private sealed class NoOpDialogService : IDialogService

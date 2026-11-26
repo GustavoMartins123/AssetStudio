@@ -1,0 +1,228 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
+        x:Class="AssetStudio.Avalonia.GlobalSearchDialog"
+        x:CompileBindings="True"
+        x:DataType="vm:GlobalSearchDialogViewModel"
+        Title="{Binding DialogTitle}"
+        Width="980"
+        Height="680"
+        MinWidth="740"
+        MinHeight="520"
+        WindowStartupLocation="CenterOwner">
+
+    <Grid RowDefinitions="Auto,Auto,Auto,*,Auto" Margin="14" RowSpacing="10">
+        <!-- Mode Selector -->
+        <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6">
+                <Button Content="Global Asset Search"
+                        Command="{Binding SwitchToSearchModeCommand}" />
+                <Button Content="Semantic Usage Graph"
+                        Command="{Binding SwitchToGraphModeCommand}" />
+            </StackPanel>
+
+            <TextBlock Grid.Column="1"
+                       Text="{Binding QuerySyntaxHint}"
+                       IsVisible="{Binding IsSearchMode}"
+                       FontSize="11"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                       VerticalAlignment="Center"
+                       TextTrimming="CharacterEllipsis" />
+
+            <ProgressBar Grid.Column="2"
+                         Width="100"
+                         Height="6"
+                         IsIndeterminate="True"
+                         IsVisible="{Binding IsBusy}"
+                         VerticalAlignment="Center" />
+        </Grid>
+
+        <!-- Query Controls Panel -->
+        <Border Grid.Row="1"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="12,10">
+            <Grid>
+                <!-- Global Asset Search Controls -->
+                <Grid RowDefinitions="Auto,Auto" RowSpacing="8" IsVisible="{Binding IsSearchMode}">
+                    <Grid Grid.Row="0" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                        <TextBox Grid.Column="0"
+                                 PlaceholderText="Search assets: text, pathid:123, guid:hex, type:Material, file:sharedassets0, -exclude"
+                                 Text="{Binding QueryText, Mode=TwoWay}" />
+                        <Button Grid.Column="1"
+                                Content="Search"
+                                MinWidth="92"
+                                IsDefault="True"
+                                Command="{Binding ExecuteQueryCommand}" />
+                        <Button Grid.Column="2"
+                                Content="Clear"
+                                MinWidth="72"
+                                Command="{Binding ClearCommand}" />
+                    </Grid>
+
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="14">
+                        <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                            <TextBlock Text="Type" VerticalAlignment="Center" />
+                            <ComboBox Width="155"
+                                      ItemsSource="{Binding TypeFilterOptions}"
+                                      SelectedIndex="{Binding SelectedTypeFilterIndex, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <CheckBox Content="Regex"
+                                  IsChecked="{Binding UseRegex, Mode=TwoWay}"
+                                  VerticalAlignment="Center" />
+
+                        <CheckBox Content="Search TextAsset contents (bounded &lt;= 2 MiB)"
+                                  IsChecked="{Binding SearchTextAssetContents, Mode=TwoWay}"
+                                  VerticalAlignment="Center" />
+                    </StackPanel>
+                </Grid>
+
+                <!-- Semantic Usage Graph Controls -->
+                <Grid RowDefinitions="Auto,Auto" RowSpacing="8" IsVisible="{Binding IsGraphMode}">
+                    <Grid Grid.Row="0" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                        <TextBox Grid.Column="0"
+                                 PlaceholderText="Enter Asset UniqueID or Shader name (e.g. Standard, sharedassets0.assets#hash#123)..."
+                                 Text="{Binding GraphQueryInput, Mode=TwoWay}" />
+                        <Button Grid.Column="1"
+                                Content="Query Graph"
+                                MinWidth="104"
+                                IsDefault="True"
+                                Command="{Binding ExecuteQueryCommand}" />
+                        <Button Grid.Column="2"
+                                Content="Clear"
+                                MinWidth="72"
+                                Command="{Binding ClearCommand}" />
+                    </Grid>
+
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="10">
+                        <TextBlock Text="Graph Query" VerticalAlignment="Center" />
+                        <ComboBox Width="250"
+                                  ItemsSource="{Binding GraphQueryKindOptions}"
+                                  SelectedIndex="{Binding SelectedGraphQueryKindIndex, Mode=TwoWay}" />
+                        <TextBlock Text="{Binding GraphTargetName}"
+                                   FontSize="11"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                   VerticalAlignment="Center"
+                                   TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                </Grid>
+            </Grid>
+        </Border>
+
+        <!-- Error Banner -->
+        <Border Grid.Row="2"
+                IsVisible="{Binding HasError}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="10,6"
+                Background="{DynamicResource SystemControlBackgroundBaseLowBrush}">
+            <TextBlock Text="{Binding ErrorText}"
+                       FontSize="12"
+                       FontWeight="SemiBold"
+                       TextWrapping="Wrap" />
+        </Border>
+
+        <!-- Results List -->
+        <Border Grid.Row="3"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="4">
+            <Grid RowDefinitions="Auto,*">
+                <Border Grid.Row="0"
+                        Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                        BorderThickness="0,0,0,1"
+                        Padding="10,6">
+                    <Grid ColumnDefinitions="115,200,190,150,*" ColumnSpacing="8">
+                        <TextBlock Grid.Column="0" Text="Type" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="1" Text="Name" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="2" Text="Container / Relation" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="3" Text="Source File" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Grid.Column="4" Text="Detail / Snippet" FontWeight="SemiBold" FontSize="11" />
+                    </Grid>
+                </Border>
+
+                <Grid Grid.Row="1">
+                    <ListBox x:Name="ResultsListBox"
+                             ItemsSource="{Binding Results}"
+                             SelectedItem="{Binding SelectedResult, Mode=TwoWay}"
+                             Background="Transparent"
+                             BorderThickness="0">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="vm:GlobalSearchResultItem" x:CompileBindings="True">
+                                <Grid ColumnDefinitions="115,200,190,150,*" ColumnSpacing="8" Margin="2,2">
+                                    <TextBlock Grid.Column="0"
+                                               Text="{Binding TypeName}"
+                                               FontSize="11"
+                                               FontWeight="SemiBold"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center" />
+                                    <TextBlock Grid.Column="1"
+                                               Text="{Binding Name}"
+                                               FontSize="12"
+                                               FontWeight="Medium"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center"
+                                               ToolTip.Tip="{Binding Name}" />
+                                    <TextBlock Grid.Column="2"
+                                               Text="{Binding Container}"
+                                               FontSize="11"
+                                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center"
+                                               ToolTip.Tip="{Binding Container}" />
+                                    <TextBlock Grid.Column="3"
+                                               Text="{Binding SourceFile}"
+                                               FontSize="11"
+                                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center"
+                                               ToolTip.Tip="{Binding SourceFile}" />
+                                    <TextBlock Grid.Column="4"
+                                               Text="{Binding Detail}"
+                                               FontSize="11"
+                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               VerticalAlignment="Center"
+                                               ToolTip.Tip="{Binding Detail}" />
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <TextBlock Text="No results to display."
+                               IsVisible="{Binding HasNoResults}"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                </Grid>
+            </Grid>
+        </Border>
+
+        <!-- Footer -->
+        <Grid Grid.Row="4" ColumnDefinitions="*,Auto" ColumnSpacing="10">
+            <TextBlock Grid.Column="0"
+                       Text="{Binding StatusText}"
+                       VerticalAlignment="Center"
+                       TextTrimming="CharacterEllipsis"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                <Button Content="Find Usages"
+                        MinWidth="96"
+                        Command="{Binding InspectSelectedUsageCommand}" />
+                <Button Content="Go To Selected"
+                        MinWidth="112"
+                        Command="{Binding GoToSelectedCommand}" />
+                <Button Content="Close"
+                        MinWidth="84"
+                        IsCancel="True"
+                        Command="{Binding CloseCommand}" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

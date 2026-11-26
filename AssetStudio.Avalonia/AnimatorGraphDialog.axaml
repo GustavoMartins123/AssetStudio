@@ -1,0 +1,506 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
+        xmlns:svc="using:AssetStudio.Avalonia.Services"
+        xmlns:local="using:AssetStudio.Avalonia"
+        x:Class="AssetStudio.Avalonia.AnimatorGraphDialog"
+        x:CompileBindings="True"
+        x:DataType="vm:AnimatorGraphViewModel"
+        Title="{Binding WindowTitle}"
+        Width="1240"
+        Height="780"
+        MinWidth="900"
+        MinHeight="580"
+        WindowStartupLocation="CenterOwner">
+
+    <Grid RowDefinitions="Auto,Auto,*,Auto" Margin="12" RowSpacing="8">
+        <!-- Top Toolbar -->
+        <Border Grid.Row="0"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="12,8">
+            <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="8">
+                <StackPanel Grid.Column="0" VerticalAlignment="Center" Spacing="2">
+                    <TextBlock Text="{Binding HeaderSummary}"
+                               FontWeight="SemiBold"
+                               FontSize="13"
+                               TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <TextBlock Text="Layer:" VerticalAlignment="Center" FontSize="12" />
+                    <ComboBox MinWidth="220"
+                              MaxWidth="320"
+                              ItemsSource="{Binding Layers}"
+                              SelectedItem="{Binding SelectedLayer, Mode=TwoWay}" />
+                </StackPanel>
+
+                <Button Grid.Column="2"
+                        Content="Export JSON..."
+                        Command="{Binding ExportJsonCommand}" />
+
+                <Button Grid.Column="3"
+                        Content="Export Graphviz DOT..."
+                        Command="{Binding ExportDotCommand}" />
+
+                <Button Grid.Column="4"
+                        Content="Copy Summary"
+                        Command="{Binding CopySummaryCommand}" />
+
+                <Button Grid.Column="5"
+                        Content="Close"
+                        IsCancel="True"
+                        Command="{Binding CloseCommand}" />
+            </Grid>
+        </Border>
+
+        <!-- Diagnostic Notes Banner -->
+        <Border Grid.Row="1"
+                IsVisible="{Binding HasNotes}"
+                Background="{DynamicResource SystemControlBackgroundBaseLowBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="10,6">
+            <TextBlock Text="{Binding NotesText}"
+                       FontSize="11"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                       TextWrapping="Wrap" />
+        </Border>
+
+        <!-- Main 3-Pane Split -->
+        <Grid Grid.Row="2" ColumnDefinitions="260,*,320" ColumnSpacing="10">
+            <!-- Left Pane: Filter, States, Parameters, Clip Overrides -->
+            <Border Grid.Column="0"
+                    BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                    BorderThickness="1"
+                    CornerRadius="6"
+                    Padding="8">
+                <Grid RowDefinitions="Auto,2*,Auto,*,Auto,Auto" RowSpacing="6">
+                    <Grid Grid.Row="0" ColumnDefinitions="*,Auto" ColumnSpacing="4">
+                        <TextBox Grid.Column="0"
+                                 PlaceholderText="Filter states / clips..."
+                                 Text="{Binding FilterText, Mode=TwoWay}" />
+                        <Button Grid.Column="1"
+                                Content="Reset"
+                                Command="{Binding ResetFilterCommand}" />
+                    </Grid>
+
+                    <!-- States List -->
+                    <Border Grid.Row="1"
+                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4">
+                        <Grid RowDefinitions="Auto,*">
+                            <Border Grid.Row="0"
+                                    Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                    Padding="8,4">
+                                <TextBlock Text="States" FontWeight="SemiBold" FontSize="11" />
+                            </Border>
+                            <ListBox Grid.Row="1"
+                                     ItemsSource="{Binding FilteredStates}"
+                                     SelectedItem="{Binding SelectedState, Mode=TwoWay}"
+                                     Background="Transparent"
+                                     BorderThickness="0">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate x:DataType="svc:AnimatorGraphState" x:CompileBindings="True">
+                                        <StackPanel Spacing="1" Margin="2,2">
+                                            <TextBlock Text="{Binding ListDisplayName}"
+                                                       FontWeight="SemiBold"
+                                                       FontSize="12"
+                                                       TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Text="{Binding MotionBadge}"
+                                                       FontSize="10"
+                                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                       TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </Grid>
+                    </Border>
+
+                    <!-- Parameters -->
+                    <TextBlock Grid.Row="2" Text="Parameters" FontWeight="SemiBold" FontSize="11" Margin="2,2,0,0" />
+                    <Border Grid.Row="3"
+                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4">
+                        <ListBox ItemsSource="{Binding Parameters}"
+                                 Background="Transparent"
+                                 BorderThickness="0">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate x:DataType="svc:AnimatorGraphParameter" x:CompileBindings="True">
+                                    <TextBlock Text="{Binding DisplayLine}"
+                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                               FontSize="11"
+                                               TextTrimming="CharacterEllipsis"
+                                               ToolTip.Tip="{Binding DisplayLine}" />
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </Border>
+
+                    <!-- Clip Overrides (visible for AnimatorOverrideController) -->
+                    <TextBlock Grid.Row="4"
+                               Text="Clip Overrides"
+                               FontWeight="SemiBold"
+                               FontSize="11"
+                               IsVisible="{Binding HasClipOverrides}"
+                               Margin="2,2,0,0" />
+                    <Border Grid.Row="5"
+                            IsVisible="{Binding HasClipOverrides}"
+                            MaxHeight="150"
+                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4">
+                        <ListBox ItemsSource="{Binding ClipOverrides}"
+                                 Background="Transparent"
+                                 BorderThickness="0">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate x:DataType="svc:AnimatorClipOverrideEntry" x:CompileBindings="True">
+                                    <TextBlock Text="{Binding DisplayLine}"
+                                               FontSize="11"
+                                               TextTrimming="CharacterEllipsis"
+                                               ToolTip.Tip="{Binding DisplayLine}" />
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- Center Pane: Interactive State-Machine Canvas -->
+            <Border Grid.Column="1"
+                    BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                    BorderThickness="1"
+                    CornerRadius="6"
+                    Background="{DynamicResource SystemControlBackgroundBaseLowBrush}">
+                <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                              VerticalScrollBarVisibility="Auto">
+                    <Canvas Width="{Binding CanvasWidth}"
+                            Height="{Binding CanvasHeight}">
+                        <!-- Transition Edges Layer -->
+                        <ItemsControl ItemsSource="{Binding CanvasEdges}"
+                                      Width="{Binding CanvasWidth}"
+                                      Height="{Binding CanvasHeight}"
+                                      IsHitTestVisible="False">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <Canvas />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:AnimatorGraphCanvasEdge" x:CompileBindings="True">
+                                    <Canvas>
+                                        <Line StartPoint="{Binding ., Converter={x:Static local:AnimatorGraphEdgePointConverter.Start}}"
+                                              EndPoint="{Binding ., Converter={x:Static local:AnimatorGraphEdgePointConverter.End}}"
+                                              Stroke="#2E7D32"
+                                              StrokeThickness="2"
+                                              IsVisible="{Binding IsEntryEdge}" />
+                                        <Line StartPoint="{Binding ., Converter={x:Static local:AnimatorGraphEdgePointConverter.Start}}"
+                                              EndPoint="{Binding ., Converter={x:Static local:AnimatorGraphEdgePointConverter.End}}"
+                                              Stroke="#00838F"
+                                              StrokeThickness="1.75"
+                                              IsVisible="{Binding IsAnyStateEdge}" />
+                                        <Line StartPoint="{Binding ., Converter={x:Static local:AnimatorGraphEdgePointConverter.Start}}"
+                                              EndPoint="{Binding ., Converter={x:Static local:AnimatorGraphEdgePointConverter.End}}"
+                                              Stroke="#78909C"
+                                              StrokeThickness="1.5"
+                                              IsVisible="{Binding IsStandardEdge}" />
+
+                                        <Ellipse Canvas.Left="{Binding ArrowX}"
+                                                 Canvas.Top="{Binding ArrowY}"
+                                                 Width="8"
+                                                 Height="8"
+                                                 Fill="#90A4AE" />
+
+                                        <Border Canvas.Left="{Binding LabelX}"
+                                                Canvas.Top="{Binding LabelY}"
+                                                IsVisible="{Binding HasLabel}"
+                                                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                BorderThickness="1"
+                                                CornerRadius="3"
+                                                Padding="4,1">
+                                            <TextBlock Text="{Binding Label}"
+                                                       FontSize="10"
+                                                       MaxWidth="140"
+                                                       TextTrimming="CharacterEllipsis" />
+                                        </Border>
+                                    </Canvas>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <!-- State & Special Nodes Layer -->
+                        <ItemsControl ItemsSource="{Binding CanvasNodes}"
+                                      Width="{Binding CanvasWidth}"
+                                      Height="{Binding CanvasHeight}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <Canvas />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemContainerTheme>
+                                <ControlTheme TargetType="ContentPresenter" x:DataType="vm:AnimatorGraphCanvasNode">
+                                    <Setter Property="Canvas.Left" Value="{Binding X}" />
+                                    <Setter Property="Canvas.Top" Value="{Binding Y}" />
+                                </ControlTheme>
+                            </ItemsControl.ItemContainerTheme>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:AnimatorGraphCanvasNode" x:CompileBindings="True">
+                                    <Button Width="{Binding Width}"
+                                            Height="{Binding Height}"
+                                            Padding="0"
+                                            Opacity="{Binding NodeOpacity}"
+                                            Background="Transparent"
+                                            BorderThickness="0"
+                                            Command="{Binding SelectCommand}">
+                                        <Grid>
+                                            <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                                    BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="6"
+                                                    ClipToBounds="True">
+                                                <Grid ColumnDefinitions="6,*">
+                                                    <Border Grid.Column="0" Background="#EF6C00" IsVisible="{Binding IsDefault}" />
+                                                    <Border Grid.Column="0" Background="#8E24AA" IsVisible="{Binding IsOverridden}" />
+                                                    <Border Grid.Column="0" Background="#2E7D32" IsVisible="{Binding IsEntry}" />
+                                                    <Border Grid.Column="0" Background="#00838F" IsVisible="{Binding IsAnyState}" />
+
+                                                    <StackPanel Grid.Column="1" Margin="8,6" Spacing="2" VerticalAlignment="Center">
+                                                        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="4">
+                                                            <TextBlock Grid.Column="0"
+                                                                       Text="{Binding Title}"
+                                                                       FontWeight="SemiBold"
+                                                                       FontSize="12"
+                                                                       TextTrimming="CharacterEllipsis" />
+                                                            <Border Grid.Column="1"
+                                                                    IsVisible="{Binding HasBadge}"
+                                                                    Background="{DynamicResource SystemControlBackgroundBaseLowBrush}"
+                                                                    CornerRadius="3"
+                                                                    Padding="4,1">
+                                                                <TextBlock Text="{Binding BadgeText}"
+                                                                           FontSize="9"
+                                                                           FontWeight="Bold" />
+                                                            </Border>
+                                                        </Grid>
+                                                        <TextBlock Text="{Binding Subtitle}"
+                                                                   FontSize="10"
+                                                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                                   TextTrimming="CharacterEllipsis" />
+                                                    </StackPanel>
+                                                </Grid>
+                                            </Border>
+
+                                            <!-- Selection Ring -->
+                                            <Border IsVisible="{Binding IsSelected}"
+                                                    CornerRadius="6"
+                                                    BorderBrush="#29B6F6"
+                                                    BorderThickness="2"
+                                                    IsHitTestVisible="False" />
+                                        </Grid>
+                                    </Button>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Canvas>
+                </ScrollViewer>
+            </Border>
+
+            <!-- Right Pane: Selected State Inspector -->
+            <Border Grid.Column="2"
+                    BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                    BorderThickness="1"
+                    CornerRadius="6"
+                    Padding="10">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Spacing="10">
+                        <TextBlock Text="State Inspector" FontWeight="Bold" FontSize="13" />
+
+                        <TextBlock Text="Select a state from the list or canvas to inspect its motion, blend tree, and transitions."
+                                   IsVisible="{Binding !HasSelectedState}"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                   TextWrapping="Wrap" />
+
+                        <StackPanel Spacing="10" IsVisible="{Binding HasSelectedState}">
+                            <!-- Core Properties -->
+                            <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                    CornerRadius="5"
+                                    Padding="8">
+                                <StackPanel Spacing="4">
+                                    <TextBlock Text="{Binding SelectedState.Name}"
+                                               FontWeight="Bold"
+                                               FontSize="14"
+                                               TextWrapping="Wrap" />
+                                    <TextBlock Text="{Binding SelectedState.FullPath}"
+                                               FontSize="10"
+                                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                               TextWrapping="Wrap" />
+                                    <TextBlock Text="{Binding SelectedState.Tag, StringFormat='Tag: {0}'}"
+                                               IsVisible="{Binding HasSelectedStateTag}"
+                                               FontSize="11" />
+                                    <Grid ColumnDefinitions="Auto,*,Auto,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="8" RowSpacing="3" Margin="0,4,0,0">
+                                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Motion:" FontSize="11" FontWeight="SemiBold" />
+                                        <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding SelectedState.MotionKind}" FontSize="11" />
+                                        <TextBlock Grid.Row="0" Grid.Column="2" Text="Speed:" FontSize="11" FontWeight="SemiBold" />
+                                        <TextBlock Grid.Row="0" Grid.Column="3" Text="{Binding SelectedState.SpeedDisplay}" FontSize="11" />
+
+                                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Loop:" FontSize="11" FontWeight="SemiBold" />
+                                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding SelectedState.Loop}" FontSize="11" />
+                                        <TextBlock Grid.Row="1" Grid.Column="2" Text="Mirror:" FontSize="11" FontWeight="SemiBold" />
+                                        <TextBlock Grid.Row="1" Grid.Column="3" Text="{Binding SelectedState.Mirror}" FontSize="11" />
+
+                                        <TextBlock Grid.Row="2" Grid.Column="0" Text="IK Feet:" FontSize="11" FontWeight="SemiBold" />
+                                        <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding SelectedState.IKOnFeet}" FontSize="11" />
+                                        <TextBlock Grid.Row="2" Grid.Column="2" Text="WriteDef:" FontSize="11" FontWeight="SemiBold" />
+                                        <TextBlock Grid.Row="2" Grid.Column="3" Text="{Binding SelectedState.WriteDefaultValues}" FontSize="11" />
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Referenced Clips with Jump-to-Clip Buttons -->
+                            <StackPanel Spacing="4" IsVisible="{Binding HasSelectedStateClips}">
+                                <TextBlock Text="Referenced AnimationClips" FontWeight="SemiBold" FontSize="12" />
+                                <ItemsControl ItemsSource="{Binding SelectedState.Clips}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="svc:AnimatorGraphClipRef" x:CompileBindings="True">
+                                            <Border BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="4"
+                                                    Padding="6,4"
+                                                    Margin="0,2">
+                                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                                                    <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                                        <TextBlock Text="{Binding DisplayLabel}"
+                                                                   FontSize="11"
+                                                                   FontWeight="Medium"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   ToolTip.Tip="{Binding DisplayLabel}" />
+                                                        <TextBlock Text="{Binding PathId, StringFormat='PathID: {0}'}"
+                                                                   FontSize="10"
+                                                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                                                    </StackPanel>
+                                                    <Button Grid.Column="1"
+                                                            Content="Jump to Clip"
+                                                            FontSize="11"
+                                                            Padding="8,3"
+                                                            Command="{Binding $parent[Window].((vm:AnimatorGraphViewModel)DataContext).JumpToClipCommand}"
+                                                            CommandParameter="{Binding .}" />
+                                                </Grid>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </StackPanel>
+
+                            <!-- BlendTree Breakdown -->
+                            <StackPanel Spacing="4" IsVisible="{Binding HasSelectedStateBlendTree}">
+                                <TextBlock Text="BlendTree Structure" FontWeight="SemiBold" FontSize="12" />
+                                <Border Background="{DynamicResource SystemControlBackgroundBaseLowBrush}"
+                                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="4"
+                                        Padding="8,6">
+                                    <TextBlock Text="{Binding SelectedStateBlendTreeSummary}"
+                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                               FontSize="11"
+                                               TextWrapping="Wrap" />
+                                </Border>
+                            </StackPanel>
+
+                            <!-- Outgoing Transitions -->
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Outgoing Transitions" FontWeight="SemiBold" FontSize="12" />
+                                <ItemsControl ItemsSource="{Binding SelectedStateOutgoingTransitions}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="svc:AnimatorGraphTransition" x:CompileBindings="True">
+                                            <Border BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="4"
+                                                    Padding="6,4"
+                                                    Margin="0,2">
+                                                <StackPanel Spacing="2">
+                                                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                                                        <TextBlock Grid.Column="0"
+                                                                   Text="{Binding DestinationStateName, StringFormat='-> {0}'}"
+                                                                   FontWeight="SemiBold"
+                                                                   FontSize="11"
+                                                                   VerticalAlignment="Center"
+                                                                   TextTrimming="CharacterEllipsis" />
+                                                        <Button Grid.Column="1"
+                                                                Content="Focus"
+                                                                FontSize="10"
+                                                                Padding="6,2"
+                                                                IsVisible="{Binding CanNavigateToDestination}"
+                                                                Command="{Binding $parent[Window].((vm:AnimatorGraphViewModel)DataContext).SelectStateByIndexCommand}"
+                                                                CommandParameter="{Binding DestinationStateIndex}" />
+                                                    </Grid>
+                                                    <TextBlock Text="{Binding SummaryLabel}"
+                                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                               FontSize="10"
+                                                               TextWrapping="Wrap" />
+                                                    <TextBlock Text="{Binding TimingSummary}"
+                                                               FontSize="10"
+                                                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                                                </StackPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </StackPanel>
+
+                            <!-- Incoming Transitions -->
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Incoming Transitions" FontWeight="SemiBold" FontSize="12" />
+                                <ItemsControl ItemsSource="{Binding SelectedStateIncomingTransitions}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="svc:AnimatorGraphTransition" x:CompileBindings="True">
+                                            <Border BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="4"
+                                                    Padding="6,4"
+                                                    Margin="0,2">
+                                                <StackPanel Spacing="2">
+                                                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                                                        <TextBlock Grid.Column="0"
+                                                                   Text="{Binding SourceStateName, StringFormat='&lt;- {0}'}"
+                                                                   FontWeight="SemiBold"
+                                                                   FontSize="11"
+                                                                   VerticalAlignment="Center"
+                                                                   TextTrimming="CharacterEllipsis" />
+                                                        <Button Grid.Column="1"
+                                                                Content="Focus"
+                                                                FontSize="10"
+                                                                Padding="6,2"
+                                                                IsVisible="{Binding CanNavigateToSource}"
+                                                                Command="{Binding $parent[Window].((vm:AnimatorGraphViewModel)DataContext).SelectStateByIndexCommand}"
+                                                                CommandParameter="{Binding SourceStateIndex}" />
+                                                    </Grid>
+                                                    <TextBlock Text="{Binding SummaryLabel}"
+                                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                               FontSize="10"
+                                                               TextWrapping="Wrap" />
+                                                </StackPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </StackPanel>
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <!-- Footer Status Bar -->
+        <TextBlock Grid.Row="3"
+                   Text="{Binding StatusText}"
+                   FontSize="11"
+                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                   TextTrimming="CharacterEllipsis" />
+    </Grid>
+</Window>

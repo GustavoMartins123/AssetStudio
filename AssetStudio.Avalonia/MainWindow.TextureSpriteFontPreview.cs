@@ -18,6 +18,9 @@ public partial class MainWindow
     private void PreviewTexture2D(AssetItem assetItem, Texture2D m_Texture2D)
     {
         currentPreviewTexture = m_Texture2D;
+        currentPreviewTextureMipLevel = 0;
+        var mipChain = TextureMipmapService.ComputeMipChain(m_Texture2D);
+        TextureMipmap.Show(m_Texture2D, mipChain);
         PreviewSession.ActivateSurface(PreviewSurfaceKind.Texture, assetItem, isLoading: true);
         UpdateImagePreview();
     }
@@ -437,6 +440,7 @@ public partial class MainWindow
     private void UpdateImagePreview(bool forceCpu = false)
     {
         var previewTexture = currentPreviewTexture;
+        var previewTextureMipLevel = currentPreviewTextureMipLevel;
         var previewSprite = currentPreviewSprite;
         var previewTextureArray = currentPreviewTextureArray;
         var previewTextureArraySlice = currentPreviewTextureArraySlice;
@@ -464,25 +468,20 @@ public partial class MainWindow
 
                     if (previewTexture != null)
                     {
-                        int width = previewTexture.m_Width;
-                        int height = previewTexture.m_Height;
+                        infoText = BuildTextureMipPreviewInfo(previewTexture, previewTextureMipLevel);
 
-                        infoText = $"Width: {width}\nHeight: {height}\nFormat: {previewTexture.m_TextureFormat}";
-                        switch (previewTexture.m_TextureSettings.m_FilterMode)
+                        if (previewTextureMipLevel > 0)
                         {
-                            case 0: infoText += "\nFilter Mode: Point "; break;
-                            case 1: infoText += "\nFilter Mode: Bilinear "; break;
-                            case 2: infoText += "\nFilter Mode: Trilinear "; break;
+                            using var mipImage = DecodeTextureMipForPreview(previewTexture, previewTextureMipLevel, flip: true)
+                                ?? throw new InvalidOperationException($"Failed to decode mip level {previewTextureMipLevel} for {previewTexture.m_Name}.");
+                            token.ThrowIfCancellationRequested();
+                            preparedPayload = TextureGLPreviewControl.PrepareGpuImagePayload(mipImage, glCapabilities, token);
                         }
-                        infoText += $"\nAnisotropic level: {previewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {previewTexture.m_TextureSettings.m_MipBias}";
-                        switch (previewTexture.m_TextureSettings.m_WrapMode)
+                        else
                         {
-                            case 0: infoText += "\nWrap mode: Repeat"; break;
-                            case 1: infoText += "\nWrap mode: Clamp"; break;
+                            // Perform .resS I/O, Crunch unpack, and CPU fallback decode (e.g., ASTC) strictly off the UI/GL thread.
+                            preparedPayload = TextureGLPreviewControl.PrepareGpuTexturePayload(previewTexture, glCapabilities, token);
                         }
-
-                        // Perform .resS I/O, Crunch unpack, and CPU fallback decode (e.g., ASTC) strictly off the UI/GL thread.
-                        preparedPayload = TextureGLPreviewControl.PrepareGpuTexturePayload(previewTexture, glCapabilities, token);
                     }
                     else if (previewTextureArray != null)
                     {
@@ -595,6 +594,7 @@ public partial class MainWindow
         _ = Task.Run(() =>
         {
             TexturePreviewImageResult? cachedTextureResult = null;
+            SKBitmap? ownedMipImage = null;
             SKBitmap? ownedSpriteImage = null;
             SKBitmap? ownedTextureArrayImage = null;
             try
@@ -608,32 +608,39 @@ public partial class MainWindow
 
                 if (previewTexture != null)
                 {
-                    cachedTextureResult = LoadTexturePreviewThumbnail(previewTexture, MaxInlinePreviewTextureDimension);
-                    image = cachedTextureResult?.Image;
-                    previewFromCache = cachedTextureResult?.FromCache == true;
-                    previewDownscaled = cachedTextureResult?.Downscaled == true;
-                    if (image != null)
+                    if (previewTextureMipLevel > 0)
                     {
-                        infoText = $"Width: {previewTexture.m_Width}\nHeight: {previewTexture.m_Height}\nFormat: {previewTexture.m_TextureFormat}";
-                        switch (previewTexture.m_TextureSettings.m_FilterMode)
+                        ownedMipImage = DecodeTextureMipForPreview(previewTexture, previewTextureMipLevel, flip: true);
+                        if (ownedMipImage != null)
                         {
-                            case 0: infoText += "\nFilter Mode: Point "; break;
-                            case 1: infoText += "\nFilter Mode: Bilinear "; break;
-                            case 2: infoText += "\nFilter Mode: Trilinear "; break;
+                            SKBitmap mipBitmap = ownedMipImage;
+                            previewDownscaled = LimitInlinePreviewImage(ref mipBitmap);
+                            ownedMipImage = mipBitmap;
+                            image = mipBitmap;
+                            infoText = BuildTextureMipPreviewInfo(previewTexture, previewTextureMipLevel);
+                            if (previewDownscaled)
+                            {
+                                infoText += $"\nPreview texture downscaled to {image.Width}x{image.Height}";
+                            }
                         }
-                        infoText += $"\nAnisotropic level: {previewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {previewTexture.m_TextureSettings.m_MipBias}";
-                        switch (previewTexture.m_TextureSettings.m_WrapMode)
+                    }
+                    else
+                    {
+                        cachedTextureResult = LoadTexturePreviewThumbnail(previewTexture, MaxInlinePreviewTextureDimension);
+                        image = cachedTextureResult?.Image;
+                        previewFromCache = cachedTextureResult?.FromCache == true;
+                        previewDownscaled = cachedTextureResult?.Downscaled == true;
+                        if (image != null)
                         {
-                            case 0: infoText += "\nWrap mode: Repeat"; break;
-                            case 1: infoText += "\nWrap mode: Clamp"; break;
-                        }
-                        if (previewDownscaled)
-                        {
-                            infoText += $"\nPreview texture downscaled to {image.Width}x{image.Height}";
-                        }
-                        if (previewFromCache)
-                        {
-                            infoText += "\nPreview texture loaded from cache";
+                            infoText = BuildTextureMipPreviewInfo(previewTexture, 0);
+                            if (previewDownscaled)
+                            {
+                                infoText += $"\nPreview texture downscaled to {image.Width}x{image.Height}";
+                            }
+                            if (previewFromCache)
+                            {
+                                infoText += "\nPreview texture loaded from cache";
+                            }
                         }
                     }
                 }
@@ -792,6 +799,7 @@ public partial class MainWindow
             finally
             {
                 cachedTextureResult?.Dispose();
+                ownedMipImage?.Dispose();
                 ownedSpriteImage?.Dispose();
                 ownedTextureArrayImage?.Dispose();
             }

@@ -41,6 +41,10 @@ public sealed class UnityProjectExportOptions
     public bool ExportMonoBehaviours { get; init; } = true;
     public bool ExportTerrains { get; init; } = true;
     public bool ExportColliders { get; init; } = true;
+    public bool ExportColliderAuxiliaryMeshes { get; init; } = false;
+    public int? TargetLodLevel { get; init; } = null;
+    public bool AlsoBuildUnityPackage { get; init; } = false;
+    public string? UnityPackageOutputPath { get; init; } = null;
     public bool WriteManifest { get; init; } = true;
 
     public int MaxTerrainGridResolution { get; init; } = TerrainMeshConverter.DefaultMaxGridResolution;
@@ -99,6 +103,9 @@ public sealed class UnityProjectExportStatistics
     public int UniqueMeshes { get; init; }
     public int UniqueMaterials { get; init; }
     public int UniqueTextures { get; init; }
+    public int ColliderMeshesExported { get; init; }
+    public int LodGroupsFiltered { get; init; }
+    public int RenderersSkippedByLodFilter { get; init; }
 }
 
 public sealed class UnityProjectExportManifest
@@ -110,6 +117,8 @@ public sealed class UnityProjectExportManifest
     public long ElapsedMs { get; init; }
     public string OutputDirectory { get; init; } = string.Empty;
     public string SceneFilePath { get; init; } = string.Empty;
+    public string? PrefabFilePath { get; init; }
+    public string? UnityPackagePath { get; init; }
     public List<string> AdditionalScenes { get; init; } = new();
     public UnityProjectExportStatistics Statistics { get; init; } = new();
     public SortedDictionary<int, string> LayersUsed { get; init; } = new();
@@ -126,6 +135,8 @@ public sealed class UnityProjectExportResult
     public bool Success { get; init; }
     public string OutputDirectory { get; init; } = string.Empty;
     public string SceneFilePath { get; init; } = string.Empty;
+    public string? PrefabFilePath { get; init; }
+    public string? UnityPackagePath { get; init; }
     public string? ManifestPath { get; init; }
     public UnityProjectExportManifest? Manifest { get; init; }
     public string SceneName { get; init; } = string.Empty;
@@ -271,7 +282,7 @@ public sealed class UnityProjectExporterService
     }
 
     // =========================================================================
-    // Main Export Entrypoint
+    // Main Export Entrypoints (Scene & Standalone Prefab)
     // =========================================================================
 
     public UnityProjectExportResult ExportSceneToUnityProject(
@@ -303,10 +314,74 @@ public sealed class UnityProjectExporterService
             };
         }
 
+        var safeSceneName = SanitizeFileName(options.SceneName, "Scene");
+        return ExportUnityProjectCore(
+            rootGameObjects,
+            options,
+            isPrefabExport: false,
+            safePrimaryName: safeSceneName,
+            prefabRoot: null,
+            progressCallback,
+            cancellationToken);
+    }
+
+    public UnityProjectExportResult ExportPrefabToUnityProject(
+        GameObject prefabRoot,
+        UnityProjectExportOptions options,
+        Action<int, int, string>? progressCallback = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        var rawPrefabName = (!string.IsNullOrWhiteSpace(options.SceneName)
+            && !string.Equals(options.SceneName, "Scene", StringComparison.Ordinal))
+            ? options.SceneName
+            : (!string.IsNullOrWhiteSpace(prefabRoot?.m_Name) ? prefabRoot.m_Name : "Prefab");
+        var safePrefabName = SanitizeFileName(rawPrefabName, "Prefab");
+
+        if (string.IsNullOrWhiteSpace(options.OutputDirectory))
+        {
+            return new UnityProjectExportResult
+            {
+                Success = false,
+                SceneName = safePrefabName,
+                ErrorMessage = "Output directory must not be empty."
+            };
+        }
+
+        if (prefabRoot == null)
+        {
+            return new UnityProjectExportResult
+            {
+                Success = false,
+                OutputDirectory = options.OutputDirectory,
+                SceneName = safePrefabName,
+                ErrorMessage = "Prefab root GameObject must not be null."
+            };
+        }
+
+        return ExportUnityProjectCore(
+            new[] { prefabRoot },
+            options,
+            isPrefabExport: true,
+            safePrimaryName: safePrefabName,
+            prefabRoot: prefabRoot,
+            progressCallback,
+            cancellationToken);
+    }
+
+    private UnityProjectExportResult ExportUnityProjectCore(
+        IReadOnlyList<GameObject> rootGameObjects,
+        UnityProjectExportOptions options,
+        bool isPrefabExport,
+        string safePrimaryName,
+        GameObject? prefabRoot,
+        Action<int, int, string>? progressCallback,
+        CancellationToken cancellationToken)
+    {
         var sw = Stopwatch.StartNew();
         var rootDirFull = Path.GetFullPath(options.OutputDirectory);
         var rootDirWithSep = rootDirFull.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var safeSceneName = SanitizeFileName(options.SceneName, "Scene");
 
         try
         {
@@ -315,16 +390,24 @@ public sealed class UnityProjectExporterService
 
             var projectSettingsDir = EnsureConfinedDirectory(rootDirWithSep, Path.Combine(rootDirFull, "ProjectSettings"));
             var assetsDir = EnsureConfinedDirectory(rootDirWithSep, Path.Combine(rootDirFull, "Assets"));
-            var scenesDir = EnsureConfinedDirectory(rootDirWithSep, Path.Combine(assetsDir, "Scenes"));
+            var primaryContainerFolderName = isPrefabExport ? "Prefabs" : "Scenes";
+            var primaryContainerDir = EnsureConfinedDirectory(rootDirWithSep, Path.Combine(assetsDir, primaryContainerFolderName));
             var materialsDir = EnsureConfinedDirectory(rootDirWithSep, Path.Combine(assetsDir, "Materials"));
             var meshesDir = EnsureConfinedDirectory(rootDirWithSep, Path.Combine(assetsDir, "Meshes"));
             var texturesDir = EnsureConfinedDirectory(rootDirWithSep, Path.Combine(assetsDir, "Textures"));
 
-            var state = new ExportState(rootDirWithSep, options);
+            var state = new ExportState(rootDirWithSep, options, prefabRoot);
             var unityVersion = DetectUnityVersion(rootGameObjects, options.UnityVersion);
 
-            // Pass 1: Traverse scene graph iteratively, assign deterministic positive fileIDs, and index all unique assets.
-            progressCallback?.Invoke(5, 100, $"Indexing scene '{safeSceneName}' hierarchy...");
+            // Pass 0: Optional LODGroup filtering pre-pass so excluded non-target LOD renderers are skipped cleanly.
+            if (options.TargetLodLevel.HasValue)
+            {
+                progressCallback?.Invoke(3, 100, $"Inspecting LODGroups for LOD{Math.Max(0, options.TargetLodLevel.Value)} filtering...");
+                CollectLodGroupFilteringState(rootGameObjects, state, cancellationToken);
+            }
+
+            // Pass 1: Traverse hierarchy iteratively, assign deterministic positive fileIDs, and index all unique assets.
+            progressCallback?.Invoke(8, 100, $"Indexing {(isPrefabExport ? "prefab" : "scene")} '{safePrimaryName}' hierarchy...");
             CollectSceneGraph(rootGameObjects, state, cancellationToken);
 
             if (state.SceneNodes.Count == 0)
@@ -333,8 +416,8 @@ public sealed class UnityProjectExporterService
                 {
                     Success = false,
                     OutputDirectory = rootDirFull,
-                    SceneName = safeSceneName,
-                    ErrorMessage = $"No GameObjects remained after filtering '{safeSceneName}'."
+                    SceneName = safePrimaryName,
+                    ErrorMessage = $"No GameObjects remained after filtering '{safePrimaryName}'."
                 };
             }
 
@@ -342,7 +425,7 @@ public sealed class UnityProjectExporterService
             progressCallback?.Invoke(15, 100, "Writing ProjectSettings and folder metadata...");
             WriteProjectVersionTxt(rootDirWithSep, Path.Combine(projectSettingsDir, "ProjectVersion.txt"), unityVersion);
             WriteTagManagerAsset(rootDirWithSep, Path.Combine(projectSettingsDir, "TagManager.asset"), state);
-            WriteFolderMeta(rootDirWithSep, Path.Combine(assetsDir, "Scenes.meta"), "Scenes");
+            WriteFolderMeta(rootDirWithSep, Path.Combine(assetsDir, primaryContainerFolderName + ".meta"), primaryContainerFolderName);
             WriteFolderMeta(rootDirWithSep, Path.Combine(assetsDir, "Materials.meta"), "Materials");
             WriteFolderMeta(rootDirWithSep, Path.Combine(assetsDir, "Meshes.meta"), "Meshes");
             WriteFolderMeta(rootDirWithSep, Path.Combine(assetsDir, "Textures.meta"), "Textures");
@@ -364,30 +447,51 @@ public sealed class UnityProjectExporterService
             // Pass 2d: Export unique Terrains (mesh .obj + baked splatmap .png + terrain .mat).
             if (options.ExportTerrains && state.TerrainAssets.Count > 0)
             {
-                progressCallback?.Invoke(60, 100, $"Exporting {state.TerrainAssets.Count:N0} terrain(s)...");
+                progressCallback?.Invoke(58, 100, $"Exporting {state.TerrainAssets.Count:N0} terrain(s)...");
                 ExportTerrains(state, meshesDir, texturesDir, materialsDir, cancellationToken);
             }
 
             // Pass 2e: Export unique Materials (.mat + .mat.meta).
             if (options.ExportMaterials && state.MaterialsToExport.Count > 0)
             {
-                progressCallback?.Invoke(70, 100, $"Exporting {state.MaterialsToExport.Count:N0} material(s)...");
+                progressCallback?.Invoke(68, 100, $"Exporting {state.MaterialsToExport.Count:N0} material(s)...");
                 ExportMaterials(state, materialsDir, cancellationToken);
             }
 
-            // Pass 2f: Stream Unity YAML 1.1 Scene (.unity + .unity.meta).
-            progressCallback?.Invoke(82, 100, $"Streaming {safeSceneName}.unity...");
-            var sceneFilePath = EnsureConfinedPath(rootDirWithSep, Path.Combine(scenesDir, safeSceneName + ".unity"));
-            WriteUnitySceneFile(sceneFilePath, state, cancellationToken);
-            WriteSceneMetaFile(
-                EnsureConfinedPath(rootDirWithSep, sceneFilePath + ".meta"),
-                ComputeUnityAssetGuid("scene", options.ScenePath, 0, safeSceneName));
+            // Pass 2e2: Optional Collider Auxiliary Meshes (Assets/Colliders/*.obj + .obj.meta).
+            if (options.ExportColliders && options.ExportColliderAuxiliaryMeshes && state.ColliderAuxiliaryTargets.Count > 0)
+            {
+                progressCallback?.Invoke(75, 100, $"Exporting {state.ColliderAuxiliaryTargets.Count:N0} auxiliary collider mesh(es)...");
+                ExportColliderAuxiliaryMeshes(state, assetsDir, cancellationToken);
+            }
+
+            // Pass 2f: Stream Unity YAML 1.1 Scene (.unity) or Standalone Prefab (.prefab) + .meta.
+            string sceneFilePath = string.Empty;
+            string? prefabFilePath = null;
+            if (isPrefabExport)
+            {
+                progressCallback?.Invoke(82, 100, $"Streaming {safePrimaryName}.prefab...");
+                prefabFilePath = EnsureConfinedPath(rootDirWithSep, Path.Combine(primaryContainerDir, safePrimaryName + ".prefab"));
+                WriteUnityPrefabFile(prefabFilePath, state, cancellationToken);
+                WritePrefabMetaFile(
+                    EnsureConfinedPath(rootDirWithSep, prefabFilePath + ".meta"),
+                    ComputeUnityAssetGuid("prefab", prefabRoot?.assetsFile?.fileName, prefabRoot?.m_PathID ?? 0, safePrimaryName));
+            }
+            else
+            {
+                progressCallback?.Invoke(82, 100, $"Streaming {safePrimaryName}.unity...");
+                sceneFilePath = EnsureConfinedPath(rootDirWithSep, Path.Combine(primaryContainerDir, safePrimaryName + ".unity"));
+                WriteUnitySceneFile(sceneFilePath, state, cancellationToken);
+                WriteSceneMetaFile(
+                    EnsureConfinedPath(rootDirWithSep, sceneFilePath + ".meta"),
+                    ComputeUnityAssetGuid("scene", options.ScenePath, 0, safePrimaryName));
+            }
 
             // Pass 2g: Optional managed C# scripts callback (Block 1 integration hook).
             UnityProjectScriptExportSummary? scriptSummary = null;
             if (options.IncludeScriptsCallback != null)
             {
-                progressCallback?.Invoke(92, 100, "Exporting managed C# scripts...");
+                progressCallback?.Invoke(88, 100, "Exporting managed C# scripts...");
                 var scriptsDir = EnsureConfinedDirectory(rootDirWithSep, Path.Combine(assetsDir, "Scripts"));
                 scriptSummary = options.IncludeScriptsCallback(scriptsDir, cancellationToken);
                 var scriptsMetaPath = EnsureConfinedPath(rootDirWithSep, Path.Combine(assetsDir, "Scripts.meta"));
@@ -397,41 +501,85 @@ public sealed class UnityProjectExporterService
                 }
             }
 
+            // Pass 2h: Optional unified .unitypackage packing (SCENE-13).
+            string? unityPackagePath = null;
+            if (options.AlsoBuildUnityPackage)
+            {
+                progressCallback?.Invoke(93, 100, "Packing .unitypackage archive...");
+                var targetPackagePath = !string.IsNullOrWhiteSpace(options.UnityPackageOutputPath)
+                    ? Path.GetFullPath(options.UnityPackageOutputPath)
+                    : rootDirFull.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + ".unitypackage";
+
+                var packageExporter = new UnityPackageExporterService();
+                var pkgResult = packageExporter.ExportFromUnityProjectDirectory(
+                    new UnityPackageExportOptions
+                    {
+                        SourceProjectOrAssetsDirectory = rootDirFull,
+                        OutputPackagePath = targetPackagePath,
+                        IncludeScripts = true,
+                        OverwriteExisting = true
+                    },
+                    ct: cancellationToken);
+
+                if (!pkgResult.Success)
+                {
+                    return new UnityProjectExportResult
+                    {
+                        Success = false,
+                        OutputDirectory = rootDirFull,
+                        SceneFilePath = sceneFilePath,
+                        PrefabFilePath = prefabFilePath,
+                        SceneName = safePrimaryName,
+                        ErrorMessage = $"Unity project exported, but .unitypackage packing failed: {pkgResult.ErrorMessage}"
+                    };
+                }
+
+                unityPackagePath = pkgResult.OutputPackagePath;
+            }
+
             sw.Stop();
 
-            // Pass 2h: Write ExportManifest.json (SCENE-11 report).
+            // Pass 2i: Write ExportManifest.json (SCENE-11 report).
             UnityProjectExportManifest? manifest = null;
             string? manifestPath = null;
             if (options.WriteManifest)
             {
-                progressCallback?.Invoke(96, 100, "Writing ExportManifest.json...");
+                progressCallback?.Invoke(97, 100, "Writing ExportManifest.json...");
                 manifest = BuildManifest(
                     options,
-                    safeSceneName,
+                    safePrimaryName,
                     unityVersion,
                     sw.ElapsedMilliseconds,
                     rootDirFull,
                     sceneFilePath,
+                    prefabFilePath,
+                    unityPackagePath,
                     state,
                     scriptSummary);
                 manifestPath = EnsureConfinedPath(rootDirWithSep, Path.Combine(rootDirFull, "ExportManifest.json"));
                 File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, ManifestJsonOptions), Utf8NoBom);
             }
 
-            progressCallback?.Invoke(100, 100, "Unity project export complete.");
+            progressCallback?.Invoke(100, 100, isPrefabExport ? "Unity prefab export complete." : "Unity project export complete.");
             var stats = manifest?.Statistics ?? BuildStatistics(state);
+            var exportKindLabel = isPrefabExport ? "Unity prefab" : "Unity project";
+            var destinationLabel = !string.IsNullOrEmpty(unityPackagePath)
+                ? $"{rootDirFull} (package: {unityPackagePath})"
+                : rootDirFull;
             var summary = string.Create(
                 CultureInfo.InvariantCulture,
-                $"Exported Unity project '{safeSceneName}' ({sw.ElapsedMilliseconds:N0} ms): {stats.GameObjects:N0} GameObjects ({stats.InactiveGameObjects:N0} inactive), {stats.UniqueMeshes:N0} meshes, {stats.UniqueMaterials:N0} materials, {stats.UniqueTextures:N0} textures, {stats.Terrains:N0} terrains, {stats.MonoBehaviours:N0} scripts -> {rootDirFull}");
+                $"Exported {exportKindLabel} '{safePrimaryName}' ({sw.ElapsedMilliseconds:N0} ms): {stats.GameObjects:N0} GameObjects ({stats.InactiveGameObjects:N0} inactive), {stats.UniqueMeshes:N0} meshes, {stats.UniqueMaterials:N0} materials, {stats.UniqueTextures:N0} textures, {stats.Terrains:N0} terrains, {stats.MonoBehaviours:N0} scripts -> {destinationLabel}");
 
             return new UnityProjectExportResult
             {
                 Success = true,
                 OutputDirectory = rootDirFull,
                 SceneFilePath = sceneFilePath,
+                PrefabFilePath = prefabFilePath,
+                UnityPackagePath = unityPackagePath,
                 ManifestPath = manifestPath,
                 Manifest = manifest,
-                SceneName = safeSceneName,
+                SceneName = safePrimaryName,
                 SummaryMessage = summary
             };
         }
@@ -445,7 +593,7 @@ public sealed class UnityProjectExporterService
             {
                 Success = false,
                 OutputDirectory = rootDirFull,
-                SceneName = safeSceneName,
+                SceneName = safePrimaryName,
                 ErrorMessage = ex.Message
             };
         }
@@ -543,16 +691,27 @@ public sealed class UnityProjectExporterService
         public int Count { get; set; }
     }
 
+    private sealed class ColliderAuxiliaryTarget
+    {
+        public required string OwnerGameObjectName { get; init; }
+        public required AssetStudio.Object ColliderObject { get; init; }
+        public Mesh? ResolvedMesh { get; init; }
+    }
+
     private sealed class ExportState
     {
         private long _nextFileId = 1000;
 
         public string RootDirWithSep { get; }
         public UnityProjectExportOptions Options { get; }
+        public GameObject? PrefabRootObject { get; }
 
         public List<SceneNodeRecord> SceneNodes { get; } = new();
         public Dictionary<AssetStudio.Object, long> LocalFileIdByObject { get; } = new(ReferenceEqualityComparer.Instance);
         public Dictionary<(string FileName, long PathId), long> LocalFileIdByKey { get; } = new();
+
+        public HashSet<Renderer> ExcludedLodRenderers { get; } = new(ReferenceEqualityComparer.Instance);
+        public HashSet<(string FileName, long PathId)> ExcludedLodRendererIds { get; } = new();
 
         public Dictionary<(string FileName, long PathId), ExportedMeshAsset> MeshesByKey { get; } = new();
         public Dictionary<Mesh, ExportedMeshAsset> MeshesByRef { get; } = new(ReferenceEqualityComparer.Instance);
@@ -569,9 +728,12 @@ public sealed class UnityProjectExporterService
         public Dictionary<(string FileName, long PathId), ExportedTerrainAsset> TerrainsByKey { get; } = new();
         public List<ExportedTerrainAsset> TerrainAssets { get; } = new();
 
+        public List<ColliderAuxiliaryTarget> ColliderAuxiliaryTargets { get; } = new();
+
         public HashSet<string> UsedMeshFileNames { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> UsedMaterialFileNames { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> UsedTextureFileNames { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> UsedColliderFileNames { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public SortedSet<int> UsedLayers { get; } = new();
         public SortedSet<string> UsedCustomTags { get; } = new(StringComparer.Ordinal);
@@ -593,11 +755,15 @@ public sealed class UnityProjectExporterService
         public int ColliderCount;
         public int TerrainCount;
         public int MonoBehaviourCount;
+        public int ColliderMeshesExported;
+        public int LodGroupsFiltered;
+        public int RenderersSkippedByLodFilter;
 
-        public ExportState(string rootDirWithSep, UnityProjectExportOptions options)
+        public ExportState(string rootDirWithSep, UnityProjectExportOptions options, GameObject? prefabRootObject = null)
         {
             RootDirWithSep = rootDirWithSep;
             Options = options;
+            PrefabRootObject = prefabRootObject;
         }
 
         public long AllocateFileId() => _nextFileId++;
@@ -656,6 +822,369 @@ public sealed class UnityProjectExporterService
                 suffix++;
             }
         }
+    }
+
+    // =========================================================================
+    // Pass 0: LODGroup Inspection & Target LOD Filtering (MESH-11)
+    // =========================================================================
+
+    private static void CollectLodGroupFilteringState(
+        IReadOnlyList<GameObject> rootGameObjects,
+        ExportState state,
+        CancellationToken cancellationToken)
+    {
+        if (!state.Options.TargetLodLevel.HasValue)
+        {
+            return;
+        }
+
+        int requestedLod = Math.Max(0, state.Options.TargetLodLevel.Value);
+        var visited = new HashSet<GameObject>(ReferenceEqualityComparer.Instance);
+        var stack = new Stack<GameObject>();
+        var keptRenderers = new HashSet<Renderer>(ReferenceEqualityComparer.Instance);
+        var keptRendererIds = new HashSet<(string FileName, long PathId)>();
+        var perGroupCandidates = new List<(List<Renderer> Renderers, List<(string FileName, long PathId)> Keys)>();
+
+        for (int i = rootGameObjects.Count - 1; i >= 0; i--)
+        {
+            if (rootGameObjects[i] != null)
+            {
+                stack.Push(rootGameObjects[i]);
+            }
+        }
+
+        while (stack.Count > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var go = stack.Pop();
+            if (go == null || !visited.Add(go))
+            {
+                continue;
+            }
+
+            if (!state.Options.IncludeInactive && !go.m_IsActive)
+            {
+                continue;
+            }
+
+            SceneGlbExportService.EnsureGameObjectComponentsLinked(go);
+
+            if (go.m_Components != null)
+            {
+                for (int c = 0; c < go.m_Components.Length; c++)
+                {
+                    var compPtr = go.m_Components[c];
+                    if (compPtr == null || compPtr.IsNull)
+                    {
+                        continue;
+                    }
+
+                    var compObj = ResolveComponentObject(go, compPtr);
+                    if (compObj == null || (compObj is not LODGroup && compObj.type != ClassIDType.LODGroup))
+                    {
+                        continue;
+                    }
+
+                    if (compObj is LODGroup typedLod && !typedLod.m_Enabled)
+                    {
+                        continue;
+                    }
+
+                    var lods = ExtractLodLevels(compObj);
+                    if (lods.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    int selectedIndex = SelectTargetLodIndex(lods, requestedLod);
+                    if (selectedIndex < 0)
+                    {
+                        continue;
+                    }
+
+                    var groupExcludedRends = new List<Renderer>();
+                    var groupExcludedKeys = new List<(string FileName, long PathId)>();
+
+                    for (int l = 0; l < lods.Count; l++)
+                    {
+                        var lod = lods[l];
+                        if (lod?.renderers == null || lod.renderers.Length == 0)
+                        {
+                            continue;
+                        }
+
+                        bool isTargetTier = l == selectedIndex;
+                        for (int r = 0; r < lod.renderers.Length; r++)
+                        {
+                            var rPtr = lod.renderers[r];
+                            if (rPtr == null || rPtr.IsNull)
+                            {
+                                continue;
+                            }
+
+                            var resolvedRend = ResolveRendererPPtr(compObj, rPtr);
+                            var key = resolvedRend != null && resolvedRend.m_PathID != 0
+                                ? (resolvedRend.assetsFile?.fileName ?? string.Empty, resolvedRend.m_PathID)
+                                : (ResolvePPtrFileName(compObj.assetsFile, rPtr.m_FileID), rPtr.m_PathID);
+
+                            if (isTargetTier)
+                            {
+                                if (resolvedRend != null) keptRenderers.Add(resolvedRend);
+                                if (key.Item2 != 0) keptRendererIds.Add(key);
+                            }
+                            else
+                            {
+                                if (resolvedRend != null)
+                                {
+                                    state.ExcludedLodRenderers.Add(resolvedRend);
+                                    groupExcludedRends.Add(resolvedRend);
+                                }
+                                if (key.Item2 != 0)
+                                {
+                                    state.ExcludedLodRendererIds.Add(key);
+                                    groupExcludedKeys.Add(key);
+                                }
+                            }
+                        }
+                    }
+
+                    if (groupExcludedRends.Count > 0 || groupExcludedKeys.Count > 0)
+                    {
+                        perGroupCandidates.Add((groupExcludedRends, groupExcludedKeys));
+                    }
+                }
+            }
+
+            var tr = go.m_Transform;
+            if (tr?.m_Children != null && tr.m_Children.Length > 0)
+            {
+                for (int i = tr.m_Children.Length - 1; i >= 0; i--)
+                {
+                    var childPtr = tr.m_Children[i];
+                    if (childPtr == null || childPtr.IsNull)
+                    {
+                        continue;
+                    }
+
+                    var childTr = ResolveTransform(tr, childPtr);
+                    if (childTr?.m_GameObject != null && !childTr.m_GameObject.IsNull)
+                    {
+                        var childGo = ResolveGameObject(childTr, childTr.m_GameObject);
+                        if (childGo != null)
+                        {
+                            stack.Push(childGo);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Renderers shared with the target LOD tier (e.g. present in both LOD0 and LOD1) are ALWAYS kept.
+        state.ExcludedLodRenderers.ExceptWith(keptRenderers);
+        state.ExcludedLodRendererIds.ExceptWith(keptRendererIds);
+
+        for (int i = 0; i < perGroupCandidates.Count; i++)
+        {
+            var (rends, keys) = perGroupCandidates[i];
+            bool anyExcluded = false;
+            for (int r = 0; r < rends.Count; r++)
+            {
+                if (state.ExcludedLodRenderers.Contains(rends[r]))
+                {
+                    anyExcluded = true;
+                    break;
+                }
+            }
+            if (!anyExcluded)
+            {
+                for (int k = 0; k < keys.Count; k++)
+                {
+                    if (state.ExcludedLodRendererIds.Contains(keys[k]))
+                    {
+                        anyExcluded = true;
+                        break;
+                    }
+                }
+            }
+
+            if (anyExcluded)
+            {
+                state.LodGroupsFiltered++;
+            }
+        }
+    }
+
+    private static int SelectTargetLodIndex(IReadOnlyList<LOD> lods, int requestedLod)
+    {
+        static bool HasRenderers(LOD? lod)
+        {
+            if (lod?.renderers == null || lod.renderers.Length == 0)
+            {
+                return false;
+            }
+            for (int i = 0; i < lod.renderers.Length; i++)
+            {
+                if (lod.renderers[i] != null && !lod.renderers[i].IsNull)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if (requestedLod >= 0 && requestedLod < lods.Count && HasRenderers(lods[requestedLod]))
+        {
+            return requestedLod;
+        }
+
+        for (int i = Math.Min(requestedLod + 1, lods.Count); i < lods.Count; i++)
+        {
+            if (HasRenderers(lods[i]))
+            {
+                return i;
+            }
+        }
+
+        for (int i = Math.Min(requestedLod - 1, lods.Count - 1); i >= 0; i--)
+        {
+            if (HasRenderers(lods[i]))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static List<LOD> ExtractLodLevels(AssetStudio.Object lodGroupObj)
+    {
+        if (lodGroupObj is LODGroup typed && typed.m_LODs is { Length: > 0 })
+        {
+            var list = new List<LOD>(typed.m_LODs.Length);
+            for (int i = 0; i < typed.m_LODs.Length; i++)
+            {
+                if (typed.m_LODs[i] != null)
+                {
+                    list.Add(typed.m_LODs[i]);
+                }
+            }
+            if (list.Count > 0)
+            {
+                return list;
+            }
+        }
+
+        // TypeTree fallback when LODGroup m_LODs wasn't populated via binary constructor.
+        if (lodGroupObj.serializedType?.m_Type?.m_Nodes is { Count: > 0 })
+        {
+            try
+            {
+                var dict = lodGroupObj.ToType(lodGroupObj.serializedType.m_Type);
+                if (dict != null && dict.Contains("m_LODs") && dict["m_LODs"] is IEnumerable lodItems && dict["m_LODs"] is not string)
+                {
+                    var result = new List<LOD>();
+                    foreach (var lodItem in lodItems)
+                    {
+                        if (lodItem is not IDictionary lodDict)
+                        {
+                            continue;
+                        }
+
+                        var lod = new LOD();
+                        if (TryReadFloat(lodDict, "screenRelativeHeight", out var screenHeight)
+                            || TryReadFloat(lodDict, "screenRelativeTransitionHeight", out screenHeight))
+                        {
+                            lod.screenRelativeHeight = screenHeight;
+                        }
+                        if (TryReadFloat(lodDict, "fadeTransitionWidth", out var fadeWidth))
+                        {
+                            lod.fadeTransitionWidth = fadeWidth;
+                        }
+
+                        var renderers = new List<PPtr<Renderer>>();
+                        if (lodDict.Contains("renderers") && lodDict["renderers"] is IEnumerable rendItems && lodDict["renderers"] is not string)
+                        {
+                            foreach (var rendItem in rendItems)
+                            {
+                                if (rendItem is not IDictionary rendDict)
+                                {
+                                    continue;
+                                }
+
+                                IDictionary pptrDict = rendDict.Contains("renderer") && rendDict["renderer"] is IDictionary inner
+                                    ? inner
+                                    : rendDict;
+                                if (pptrDict.Contains("m_FileID") && pptrDict.Contains("m_PathID")
+                                    && TryConvertInt(pptrDict["m_FileID"], out int fId)
+                                    && TryConvertLong(pptrDict["m_PathID"], out long pId)
+                                    && pId != 0)
+                                {
+                                    renderers.Add(new PPtr<Renderer>(fId, pId, lodGroupObj.assetsFile));
+                                }
+                            }
+                        }
+
+                        lod.renderers = renderers.ToArray();
+                        result.Add(lod);
+                    }
+                    return result;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return new List<LOD>();
+    }
+
+    private static Renderer? ResolveRendererPPtr(AssetStudio.Object ownerObj, PPtr<Renderer> rendPtr)
+    {
+        if (rendPtr.TryGet(out var rend) && rend != null)
+        {
+            return rend;
+        }
+
+        if (rendPtr.m_FileID == 0 && ownerObj.assetsFile != null
+            && ownerObj.assetsFile.TryGetObject(rendPtr.m_PathID, out var localObj)
+            && localObj is Renderer localRend)
+        {
+            return localRend;
+        }
+
+        foreach (var sf in SnapshotAssetsFiles(ownerObj.assetsFile?.assetsManager))
+        {
+            if (sf.TryGetObject(rendPtr.m_PathID, out var found) && found is Renderer foundRend)
+            {
+                return foundRend;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsRendererExcludedByLodFilter(Renderer renderer, ExportState state)
+    {
+        if (state.ExcludedLodRenderers.Count == 0 && state.ExcludedLodRendererIds.Count == 0)
+        {
+            return false;
+        }
+
+        if (state.ExcludedLodRenderers.Contains(renderer))
+        {
+            return true;
+        }
+
+        if (renderer.m_PathID != 0)
+        {
+            var key = (renderer.assetsFile?.fileName ?? string.Empty, renderer.m_PathID);
+            if (state.ExcludedLodRendererIds.Contains(key))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // =========================================================================
@@ -802,6 +1331,13 @@ public sealed class UnityProjectExporterService
 
             case MeshFilter mf:
             {
+                if (state.Options.TargetLodLevel.HasValue
+                    && go.m_MeshRenderer != null
+                    && IsRendererExcludedByLodFilter(go.m_MeshRenderer, state))
+                {
+                    break;
+                }
+
                 var compId = state.AllocateFileId();
                 state.RegisterLocalObject(mf, compId);
                 state.MeshFilterCount++;
@@ -833,6 +1369,12 @@ public sealed class UnityProjectExporterService
 
             case MeshRenderer mr:
             {
+                if (state.Options.TargetLodLevel.HasValue && IsRendererExcludedByLodFilter(mr, state))
+                {
+                    state.RenderersSkippedByLodFilter++;
+                    break;
+                }
+
                 var compId = state.AllocateFileId();
                 state.RegisterLocalObject(mr, compId);
                 state.MeshRendererCount++;
@@ -857,6 +1399,12 @@ public sealed class UnityProjectExporterService
 
             case SkinnedMeshRenderer smr:
             {
+                if (state.Options.TargetLodLevel.HasValue && IsRendererExcludedByLodFilter(smr, state))
+                {
+                    state.RenderersSkippedByLodFilter++;
+                    break;
+                }
+
                 var compId = state.AllocateFileId();
                 state.RegisterLocalObject(smr, compId);
                 state.SkinnedMeshRendererCount++;
@@ -1039,13 +1587,24 @@ public sealed class UnityProjectExporterService
                     ExportedMeshAsset? colliderMesh = null;
                     if (colliderKind.Value == ExportedComponentKind.MeshCollider && state.Options.ExportMeshes)
                     {
-                        var dict = ReadColliderFields(compObj, state);
-                        if (dict != null && TryExtractPPtrValues(dict, "m_Mesh", out int mFileId, out long mPathId) && mPathId != 0)
+                        if (ColliderMeshConverter.TryExtractColliderProperties(compObj, obj => ReadColliderFields(obj, state), out var colProps)
+                            && colProps.MeshPathId != 0)
                         {
-                            var meshPtr = new PPtr<Mesh>(mFileId, mPathId, compObj.assetsFile);
+                            var meshPtr = new PPtr<Mesh>(colProps.MeshFileId, colProps.MeshPathId, compObj.assetsFile);
                             if (meshPtr.TryGet(out var resolvedColMesh) && resolvedColMesh != null)
                             {
                                 colliderMesh = RegisterMeshAsset(resolvedColMesh, state);
+                            }
+                            else
+                            {
+                                foreach (var sf in SnapshotAssetsFiles(compObj.assetsFile?.assetsManager))
+                                {
+                                    if (sf.TryGetObject(colProps.MeshPathId, out var foundObj) && foundObj is Mesh foundColMesh)
+                                    {
+                                        colliderMesh = RegisterMeshAsset(foundColMesh, state);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1058,6 +1617,16 @@ public sealed class UnityProjectExporterService
                         SourceObject = compObj,
                         ResolvedMesh = colliderMesh
                     });
+
+                    if (state.Options.ExportColliderAuxiliaryMeshes)
+                    {
+                        state.ColliderAuxiliaryTargets.Add(new ColliderAuxiliaryTarget
+                        {
+                            OwnerGameObjectName = string.IsNullOrWhiteSpace(go.m_Name) ? $"GameObject_{go.m_PathID}" : go.m_Name,
+                            ColliderObject = compObj,
+                            ResolvedMesh = colliderMesh?.Mesh
+                        });
+                    }
                 }
                 break;
             }
@@ -1344,6 +1913,21 @@ public sealed class UnityProjectExporterService
         sw.WriteLine("  assetBundleVariant: ");
     }
 
+    private static void WritePrefabMetaFile(string metaPath, string guid)
+    {
+        using var fs = new FileStream(metaPath, FileMode.Create, FileAccess.Write, FileShare.None, 4096);
+        using var sw = new StreamWriter(fs, Utf8NoBom, 4096) { NewLine = "\n" };
+
+        sw.WriteLine("fileFormatVersion: 2");
+        sw.Write("guid: ");
+        sw.WriteLine(guid);
+        sw.WriteLine("PrefabImporter:");
+        sw.WriteLine("  externalObjects: {}");
+        sw.WriteLine("  userData: ");
+        sw.WriteLine("  assetBundleName: ");
+        sw.WriteLine("  assetBundleVariant: ");
+    }
+
     private static void ExportTextures(ExportState state, string texturesDir, CancellationToken cancellationToken)
     {
         for (int i = 0; i < state.TexturesToExport.Count; i++)
@@ -1468,8 +2052,21 @@ public sealed class UnityProjectExporterService
                     continue;
                 }
 
-                WriteMeshObjStreaming(objPath, asset.SafeName, asset.Mesh);
-                WriteModelImporterMetaFile(metaPath, asset.Guid, asset.SafeName);
+                var objGroupName = SanitizeObjGroupName(asset.SafeName, "Mesh");
+                int subMeshCount = asset.Mesh.m_SubMeshes?.Length ?? 0;
+                string? mtlFileName = null;
+                if (subMeshCount > 1)
+                {
+                    mtlFileName = asset.SafeName + ".mtl";
+                    var mtlPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(meshesDir, mtlFileName));
+                    var mtlMetaPath = EnsureConfinedPath(state.RootDirWithSep, mtlPath + ".meta");
+                    WriteMeshCompanionMtl(mtlPath, subMeshCount);
+                    var mtlGuid = ComputeUnityAssetGuid("mesh-mtl", asset.Mesh.assetsFile?.fileName, asset.Mesh.m_PathID, asset.SafeName);
+                    WriteSceneMetaFile(mtlMetaPath, mtlGuid);
+                }
+
+                WriteMeshObjStreaming(objPath, objGroupName, asset.Mesh, mtlFileName);
+                WriteModelImporterMetaFile(metaPath, asset.Guid, objGroupName);
                 asset.Exported = true;
             }
             catch (Exception ex)
@@ -1479,12 +2076,49 @@ public sealed class UnityProjectExporterService
         }
     }
 
-    private static void WriteMeshObjStreaming(string objPath, string meshName, Mesh mesh)
+    private static string SanitizeObjGroupName(string? rawName, string fallback = "Mesh")
+    {
+        if (string.IsNullOrWhiteSpace(rawName))
+        {
+            return fallback;
+        }
+
+        var sb = new StringBuilder(rawName.Length);
+        for (int i = 0; i < rawName.Length; i++)
+        {
+            char c = rawName[i];
+            sb.Append(char.IsWhiteSpace(c) || c < 0x20 ? '_' : c);
+        }
+
+        var cleaned = sb.ToString().Trim('_');
+        return string.IsNullOrEmpty(cleaned) ? fallback : cleaned;
+    }
+
+    private static void WriteMeshCompanionMtl(string mtlPath, int subMeshCount)
+    {
+        using var fs = new FileStream(mtlPath, FileMode.Create, FileAccess.Write, FileShare.None, 4096);
+        using var sw = new StreamWriter(fs, Utf8NoBom, 4096) { NewLine = "\n" };
+
+        sw.WriteLine("# AssetStudio Multi-SubMesh Material Library");
+        for (int s = 0; s < subMeshCount; s++)
+        {
+            sw.Write("newmtl mat_");
+            sw.WriteLine(s.ToString(CultureInfo.InvariantCulture));
+            sw.WriteLine("Kd 1 1 1");
+        }
+    }
+
+    private static void WriteMeshObjStreaming(string objPath, string meshName, Mesh mesh, string? mtlFileName = null)
     {
         using var fs = new FileStream(objPath, FileMode.Create, FileAccess.Write, FileShare.None, StreamWriterBufferSize);
         using var sw = new StreamWriter(fs, Utf8NoBom, StreamWriterBufferSize) { NewLine = "\n" };
 
         sw.Write("# AssetStudio Unity Project Exporter\n");
+        if (!string.IsNullOrEmpty(mtlFileName))
+        {
+            sw.Write("mtllib ");
+            sw.WriteLine(mtlFileName);
+        }
         sw.Write("o ");
         sw.WriteLine(meshName);
 
@@ -1534,6 +2168,11 @@ public sealed class UnityProjectExporterService
             }
         }
 
+        // Keep a single OBJ group matching the ModelImporter internalIDToNameTable entry (fileID: 4300000),
+        // switching materials via `usemtl` so Unity imports all submeshes on one unified Mesh asset.
+        sw.Write("g ");
+        sw.WriteLine(meshName);
+
         int subMeshCount = mesh.m_SubMeshes?.Length ?? 0;
         int indexCursor = 0;
         if (subMeshCount > 0 && mesh.m_Indices != null)
@@ -1542,8 +2181,6 @@ public sealed class UnityProjectExporterService
             {
                 var sub = mesh.m_SubMeshes![s];
                 int faceCount = (int)(sub.indexCount / 3);
-                sw.Write("g submesh_");
-                sw.WriteLine(s.ToString(CultureInfo.InvariantCulture));
                 sw.Write("usemtl mat_");
                 sw.WriteLine(s.ToString(CultureInfo.InvariantCulture));
 
@@ -1573,7 +2210,6 @@ public sealed class UnityProjectExporterService
         }
         else if (mesh.m_Indices != null && mesh.m_Indices.Count >= 3)
         {
-            sw.WriteLine("g submesh_0");
             sw.WriteLine("usemtl mat_0");
             int faceCount = mesh.m_Indices.Count / 3;
             for (int f = 0; f < faceCount; f++)
@@ -1636,7 +2272,11 @@ public sealed class UnityProjectExporterService
         sw.WriteLine(guid);
         sw.WriteLine("ModelImporter:");
         sw.WriteLine("  serializedVersion: 21300");
-        sw.WriteLine("  internalIDToNameTable: []");
+        sw.WriteLine("  internalIDToNameTable:");
+        sw.WriteLine("  - first:");
+        sw.WriteLine("      43: 4300000");
+        sw.Write("    second: ");
+        sw.WriteLine(FormatYamlScalarString(meshName));
         sw.WriteLine("  externalObjects: {}");
         sw.WriteLine("  materials:");
         sw.WriteLine("    materialImportMode: 2");
@@ -1705,9 +2345,10 @@ public sealed class UnityProjectExporterService
             asset.MeshData = meshData;
 
             // 1. Write Terrain OBJ + meta.
+            var terrainObjGroup = SanitizeObjGroupName(asset.SafeName, "Terrain");
             var objPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(meshesDir, asset.SafeName + ".obj"));
-            WriteTerrainObjStreaming(objPath, asset.SafeName, meshData);
-            WriteModelImporterMetaFile(EnsureConfinedPath(state.RootDirWithSep, objPath + ".meta"), asset.MeshGuid, asset.SafeName);
+            WriteTerrainObjStreaming(objPath, terrainObjGroup, meshData);
+            WriteModelImporterMetaFile(EnsureConfinedPath(state.RootDirWithSep, objPath + ".meta"), asset.MeshGuid, terrainObjGroup);
 
             // 2. Write baked splatmap PNG + meta (if present).
             if (state.Options.ExportTextures && meshData.BakedAlbedoBytes is { Length: > 0 })
@@ -1769,7 +2410,8 @@ public sealed class UnityProjectExporterService
             sw.WriteLine(FormatFloat(n.Z));
         }
 
-        sw.WriteLine("g submesh_0");
+        sw.Write("g ");
+        sw.WriteLine(meshName);
         sw.WriteLine("usemtl mat_0");
 
         int triCount = meshData.Indices.Length / 3;
@@ -1836,6 +2478,87 @@ public sealed class UnityProjectExporterService
 
             WriteMaterialFileStreaming(matPath, asset);
             WriteMaterialMetaFile(metaPath, asset.Guid);
+        }
+    }
+
+    private static void ExportColliderAuxiliaryMeshes(ExportState state, string assetsDir, CancellationToken cancellationToken)
+    {
+        string? collidersDir = null;
+
+        for (int i = 0; i < state.ColliderAuxiliaryTargets.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var target = state.ColliderAuxiliaryTargets[i];
+
+            Mesh? ResolveColliderMesh(PPtr<Mesh> meshPtr)
+            {
+                if (target.ResolvedMesh != null)
+                {
+                    return target.ResolvedMesh;
+                }
+
+                if (!meshPtr.IsNull && meshPtr.TryGet(out var directMesh) && directMesh != null)
+                {
+                    return directMesh;
+                }
+
+                if (!meshPtr.IsNull)
+                {
+                    foreach (var sf in SnapshotAssetsFiles(target.ColliderObject.assetsFile?.assetsManager))
+                    {
+                        if (sf.TryGetObject(meshPtr.m_PathID, out var found) && found is Mesh foundMesh)
+                        {
+                            return foundMesh;
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            var geometry = ColliderMeshConverter.TryBuildColliderMesh(
+                target.ColliderObject,
+                target.OwnerGameObjectName,
+                fieldProvider: obj => ReadColliderFields(obj, state),
+                meshResolver: ResolveColliderMesh);
+
+            if (geometry == null || geometry.VertexCount == 0 || geometry.TriangleCount == 0)
+            {
+                continue;
+            }
+
+            if (collidersDir == null)
+            {
+                collidersDir = EnsureConfinedDirectory(state.RootDirWithSep, Path.Combine(assetsDir, "Colliders"));
+                WriteFolderMeta(state.RootDirWithSep, Path.Combine(assetsDir, "Colliders.meta"), "Colliders");
+            }
+
+            var safeGoStem = SanitizeFileName(target.OwnerGameObjectName, "GameObject");
+            var safeColliderFileName = state.AllocateUniqueAssetName(
+                state.UsedColliderFileNames,
+                $"{safeGoStem}_Collider_{geometry.ColliderKind}",
+                "Collider",
+                target.ColliderObject.m_PathID);
+
+            var objPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(collidersDir, safeColliderFileName + ".obj"));
+            var metaPath = EnsureConfinedPath(state.RootDirWithSep, objPath + ".meta");
+            var guid = ComputeUnityAssetGuid(
+                "collider-mesh",
+                target.ColliderObject.assetsFile?.fileName,
+                target.ColliderObject.m_PathID,
+                safeColliderFileName);
+
+            try
+            {
+                var colliderGroupName = SanitizeObjGroupName(safeColliderFileName, "Collider");
+                ColliderMeshConverter.WriteObj(geometry, objPath, colliderGroupName);
+                WriteModelImporterMetaFile(metaPath, guid, colliderGroupName);
+                state.ColliderMeshesExported++;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"UnityProjectExporter: failed to export auxiliary collider mesh '{safeColliderFileName}': {ex.Message}");
+            }
         }
     }
 
@@ -2019,7 +2742,7 @@ public sealed class UnityProjectExporterService
     }
 
     // =========================================================================
-    // Streaming Unity YAML 1.1 Scene Writer (.unity)
+    // Streaming Unity YAML 1.1 Scene (.unity) & Standalone Prefab (.prefab) Writers
     // =========================================================================
 
     private static void WriteUnitySceneFile(string scenePath, ExportState state, CancellationToken cancellationToken)
@@ -2031,6 +2754,31 @@ public sealed class UnityProjectExporterService
         sw.WriteLine("%TAG !u! tag:unity3d.com,2011:");
 
         WriteSceneSettingsHeader(sw);
+
+        for (int i = 0; i < state.SceneNodes.Count; i++)
+        {
+            if ((i & 63) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            var node = state.SceneNodes[i];
+            WriteGameObjectYaml(sw, node);
+
+            for (int c = 0; c < node.Components.Count; c++)
+            {
+                WriteComponentYaml(sw, node, node.Components[c], state);
+            }
+        }
+    }
+
+    private static void WriteUnityPrefabFile(string prefabPath, ExportState state, CancellationToken cancellationToken)
+    {
+        using var fs = new FileStream(prefabPath, FileMode.Create, FileAccess.Write, FileShare.None, StreamWriterBufferSize);
+        using var sw = new StreamWriter(fs, Utf8NoBom, StreamWriterBufferSize) { NewLine = "\n" };
+
+        sw.WriteLine("%YAML 1.1");
+        sw.WriteLine("%TAG !u! tag:unity3d.com,2011:");
 
         for (int i = 0; i < state.SceneNodes.Count; i++)
         {
@@ -2278,8 +3026,9 @@ public sealed class UnityProjectExporterService
             }
         }
 
+        bool isPrefabRoot = state.PrefabRootObject != null && ReferenceEquals(node.GameObject, state.PrefabRootObject);
         long fatherId = 0;
-        if (tr.m_Father != null && !tr.m_Father.IsNull)
+        if (!isPrefabRoot && tr.m_Father != null && !tr.m_Father.IsNull)
         {
             TryLookupLocalFileId(tr.assetsFile, tr.m_Father.m_FileID, tr.m_Father.m_PathID, state, out fatherId);
         }
@@ -2288,7 +3037,7 @@ public sealed class UnityProjectExporterService
         sw.Write(fatherId.ToString(CultureInfo.InvariantCulture));
         sw.WriteLine("}");
         sw.Write("  m_RootOrder: ");
-        sw.WriteLine(node.RootOrder.ToString(CultureInfo.InvariantCulture));
+        sw.WriteLine((isPrefabRoot ? 0 : node.RootOrder).ToString(CultureInfo.InvariantCulture));
 
         if (tr is RectTransform rt)
         {
@@ -2690,16 +3439,17 @@ public sealed class UnityProjectExporterService
         sw.Write("  m_LastLODIsBillboard: ");
         sw.WriteLine(lodGroup.m_LastLODIsBillboard ? "1" : "0");
 
-        if (lodGroup.m_LODs == null || lodGroup.m_LODs.Length == 0)
+        var lodLevels = ExtractLodLevels(lodGroup);
+        if (lodLevels.Count == 0)
         {
             sw.WriteLine("  m_LODs: []");
         }
         else
         {
             sw.WriteLine("  m_LODs:");
-            for (int l = 0; l < lodGroup.m_LODs.Length; l++)
+            for (int l = 0; l < lodLevels.Count; l++)
             {
-                var lod = lodGroup.m_LODs[l];
+                var lod = lodLevels[l];
                 if (lod == null)
                 {
                     continue;
@@ -2747,17 +3497,17 @@ public sealed class UnityProjectExporterService
     private static void WriteColliderYaml(StreamWriter sw, ExportedComponentRecord comp, ExportState state)
     {
         var obj = comp.SourceObject!;
-        var fields = ReadColliderFields(obj, state);
+        var hasProps = ColliderMeshConverter.TryExtractColliderProperties(obj, o => ReadColliderFields(o, state), out var props);
 
-        bool enabled = fields == null || !TryReadBool(fields, "m_Enabled", out var en) || en;
-        bool isTrigger = fields != null && TryReadBool(fields, "m_IsTrigger", out var trig) && trig;
+        bool enabled = !hasProps || props.Enabled;
+        bool isTrigger = hasProps && props.IsTrigger;
 
         switch (comp.Kind)
         {
             case ExportedComponentKind.BoxCollider:
             {
-                var size = fields != null && TryReadVector3(fields, "m_Size", out var s) ? s : new Vector3(1f, 1f, 1f);
-                var center = fields != null && TryReadVector3(fields, "m_Center", out var c) ? c : Vector3.Zero;
+                var size = hasProps ? props.Size : new Vector3(1f, 1f, 1f);
+                var center = hasProps ? props.Center : Vector3.Zero;
                 sw.Write("--- !u!65 &");
                 sw.WriteLine(comp.FileId.ToString(CultureInfo.InvariantCulture));
                 sw.WriteLine("BoxCollider:");
@@ -2781,8 +3531,8 @@ public sealed class UnityProjectExporterService
 
             case ExportedComponentKind.SphereCollider:
             {
-                float radius = fields != null && TryReadFloat(fields, "m_Radius", out var r) ? r : 0.5f;
-                var center = fields != null && TryReadVector3(fields, "m_Center", out var c) ? c : Vector3.Zero;
+                float radius = hasProps ? props.Radius : 0.5f;
+                var center = hasProps ? props.Center : Vector3.Zero;
                 sw.Write("--- !u!135 &");
                 sw.WriteLine(comp.FileId.ToString(CultureInfo.InvariantCulture));
                 sw.WriteLine("SphereCollider:");
@@ -2801,10 +3551,10 @@ public sealed class UnityProjectExporterService
 
             case ExportedComponentKind.CapsuleCollider:
             {
-                float radius = fields != null && TryReadFloat(fields, "m_Radius", out var r) ? r : 0.5f;
-                float height = fields != null && TryReadFloat(fields, "m_Height", out var h) ? h : 2f;
-                int direction = fields != null && TryReadInt(fields, "m_Direction", out var d) ? d : 1;
-                var center = fields != null && TryReadVector3(fields, "m_Center", out var c) ? c : Vector3.Zero;
+                float radius = hasProps ? props.Radius : 0.5f;
+                float height = hasProps ? props.Height : 2f;
+                int direction = hasProps ? props.Direction : 1;
+                var center = hasProps ? props.Center : Vector3.Zero;
                 sw.Write("--- !u!136 &");
                 sw.WriteLine(comp.FileId.ToString(CultureInfo.InvariantCulture));
                 sw.WriteLine("CapsuleCollider:");
@@ -2827,8 +3577,8 @@ public sealed class UnityProjectExporterService
 
             case ExportedComponentKind.MeshCollider:
             {
-                bool convex = fields != null && TryReadBool(fields, "m_Convex", out var cv) && cv;
-                int cookingOptions = fields != null && TryReadInt(fields, "m_CookingOptions", out var co) ? co : 30;
+                bool convex = hasProps && props.Convex;
+                int cookingOptions = hasProps ? props.CookingOptions : 30;
                 sw.Write("--- !u!64 &");
                 sw.WriteLine(comp.FileId.ToString(CultureInfo.InvariantCulture));
                 sw.WriteLine("MeshCollider:");
@@ -3306,7 +4056,10 @@ public sealed class UnityProjectExporterService
             MonoBehaviours = state.MonoBehaviourCount,
             UniqueMeshes = state.MeshesToExport.Count(static m => m.Exported) + state.TerrainAssets.Count(static t => t.MeshData != null),
             UniqueMaterials = state.MaterialsToExport.Count + (state.Options.ExportMaterials ? state.TerrainAssets.Count(static t => t.MeshData != null) : 0),
-            UniqueTextures = state.TexturesToExport.Count(static t => t.Exported) + state.TerrainAssets.Count(static t => t.HasBakedTexture)
+            UniqueTextures = state.TexturesToExport.Count(static t => t.Exported) + state.TerrainAssets.Count(static t => t.HasBakedTexture),
+            ColliderMeshesExported = state.ColliderMeshesExported,
+            LodGroupsFiltered = state.LodGroupsFiltered,
+            RenderersSkippedByLodFilter = state.RenderersSkippedByLodFilter
         };
     }
 
@@ -3317,6 +4070,8 @@ public sealed class UnityProjectExporterService
         long elapsedMs,
         string outputDirFull,
         string sceneFilePath,
+        string? prefabFilePath,
+        string? unityPackagePath,
         ExportState state,
         UnityProjectScriptExportSummary? scriptSummary)
     {
@@ -3367,6 +4122,8 @@ public sealed class UnityProjectExporterService
             ElapsedMs = elapsedMs,
             OutputDirectory = outputDirFull,
             SceneFilePath = sceneFilePath,
+            PrefabFilePath = prefabFilePath,
+            UnityPackagePath = unityPackagePath,
             AdditionalScenes = options.AdditionalSceneNames != null
                 ? options.AdditionalSceneNames.Where(static n => !string.IsNullOrWhiteSpace(n)).ToList()
                 : new List<string>(),

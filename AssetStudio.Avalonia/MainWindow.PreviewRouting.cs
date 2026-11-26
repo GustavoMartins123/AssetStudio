@@ -830,6 +830,7 @@ public partial class MainWindow : Window
         currentPreviewTexture = null;
         currentPreviewSprite = null;
         ResetTextureArrayPreview();
+        ResetTextureMipmapPreview();
         currentPreviewAudioClip = null;
         currentPreviewVideoClip = null;
 

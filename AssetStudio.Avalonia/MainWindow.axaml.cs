@@ -409,6 +409,18 @@ public partial class MainWindow : Window
         handlers.ExportSceneGlbAsync = ExportSceneGlbCommandHandlerAsync;
         handlers.ExportSelectedSubtreeGlbAsync = ExportSelectedSubtreeGlbWithLazySupportAsync;
         handlers.ExportSceneToUnityProjectAsync = ExportSceneToUnityProjectCommandHandlerAsync;
+        handlers.ExportSceneToUnityPackageAsync = ExportSceneToUnityPackageCommandHandlerAsync;
+        handlers.ExportSelectedPrefabToUnityProjectAsync = () => ExportSelectedPrefabToUnityProjectCommandHandlerAsync(buildUnityPackage: false);
+        handlers.ExportSelectedPrefabToUnityPackageAsync = () => ExportSelectedPrefabToUnityProjectCommandHandlerAsync(buildUnityPackage: true);
+        handlers.OpenBuildDiffDialogAsync = OpenBuildDiffDialogCommandHandlerAsync;
+        handlers.OpenGlobalSearchDialogAsync = OpenGlobalSearchDialogCommandHandlerAsync;
+        handlers.QuerySelectedAssetGraphUsageAsync = QuerySelectedAssetGraphUsageCommandHandlerAsync;
+        handlers.OpenAnimatorGraphDialogAsync = OpenAnimatorGraphDialogCommandHandlerAsync;
+        handlers.ExportSelectedAnimationClipMetadataAsync = ExportSelectedAnimationClipMetadataCommandHandlerAsync;
+        handlers.ExportCurrentTextureMipChainAsync = ExportCurrentTextureMipChainCommandHandlerAsync;
+        handlers.ExportCurrentTextureHdrExrAsync = ExportCurrentTextureHdrExrCommandHandlerAsync;
+        handlers.ExportCurrentTextureHdrTiffAsync = ExportCurrentTextureHdrTiffCommandHandlerAsync;
+        handlers.ExportSelectedSpriteAtlasMetadataAsync = ExportSelectedSpriteAtlasMetadataCommandHandlerAsync;
         WireSceneHierarchyViewModelHandlers();
 
         handlers.ExportAllAssetsAsync = () => ExportAllAssetsAsync(ExportMode.Convert);

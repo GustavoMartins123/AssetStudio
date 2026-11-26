@@ -243,16 +243,27 @@ public partial class MainWindow
 
     internal async Task ExportSceneToUnityProjectCommandHandlerAsync()
     {
+        await ExportSceneToUnityProjectCoreAsync(packageOnlyMode: false);
+    }
+
+    internal async Task ExportSceneToUnityPackageCommandHandlerAsync()
+    {
+        await ExportSceneToUnityProjectCoreAsync(packageOnlyMode: true);
+    }
+
+    private async Task ExportSceneToUnityProjectCoreAsync(bool packageOnlyMode)
+    {
         if (IsWindowClosingOrClosed)
         {
             return;
         }
 
+        var actionTitle = packageOnlyMode ? "Export Scene to .unitypackage" : "Export Scene to Unity Project";
         var (candidates, bindingMap) = GatherAvailableSceneExportCandidates();
         if (candidates.Count == 0)
         {
             await ViewModel.DialogService.ShowMessageAsync(
-                "Export Scene to Unity Project",
+                actionTitle,
                 "No loaded Scene Hierarchy, BuildSettings scene, .unity scene bundle, streamed scene bundle, or Addressables SceneProvider entry was detected.\n\n" +
                 "Load a Unity game folder or scene file (such as level0 or a scene bundle) first.");
             return;
@@ -261,7 +272,7 @@ public partial class MainWindow
         var dialogRequest = new SceneExportDialogRequest(
             scenes: candidates,
             initialOptions: _lastSceneExportOptions,
-            dialogTitle: "Export Unity Scene to Unity Project");
+            dialogTitle: packageOnlyMode ? "Export Unity Scene to .unitypackage" : "Export Unity Scene to Unity Project");
 
         var dialogResult = await ViewModel.DialogService.ShowSceneExportDialogAsync(dialogRequest);
         if (dialogResult == null || dialogResult.SelectedScenes.Count == 0)
@@ -289,29 +300,67 @@ public partial class MainWindow
             ? primaryCandidate.Name
             : $"{primaryCandidate.Name}_Combined";
         var outputSceneName = string.IsNullOrWhiteSpace(suggestedBaseName) ? "Scene" : suggestedBaseName;
+        var safeSceneName = UnityProjectExporterService.SanitizeFileName(outputSceneName, "Scene");
 
-        var selectedFolder = await ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
-            title: "Select Output Folder for Unity Project",
-            suggestedStartDirectory: GetSuggestedExportStartDirectory()));
-        if (string.IsNullOrWhiteSpace(selectedFolder))
+        string projectOutputDir;
+        string? unityPackageOutputPath = null;
+        string? folderToOpenAfterExport;
+        bool alsoBuildUnityPackage;
+        string? stagingDirToCleanup = null;
+
+        if (packageOnlyMode)
         {
-            return;
-        }
+            var suggestedPackageFileName = safeSceneName + ".unitypackage";
+            var savePackagePath = await PickSaveUnityPackageDialogAsync("Export Unity Scene to .unitypackage", suggestedPackageFileName);
+            if (string.IsNullOrWhiteSpace(savePackagePath))
+            {
+                return;
+            }
 
-        SaveExportFolder(selectedFolder);
+            folderToOpenAfterExport = Path.GetDirectoryName(savePackagePath);
+            if (!string.IsNullOrEmpty(folderToOpenAfterExport))
+            {
+                SaveExportFolder(folderToOpenAfterExport);
+            }
+
+            stagingDirToCleanup = Path.Combine(Path.GetTempPath(), $"AssetStudio_UnityPkg_{Guid.NewGuid():N}");
+            projectOutputDir = stagingDirToCleanup;
+            unityPackageOutputPath = savePackagePath;
+            alsoBuildUnityPackage = true;
+        }
+        else
+        {
+            var selectedFolder = await ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
+                title: "Select Output Folder for Unity Project",
+                suggestedStartDirectory: GetSuggestedExportStartDirectory()));
+            if (string.IsNullOrWhiteSpace(selectedFolder))
+            {
+                return;
+            }
+
+            SaveExportFolder(selectedFolder);
+            var projectFolderName = safeSceneName + "_UnityProject";
+            projectOutputDir = Path.Combine(selectedFolder, projectFolderName);
+            folderToOpenAfterExport = projectOutputDir;
+
+            alsoBuildUnityPackage = await ViewModel.DialogService.ConfirmAsync(
+                "Also Pack .unitypackage Archive",
+                $"Would you also like to pack the exported Unity project into a ready-to-import '{safeSceneName}.unitypackage' archive alongside the project folder?");
+            if (alsoBuildUnityPackage)
+            {
+                unityPackageOutputPath = Path.Combine(selectedFolder, safeSceneName + ".unitypackage");
+            }
+        }
 
         var discoveredScripts = DiscoverCurrentScriptSources(out _);
         var includeScriptsInUnityProject = false;
         if (discoveredScripts.HasAnySource)
         {
             includeScriptsInUnityProject = await ViewModel.DialogService.ConfirmAsync(
-                "Include C# Scripts in Unity Project",
+                "Include C# Scripts",
                 "Script sources were detected for this project.\n\n" +
                 "Would you also like to export the game's C# scripts into Assets/Scripts/ with matching deterministic .cs.meta GUIDs so MonoBehaviour components link automatically in Unity?");
         }
-
-        var projectFolderName = UnityProjectExporterService.SanitizeFileName(outputSceneName, "Scene") + "_UnityProject";
-        var projectOutputDir = Path.Combine(selectedFolder, projectFolderName);
 
         var displaySceneName = selectedBindings.Count == 1
             ? primaryCandidate.Name
@@ -320,9 +369,9 @@ public partial class MainWindow
         var ctsToken = ExportState.BeginExport(
             ExportOperationMode.SplitObjects,
             100,
-            projectOutputDir,
-            $"Preparing Unity project export for '{displaySceneName}'...");
-        StatusStripUpdate($"Exporting scene '{displaySceneName}' to Unity project '{projectFolderName}'...");
+            folderToOpenAfterExport,
+            $"Preparing {(packageOnlyMode ? ".unitypackage" : "Unity project")} export for '{displaySceneName}'...");
+        StatusStripUpdate($"Exporting scene '{displaySceneName}' to {(packageOnlyMode ? Path.GetFileName(unityPackageOutputPath) : Path.GetFileName(projectOutputDir))}...");
 
         UnityProjectExportResult? result = null;
         try
@@ -349,6 +398,10 @@ public partial class MainWindow
                     exportCamerasAndLights: true,
                     resolveStaticScriptSpawns: true);
                 requiredObjectTypes.Add(ClassIDType.Texture2D);
+                requiredObjectTypes.Add(ClassIDType.BoxCollider);
+                requiredObjectTypes.Add(ClassIDType.SphereCollider);
+                requiredObjectTypes.Add(ClassIDType.CapsuleCollider);
+                requiredObjectTypes.Add(ClassIDType.MeshCollider);
 
                 var prepared = PrepareSelectedScenesForExport(
                     selectedBindings,
@@ -388,54 +441,10 @@ public partial class MainWindow
                     }
                 }
 
-                Func<string, CancellationToken, UnityProjectScriptExportSummary?>? includeScriptsCallback = null;
-                if (includeScriptsInUnityProject && discoveredScripts.HasAnySource)
-                {
-                    var effectiveScriptRoot = ResolveEffectiveScriptProjectRoot();
-                    var customScriptsDir = _customScriptsDirectory;
-                    includeScriptsCallback = (scriptsOutputDir, ct) =>
-                    {
-                        ReportSceneExportProgress(92, "Exporting C# scripts into Assets/Scripts with matching GUIDs...");
-                        var scriptExportResult = _csharpProjectExporter.Export(
-                            new CSharpProjectExportOptions
-                            {
-                                OutputDirectory = scriptsOutputDir,
-                                ProjectName = ScriptExportPathSanitizer.SanitizeSegment(outputSceneName, "ExportedScripts"),
-                                LayoutMode = CSharpProjectLayoutMode.UnityAssetsScripts,
-                                IncludeEngineAndThirdPartyAssemblies = false,
-                                GenerateUnityMetaFiles = true,
-                                GenerateAsmdefFiles = true,
-                                CopyReferenceDlls = false,
-                                ManagedDirectories = discoveredScripts.ManagedDirectories,
-                                DummyDllDirectories = discoveredScripts.DummyDllDirectories,
-                                DumpCsPath = discoveredScripts.DumpCsPath,
-                                ScriptJsonPath = discoveredScripts.ScriptJsonPath,
-                                GlobalMetadataPath = discoveredScripts.GlobalMetadataPath,
-                                GameAssemblyPath = discoveredScripts.GameAssemblyPath,
-                                ProjectRoot = effectiveScriptRoot,
-                                CustomScriptsDirectory = customScriptsDir
-                            },
-                            cancellationToken: ct);
-
-                        var warnings = new List<string>();
-                        if (!scriptExportResult.Success && !string.IsNullOrWhiteSpace(scriptExportResult.ErrorMessage))
-                        {
-                            warnings.Add(scriptExportResult.ErrorMessage);
-                        }
-                        if (scriptExportResult.FailedTypesCount > 0)
-                        {
-                            warnings.Add($"{scriptExportResult.FailedTypesCount:N0} type(s) emitted as comment stubs due to decompiler errors.");
-                        }
-
-                        return new UnityProjectScriptExportSummary
-                        {
-                            ExportedScriptFiles = scriptExportResult.TotalTypesExported,
-                            ExportedAssemblies = scriptExportResult.GameAssembliesCount,
-                            OutputDirectory = scriptsOutputDir,
-                            Warnings = warnings
-                        };
-                    };
-                }
+                var includeScriptsCallback = BuildUnityProjectIncludeScriptsCallback(
+                    includeScriptsInUnityProject,
+                    discoveredScripts,
+                    outputSceneName);
 
                 var resolverContext = new SceneExportResolverContext();
                 var unityOptions = new UnityProjectExportOptions
@@ -450,7 +459,11 @@ public partial class MainWindow
                     ExportMonoBehaviours = true,
                     ExportTerrains = true,
                     ExportColliders = true,
-                    WriteManifest = sceneExportOptions.WriteManifest,
+                    ExportColliderAuxiliaryMeshes = true,
+                    TargetLodLevel = sceneExportOptions.LodMode == SceneLodExportMode.Lod0Only ? 0 : null,
+                    AlsoBuildUnityPackage = alsoBuildUnityPackage,
+                    UnityPackageOutputPath = unityPackageOutputPath,
+                    WriteManifest = !packageOnlyMode && sceneExportOptions.WriteManifest,
                     IncludeScriptsCallback = includeScriptsCallback,
                     MeshResolver = renderer => ResolveSceneMeshForRenderer(renderer, resolverContext),
                     MaterialResolver = (renderer, mesh, slotIndex) => ResolveSceneMaterialForSubmesh(renderer, mesh, slotIndex, resolverContext),
@@ -479,11 +492,395 @@ public partial class MainWindow
                 Success = false,
                 OutputDirectory = projectOutputDir,
                 SceneName = outputSceneName,
-                ErrorMessage = "Unity project export cancelled."
+                ErrorMessage = packageOnlyMode ? "Unity package export cancelled." : "Unity project export cancelled."
             };
         }
+        finally
+        {
+            TryCleanupStagingDirectory(stagingDirToCleanup);
+        }
 
-        await CompleteUnityProjectExportUiAsync(result, projectOutputDir);
+        await CompleteUnityProjectExportUiAsync(result, folderToOpenAfterExport, packageOnlyMode ? "Unity Package" : "Unity Project");
+    }
+
+    internal async Task ExportSelectedPrefabToUnityProjectCommandHandlerAsync(bool buildUnityPackage = false)
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        var actionTitle = buildUnityPackage ? "Export Prefab to .unitypackage" : "Export Prefab to Unity Project";
+        var prefabRoot = TryResolveSelectedPrefabRootGameObject(out var selectionError);
+        if (prefabRoot == null)
+        {
+            await ViewModel.DialogService.ShowMessageAsync(
+                actionTitle,
+                selectionError ?? "Select a GameObject or Prefab in the Scene Hierarchy or Asset List first.");
+            return;
+        }
+
+        var prefabName = !string.IsNullOrWhiteSpace(prefabRoot.m_Name)
+            ? prefabRoot.m_Name
+            : $"Prefab_{prefabRoot.m_PathID}";
+        var safePrefabName = UnityProjectExporterService.SanitizeFileName(prefabName, "Prefab");
+
+        string projectOutputDir;
+        string? unityPackageOutputPath = null;
+        string? folderToOpenAfterExport;
+        bool alsoBuildUnityPackage;
+        string? stagingDirToCleanup = null;
+
+        if (buildUnityPackage)
+        {
+            var savePackagePath = await PickSaveUnityPackageDialogAsync(
+                $"Export Prefab '{prefabName}' to .unitypackage",
+                safePrefabName + ".unitypackage");
+            if (string.IsNullOrWhiteSpace(savePackagePath))
+            {
+                return;
+            }
+
+            folderToOpenAfterExport = Path.GetDirectoryName(savePackagePath);
+            if (!string.IsNullOrEmpty(folderToOpenAfterExport))
+            {
+                SaveExportFolder(folderToOpenAfterExport);
+            }
+
+            stagingDirToCleanup = Path.Combine(Path.GetTempPath(), $"AssetStudio_PrefabPkg_{Guid.NewGuid():N}");
+            projectOutputDir = stagingDirToCleanup;
+            unityPackageOutputPath = savePackagePath;
+            alsoBuildUnityPackage = true;
+        }
+        else
+        {
+            var selectedFolder = await ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
+                title: $"Select Output Folder for Prefab '{prefabName}'",
+                suggestedStartDirectory: GetSuggestedExportStartDirectory()));
+            if (string.IsNullOrWhiteSpace(selectedFolder))
+            {
+                return;
+            }
+
+            SaveExportFolder(selectedFolder);
+            projectOutputDir = Path.Combine(selectedFolder, safePrefabName + "_UnityPrefab");
+            folderToOpenAfterExport = projectOutputDir;
+
+            alsoBuildUnityPackage = await ViewModel.DialogService.ConfirmAsync(
+                "Also Pack .unitypackage Archive",
+                $"Would you also like to pack '{safePrefabName}.prefab' and its dependencies into '{safePrefabName}.unitypackage'?");
+            if (alsoBuildUnityPackage)
+            {
+                unityPackageOutputPath = Path.Combine(selectedFolder, safePrefabName + ".unitypackage");
+            }
+        }
+
+        var discoveredScripts = DiscoverCurrentScriptSources(out _);
+        var includeScripts = false;
+        if (discoveredScripts.HasAnySource)
+        {
+            includeScripts = await ViewModel.DialogService.ConfirmAsync(
+                "Include C# Scripts",
+                "Script sources were detected for this project.\n\n" +
+                "Would you also like to export the game's C# scripts into Assets/Scripts/ with matching deterministic .cs.meta GUIDs so MonoBehaviour components on this prefab link automatically in Unity?");
+        }
+
+        var ctsToken = ExportState.BeginExport(
+            ExportOperationMode.SplitObjects,
+            100,
+            folderToOpenAfterExport,
+            $"Preparing prefab export for '{prefabName}'...");
+        StatusStripUpdate($"Exporting prefab '{prefabName}'...");
+
+        UnityProjectExportResult? result = null;
+        try
+        {
+            var cacheFolder = GetCurrentCacheFolderPath();
+            var cacheSignature = currentScanResult != null && !string.IsNullOrWhiteSpace(cacheFolder)
+                ? _sqliteCache.GetFolderSignature(currentScanResult)
+                : null;
+            var projectRoot = !string.IsNullOrWhiteSpace(assetsManager.ProjectRoot)
+                ? assetsManager.ProjectRoot
+                : cacheFolder;
+
+            await Task.Run(() =>
+            {
+                using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
+                using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
+
+                ctsToken.ThrowIfCancellationRequested();
+
+                SceneDependencyClosureResult? depClosure = null;
+                if (prefabRoot.assetsFile != null)
+                {
+                    ReportSceneExportProgress(8, $"Resolving dependencies for prefab '{prefabName}'...");
+                    var requiredObjectTypes = SceneGlbExportService.GetRequiredSceneObjectTypes(
+                        includeAnimations: exportOptions.ExportAnimations,
+                        exportCamerasAndLights: true,
+                        resolveStaticScriptSpawns: true);
+                    requiredObjectTypes.Add(ClassIDType.Texture2D);
+
+                    depClosure = SceneGlbExportService.ResolveAndLoadSceneDependencies(
+                        assetsManager: assetsManager,
+                        seedFiles: new[] { prefabRoot.assetsFile },
+                        sqliteCache: _sqliteCache,
+                        cacheFolderPath: cacheFolder,
+                        cacheSignature: cacheSignature,
+                        projectRoot: projectRoot,
+                        resolveSourcePathByFileName: ResolveSceneDependencyDiskPath,
+                        beforeLoadFile: RemovePendingFileFromProgressiveQueue,
+                        maxDepth: _lastSceneExportOptions.MaxExternalDependencyDepth,
+                        maxAdditionalFiles: _lastSceneExportOptions.MaxExternalFilesToLoad,
+                        cancellationToken: ctsToken);
+
+                    ReportSceneExportProgress(16, $"Materializing prefab components ({depClosure.AllLoadedFiles.Count} file(s))...");
+                    foreach (var sf in depClosure.AllLoadedFiles)
+                    {
+                        MaterializeSceneObjectsForSerializedFile(sf, requiredObjectTypes, ctsToken);
+                    }
+                }
+
+                SceneGlbExportService.EnsureGameObjectComponentsLinked(prefabRoot);
+
+                var includeScriptsCallback = BuildUnityProjectIncludeScriptsCallback(
+                    includeScripts,
+                    discoveredScripts,
+                    safePrefabName);
+
+                var resolverContext = new SceneExportResolverContext();
+                var unityOptions = new UnityProjectExportOptions
+                {
+                    OutputDirectory = projectOutputDir,
+                    SceneName = safePrefabName,
+                    IncludeInactive = true,
+                    ExportMeshes = true,
+                    ExportTextures = true,
+                    ExportMaterials = true,
+                    ExportMonoBehaviours = true,
+                    ExportTerrains = true,
+                    ExportColliders = true,
+                    ExportColliderAuxiliaryMeshes = true,
+                    AlsoBuildUnityPackage = alsoBuildUnityPackage,
+                    UnityPackageOutputPath = unityPackageOutputPath,
+                    WriteManifest = !buildUnityPackage && _lastSceneExportOptions.WriteManifest,
+                    IncludeScriptsCallback = includeScriptsCallback,
+                    MeshResolver = renderer => ResolveSceneMeshForRenderer(renderer, resolverContext),
+                    MaterialResolver = (renderer, mesh, slotIndex) => ResolveSceneMaterialForSubmesh(renderer, mesh, slotIndex, resolverContext),
+                    TextureResolver = ResolveTextureForModelConverter,
+                    AssemblyLoader = assemblyLoader,
+                    ResolvedDependencies = depClosure?.ResolvedDependencies,
+                    MissingDependencies = depClosure?.MissingDependencies
+                };
+
+                result = _unityProjectExporterService.ExportPrefabToUnityProject(
+                    prefabRoot,
+                    unityOptions,
+                    progressCallback: (pct, _, status) =>
+                    {
+                        var mappedPct = 20 + (int)(Math.Clamp(pct, 0, 100) * 0.8);
+                        ReportSceneExportProgress(mappedPct, status);
+                    },
+                    cancellationToken: ctsToken);
+            }, ctsToken);
+        }
+        catch (OperationCanceledException)
+        {
+            result = new UnityProjectExportResult
+            {
+                Success = false,
+                OutputDirectory = projectOutputDir,
+                SceneName = safePrefabName,
+                ErrorMessage = "Unity prefab export cancelled."
+            };
+        }
+        finally
+        {
+            TryCleanupStagingDirectory(stagingDirToCleanup);
+        }
+
+        await CompleteUnityProjectExportUiAsync(result, folderToOpenAfterExport, buildUnityPackage ? "Unity Prefab Package" : "Unity Prefab");
+    }
+
+    private Func<string, CancellationToken, UnityProjectScriptExportSummary?>? BuildUnityProjectIncludeScriptsCallback(
+        bool includeScripts,
+        DiscoveredScriptSources discoveredScripts,
+        string projectName)
+    {
+        if (!includeScripts || !discoveredScripts.HasAnySource)
+        {
+            return null;
+        }
+
+        var effectiveScriptRoot = ResolveEffectiveScriptProjectRoot();
+        var customScriptsDir = _customScriptsDirectory;
+        return (scriptsOutputDir, ct) =>
+        {
+            ReportSceneExportProgress(88, "Exporting C# scripts into Assets/Scripts with matching GUIDs...");
+            var scriptExportResult = _csharpProjectExporter.Export(
+                new CSharpProjectExportOptions
+                {
+                    OutputDirectory = scriptsOutputDir,
+                    ProjectName = ScriptExportPathSanitizer.SanitizeSegment(projectName, "ExportedScripts"),
+                    LayoutMode = CSharpProjectLayoutMode.UnityAssetsScripts,
+                    IncludeEngineAndThirdPartyAssemblies = false,
+                    GenerateUnityMetaFiles = true,
+                    GenerateAsmdefFiles = true,
+                    CopyReferenceDlls = false,
+                    ManagedDirectories = discoveredScripts.ManagedDirectories,
+                    DummyDllDirectories = discoveredScripts.DummyDllDirectories,
+                    DumpCsPath = discoveredScripts.DumpCsPath,
+                    ScriptJsonPath = discoveredScripts.ScriptJsonPath,
+                    GlobalMetadataPath = discoveredScripts.GlobalMetadataPath,
+                    GameAssemblyPath = discoveredScripts.GameAssemblyPath,
+                    ProjectRoot = effectiveScriptRoot,
+                    CustomScriptsDirectory = customScriptsDir
+                },
+                cancellationToken: ct);
+
+            var warnings = new List<string>();
+            if (!scriptExportResult.Success && !string.IsNullOrWhiteSpace(scriptExportResult.ErrorMessage))
+            {
+                warnings.Add(scriptExportResult.ErrorMessage);
+            }
+            if (scriptExportResult.FailedTypesCount > 0)
+            {
+                warnings.Add($"{scriptExportResult.FailedTypesCount:N0} type(s) emitted as comment stubs due to decompiler errors.");
+            }
+
+            return new UnityProjectScriptExportSummary
+            {
+                ExportedScriptFiles = scriptExportResult.TotalTypesExported,
+                ExportedAssemblies = scriptExportResult.GameAssembliesCount,
+                OutputDirectory = scriptsOutputDir,
+                Warnings = warnings
+            };
+        };
+    }
+
+    private GameObject? TryResolveSelectedPrefabRootGameObject(out string? selectionError)
+    {
+        selectionError = null;
+        bool assetListTabActive = LeftTabControl?.SelectedIndex == 1;
+
+        GameObject? TryFromSceneHierarchy()
+        {
+            GameObjectNode? targetNode = SceneTreeView?.SelectedItem as GameObjectNode;
+            if (targetNode == null)
+            {
+                var checkedNodes = GetSelectedParentNodes();
+                if (checkedNodes.Count > 0)
+                {
+                    targetNode = checkedNodes[0];
+                }
+            }
+
+            if (targetNode == null)
+            {
+                return null;
+            }
+
+            if (targetNode.GameObject != null)
+            {
+                return targetNode.GameObject;
+            }
+
+            return SceneGlbExportService.CollectRootGameObjectsFromSceneNode(targetNode).FirstOrDefault();
+        }
+
+        GameObject? TryFromAssetList()
+        {
+            var candidateItem = assetContextItem ?? AssetListDataGrid?.SelectedItem as AssetItem;
+            if (candidateItem == null)
+            {
+                var selected = GetSelectedAssets();
+                if (selected.Count > 0)
+                {
+                    candidateItem = selected[0];
+                }
+            }
+
+            if (candidateItem == null)
+            {
+                return null;
+            }
+
+            if (candidateItem.TreeNode?.GameObject != null)
+            {
+                return candidateItem.TreeNode.GameObject;
+            }
+
+            if (candidateItem.Asset == null)
+            {
+                EnsureLazyAssetsLoadedForExport(new List<AssetItem> { candidateItem });
+            }
+
+            var resolvedObj = candidateItem.Asset;
+            if (resolvedObj == null && candidateItem.Handle != null)
+            {
+                resolvedObj = ResolveSemanticRelationHandleForPreview(candidateItem.Handle);
+            }
+
+            if (resolvedObj is GameObject go)
+            {
+                return go;
+            }
+
+            if (resolvedObj is Component comp && comp.m_GameObject != null && !comp.m_GameObject.IsNull && comp.m_GameObject.TryGet(out var compGo) && compGo != null)
+            {
+                return compGo;
+            }
+
+            if (resolvedObj != null && resolvedObj.assetsFile != null)
+            {
+                try
+                {
+                    var dict = resolvedObj.ToType();
+                    if (dict != null && dict.Contains("m_RootGameObject"))
+                    {
+                        var rootObj = ResolvePPtr(dict["m_RootGameObject"], resolvedObj.assetsFile);
+                        if (rootObj is GameObject prefabGo)
+                        {
+                            return prefabGo;
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return null;
+        }
+
+        var found = assetListTabActive
+            ? (TryFromAssetList() ?? TryFromSceneHierarchy())
+            : (TryFromSceneHierarchy() ?? TryFromAssetList());
+
+        if (found == null)
+        {
+            selectionError = "No GameObject or Prefab is currently selected.\n\nSelect a GameObject node in Scene Hierarchy or a GameObject/Prefab entry in Asset List first.";
+        }
+
+        return found;
+    }
+
+    private static void TryCleanupStagingDirectory(string? stagingDir)
+    {
+        if (string.IsNullOrWhiteSpace(stagingDir))
+        {
+            return;
+        }
+
+        try
+        {
+            if (Directory.Exists(stagingDir))
+            {
+                Directory.Delete(stagingDir, recursive: true);
+            }
+        }
+        catch
+        {
+        }
     }
 
     private PreparedSceneExportData PrepareSelectedScenesForExport(
@@ -695,7 +1092,7 @@ public partial class MainWindow
         };
     }
 
-    private async Task CompleteUnityProjectExportUiAsync(UnityProjectExportResult? result, string? exportFolder)
+    private async Task CompleteUnityProjectExportUiAsync(UnityProjectExportResult? result, string? exportFolder, string label = "Unity Project")
     {
         ViewModel.LoadingProgress = 100;
         if (result != null && result.Success)
@@ -709,15 +1106,15 @@ public partial class MainWindow
             }
             else
             {
-                await ViewModel.DialogService.ShowMessageAsync("Unity Project Export Complete", result.SummaryMessage);
+                await ViewModel.DialogService.ShowMessageAsync($"{label} Export Complete", result.SummaryMessage);
             }
         }
         else
         {
-            var errorMsg = result?.ErrorMessage ?? "Unity project export failed.";
+            var errorMsg = result?.ErrorMessage ?? $"{label} export failed.";
             ExportState.Fail(errorMsg, null);
-            StatusStripUpdate($"Unity project export failed: {errorMsg}");
-            await ViewModel.DialogService.ShowErrorAsync("Unity Project Export Failed", errorMsg);
+            StatusStripUpdate($"{label} export failed: {errorMsg}");
+            await ViewModel.DialogService.ShowErrorAsync($"{label} Export Failed", errorMsg);
         }
     }
 
@@ -1963,6 +2360,21 @@ public partial class MainWindow
             fileTypeFilters: filters));
 
         return result;
+    }
+
+    private async Task<string?> PickSaveUnityPackageDialogAsync(string title, string suggestedFileName)
+    {
+        var filters = new[]
+        {
+            new FileTypeFilterSpec("Unity Package (*.unitypackage)", "*.unitypackage")
+        };
+
+        return await ViewModel.DialogService.PickSaveFileAsync(new SaveFilePickerRequest(
+            title: title,
+            suggestedFileName: suggestedFileName,
+            defaultExtension: "unitypackage",
+            suggestedStartDirectory: GetSuggestedExportStartDirectory(),
+            fileTypeFilters: filters));
     }
 
     private string? GetSuggestedExportStartDirectory()
