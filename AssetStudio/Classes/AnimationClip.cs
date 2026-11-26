@@ -950,6 +950,7 @@ namespace AssetStudio
         public byte isPPtrCurve;
         public byte isIntCurve;
         public byte isSerializeReferenceCurve;
+        public ushort metaData;
 
         public GenericBinding() { }
 
@@ -976,6 +977,10 @@ namespace AssetStudio
             if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2)) //2022.2 and up
             {
                 isSerializeReferenceCurve = reader.ReadByte();
+            }
+            if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 5)) //6000.5 and up
+            {
+                metaData = reader.ReadUInt16();
             }
             reader.AlignStream();
         }

@@ -567,7 +567,14 @@ namespace AssetStudio
 
                     if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 3)) //6000.3 and up
                     {
-                        var m_EntityIdValues = reader.ReadInt32Array();
+                        if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 5)) //6000.5 and up: EntityId is 64-bit
+                        {
+                            var m_EntityIdValues = reader.ReadInt64Array();
+                        }
+                        else
+                        {
+                            var m_EntityIdValues = reader.ReadInt32Array();
+                        }
                     }
                 }
             }

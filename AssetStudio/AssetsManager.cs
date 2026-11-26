@@ -89,6 +89,8 @@ namespace AssetStudio
         public Func<int, int, bool>? ConfirmExternalCascadeCallback { get; set; }
         public int LastSkippedExternalDependencyCount { get; private set; }
         public DecompressedBundleCache? DecompressionCache { get; set; }
+        /// <summary>TypeTrees loaded from extracted TypeTree data archives (Unity 6000.5+ ExtractTypeTree builds).</summary>
+        public TypeTreeStore TypeTreeStore { get; } = new TypeTreeStore();
 
         private readonly object unityVersionInferenceLock = new object();
         private string inferredUnityVersion = "";
@@ -970,6 +972,14 @@ namespace AssetStudio
                     allowParallelDecompression: true,
                     lowMemoryThresholdOverride: null,
                     serializedFilesOnly: serializedFilesOnly);
+                if (TypeTreeStore.IsTypeTreeArchive(bundleFile))
+                {
+                    int added = TypeTreeStore.AddArchive(bundleFile, reader.FileName);
+                    handedOffCount = bundleFile.fileList.Length;
+                    bundleFile.Dispose();
+                    Logger.Info($"Loaded {added} TypeTree(s) from TypeTree data archive {reader.FileName}");
+                    return;
+                }
                 if (bundleFile.BlocksStream != null)
                 {
                     if (context.IsolateStreams)
@@ -2489,6 +2499,7 @@ namespace AssetStudio
                     }
                 }
 
+                ResolveExternalTypeTrees(context.LoadedAssetsFiles);
                 var unprocessedFiles = ClaimUnprocessedFiles(context.LoadedAssetsFiles.ToArray());
                 foreach (var assetsFile in unprocessedFiles)
                 {
@@ -3055,6 +3066,31 @@ namespace AssetStudio
             }
         }
 
+        // Attaches extracted TypeTrees to every loaded file (the archive can be opened before or after the bundles)
+        // and warns about the files being read that still miss some.
+        private void ResolveExternalTypeTrees(IEnumerable<SerializedFile> filesBeingRead)
+        {
+            SerializedFile[] loaded;
+            lock (loadLock)
+            {
+                loaded = assetsFileList.ToArray();
+            }
+            foreach (var file in loaded)
+            {
+                if (file.ExternalTypeTreeCount > 0)
+                {
+                    file.ResolveExternalTypeTrees(TypeTreeStore);
+                }
+            }
+            foreach (var file in filesBeingRead)
+            {
+                if (file.ExternalTypeTreeCount > 0)
+                {
+                    Logger.Warning($"{file.fileName}: {file.ExternalTypeTreeCount} type(s) keep their TypeTree in a separate TypeTree data archive (Unity ExtractTypeTree build). Open that archive together with the bundles to read script fields.");
+                }
+            }
+        }
+
         private List<SerializedFile> ClaimUnprocessedFiles(IEnumerable<SerializedFile> files)
         {
             var result = new List<SerializedFile>();
@@ -3079,6 +3115,7 @@ namespace AssetStudio
         {
             Logger.Info("Read assets...");
 
+            ResolveExternalTypeTrees(context.LoadedAssetsFiles);
             var filesForRead = context.LoadedAssetsFiles.ToArray();
             var progressCount = filesForRead.Sum(x => x.m_Objects.Count);
             int progressValue = 0;

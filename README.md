@@ -15,7 +15,7 @@ For a plain-language overview of what is currently supported, known limits, and 
 ## Features
 
 * Supported Unity versions:
-  * 3.4 – 6000.4 (Mono and IL2CPP)
+  * 3.4 – 6000.5 (Mono and IL2CPP)
 * Supported asset types:
   * **Texture2D**: convert to `png`, `tga`, `jpeg`, `bmp`, with preview and color channel toggles.
   * **Sprite**: crop `Texture2D` / `SpriteAtlas` to `png`, `tga`, `jpeg`, `bmp`.

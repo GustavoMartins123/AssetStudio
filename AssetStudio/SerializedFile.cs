@@ -34,6 +34,8 @@ namespace AssetStudio
         public List<FileIdentifier> m_Externals;
         public List<SerializedType>? m_RefTypes;
         public string? userInformation;
+        /// <summary>Types whose TypeTree was extracted to a separate TypeTree data archive and is not resolved yet.</summary>
+        public int ExternalTypeTreeCount;
 
         public SerializedFile(FileReader reader, AssetsManager assetsManager)
         {
@@ -262,10 +264,15 @@ namespace AssetStudio
 
         private void ValidateCount(int count, int minBytesPerItem, string name)
         {
+            ValidateCount(reader, count, minBytesPerItem, name, fileName);
+        }
+
+        private static void ValidateCount(EndianBinaryReader reader, int count, int minBytesPerItem, string name, string sourceName)
+        {
             var remaining = reader.BaseStream.Length - reader.BaseStream.Position;
             if (count < 0 || (long)count * minBytesPerItem > remaining)
             {
-                throw new InvalidDataException($"Invalid {name} count {count} in {fileName}: only {remaining} bytes remain.");
+                throw new InvalidDataException($"Invalid {name} count {count} in {sourceName}: only {remaining} bytes remain.");
             }
         }
 
@@ -302,7 +309,16 @@ namespace AssetStudio
             {
                 type.m_Type = new TypeTree();
                 type.m_Type.m_Nodes = new List<TypeTreeNode>();
-                if (header.m_Version >= SerializedFileFormatVersion.Unknown_12 || header.m_Version == SerializedFileFormatVersion.Unknown_10)
+                if (header.m_Version >= SerializedFileFormatVersion.ExtractableTypeTree)
+                {
+                    type.m_TypeTreeHash = reader.ReadBytes(16);
+                    if (!TypeTreeDataBlockRead(type.m_Type))
+                    {
+                        type.m_Type = null;
+                        ExternalTypeTreeCount++;
+                    }
+                }
+                else if (header.m_Version >= SerializedFileFormatVersion.Unknown_12 || header.m_Version == SerializedFileFormatVersion.Unknown_10)
                 {
                     TypeTreeBlobRead(type.m_Type);
                 }
@@ -366,12 +382,72 @@ namespace AssetStudio
             }
         }
 
+        // Format 23 stores each TypeTree as a block: u32 size, then 'tthm' magic, data version, node count,
+        // string buffer size, the 32-byte nodes and the string buffer (the same layout an extracted TypeTree file uses).
+        private const uint TypeTreeDataMagic = 0x7474686D;
+        private const int TypeTreeDataHeaderSize = 16;
+        private const int TypeTreeDataNodeSize = 32;
+
+        // Returns false for an empty block: the build moved this TypeTree to a separate TypeTree data archive
+        // and only its hash (m_TypeTreeHash) stays in the file.
+        private bool TypeTreeDataBlockRead(TypeTree m_Type)
+        {
+            uint blockSize = reader.ReadUInt32();
+            if (blockSize == 0)
+            {
+                return false;
+            }
+            ReadTypeTreeData(reader, blockSize, m_Type, fileName);
+            return true;
+        }
+
+        /// <summary>
+        /// Reads one 'tthm' TypeTree data block of <paramref name="blockSize"/> bytes at the reader position.
+        /// Used for TypeTrees inside format 23 files and for the entries of an extracted TypeTree data archive.
+        /// </summary>
+        internal static void ReadTypeTreeData(EndianBinaryReader reader, long blockSize, TypeTree m_Type, string sourceName)
+        {
+            long blockStart = reader.Position;
+            long remaining = reader.BaseStream.Length - blockStart;
+            if (blockSize < TypeTreeDataHeaderSize || blockSize > remaining)
+            {
+                throw new InvalidDataException($"Invalid TypeTree data block size {blockSize} in {sourceName}: only {remaining} bytes remain.");
+            }
+            uint magic = reader.ReadUInt32();
+            if (magic != TypeTreeDataMagic)
+            {
+                throw new InvalidDataException($"Invalid TypeTree data block in {sourceName}: expected 'tthm' header, found 0x{magic:X8}.");
+            }
+            uint dataVersion = reader.ReadUInt32();
+            if (dataVersion != (uint)SerializedFileFormatVersion.ExtractableTypeTree)
+            {
+                throw new InvalidDataException($"Unsupported TypeTree data version {dataVersion} in {sourceName} (supported: {(uint)SerializedFileFormatVersion.ExtractableTypeTree}).");
+            }
+            int numberOfNodes = reader.ReadInt32();
+            int stringBufferSize = reader.ReadInt32();
+            if (numberOfNodes < 0 || stringBufferSize < 0
+                || TypeTreeDataHeaderSize + (long)numberOfNodes * TypeTreeDataNodeSize + stringBufferSize != blockSize)
+            {
+                throw new InvalidDataException($"Invalid TypeTree data block in {sourceName}: {numberOfNodes} nodes and {stringBufferSize} string bytes do not fill {blockSize} bytes.");
+            }
+            ReadTypeTreeBlobNodes(reader, m_Type, numberOfNodes, stringBufferSize, hasRefTypeHash: true, sourceName);
+            if (reader.Position != blockStart + blockSize)
+            {
+                throw new InvalidDataException($"TypeTree data block in {sourceName} ended at {reader.Position}, expected {blockStart + blockSize}.");
+            }
+        }
+
         private void TypeTreeBlobRead(TypeTree m_Type)
         {
             int numberOfNodes = reader.ReadInt32();
             int stringBufferSize = reader.ReadInt32();
-            ValidateCount(numberOfNodes, 24, "TypeTree node");
-            ValidateCount(stringBufferSize, 1, "TypeTree string buffer byte");
+            ReadTypeTreeBlobNodes(reader, m_Type, numberOfNodes, stringBufferSize, header.m_Version >= SerializedFileFormatVersion.TypeTreeNodeWithTypeFlags, fileName);
+        }
+
+        private static void ReadTypeTreeBlobNodes(EndianBinaryReader reader, TypeTree m_Type, int numberOfNodes, int stringBufferSize, bool hasRefTypeHash, string sourceName)
+        {
+            ValidateCount(reader, numberOfNodes, 24, "TypeTree node", sourceName);
+            ValidateCount(reader, stringBufferSize, 1, "TypeTree string buffer byte", sourceName);
             m_Type.m_Nodes.EnsureCapacity(m_Type.m_Nodes.Count + numberOfNodes);
             for (int i = 0; i < numberOfNodes; i++)
             {
@@ -385,7 +461,7 @@ namespace AssetStudio
                 typeTreeNode.m_ByteSize = reader.ReadInt32();
                 typeTreeNode.m_Index = reader.ReadInt32();
                 typeTreeNode.m_MetaFlag = reader.ReadInt32();
-                if (header.m_Version >= SerializedFileFormatVersion.TypeTreeNodeWithTypeFlags)
+                if (hasRefTypeHash)
                 {
                     typeTreeNode.m_RefTypeHash = reader.ReadUInt64();
                 }
@@ -419,6 +495,43 @@ namespace AssetStudio
                 }
                 return offset.ToString();
             }
+        }
+
+        /// <summary>
+        /// Attaches TypeTrees that the build extracted to a separate archive, matched by m_TypeTreeHash.
+        /// Returns how many types are still without their TypeTree.
+        /// </summary>
+        public int ResolveExternalTypeTrees(TypeTreeStore store)
+        {
+            if (ExternalTypeTreeCount == 0 || store.Count == 0)
+            {
+                return ExternalTypeTreeCount;
+            }
+            int missing = 0;
+            foreach (var list in new[] { m_Types, m_RefTypes })
+            {
+                if (list == null)
+                {
+                    continue;
+                }
+                foreach (var type in list)
+                {
+                    if (type.m_Type != null || type.m_TypeTreeHash == null)
+                    {
+                        continue;
+                    }
+                    if (store.TryGet(type.m_TypeTreeHash, out var tree))
+                    {
+                        type.m_Type = tree;
+                    }
+                    else
+                    {
+                        missing++;
+                    }
+                }
+            }
+            ExternalTypeTreeCount = missing;
+            return missing;
         }
 
         public void AddObject(Object obj)

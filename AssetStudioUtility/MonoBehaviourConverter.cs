@@ -19,7 +19,26 @@ namespace AssetStudio
                     m_Type.m_Nodes.AddRange(typeDefinitionConverter.ConvertToTypeTreeNodes());
                 }
             }
+            var version = m_MonoBehaviour.version;
+            var referencedTrees = new System.Collections.Concurrent.ConcurrentDictionary<(string, string, string), TypeTree?>();
+            m_Type.ReferencedTypeResolver = (className, nsName, asmName) => referencedTrees.GetOrAdd(
+                (className, nsName, asmName),
+                key => ConvertReferencedTypeToTypeTree(assemblyLoader, version, key.Item1, key.Item2, key.Item3));
             return m_Type;
+        }
+
+        // TypeTree of a [SerializeReference] class: a root node followed by the serialized fields, as Unity writes it.
+        private static TypeTree? ConvertReferencedTypeToTypeTree(AssemblyLoader assemblyLoader, int[] version, string className, string nsName, string asmName)
+        {
+            var typeDef = assemblyLoader.GetTypeDefinition(asmName, string.IsNullOrEmpty(nsName) ? className : $"{nsName}.{className}");
+            if (typeDef == null)
+            {
+                return null;
+            }
+            var tree = new TypeTree();
+            tree.m_Nodes.Add(new TypeTreeNode(className, "Base", 0, false));
+            tree.m_Nodes.AddRange(new TypeDefinitionConverter(typeDef, new SerializedTypeHelper(version), 1).ConvertToTypeTreeNodes());
+            return tree;
         }
     }
 }

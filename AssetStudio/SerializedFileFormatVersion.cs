@@ -80,8 +80,13 @@ namespace AssetStudio
         /// </summary>
         StoresTypeDependencies = 21,
         /// <summary>
-        /// 2020.1 to x
+        /// 2020.1 to 6000.4
         /// </summary>
-        LargeFilesSupport = 22
+        LargeFilesSupport = 22,
+        /// <summary>
+        /// 6000.5 and up: each type also stores the content hash of its TypeTree, and the TypeTree is a
+        /// self-describing "tthm" block that the build can move out of the file (ContentBuildFlags.ExtractTypeTree).
+        /// </summary>
+        ExtractableTypeTree = 23
     }
 }

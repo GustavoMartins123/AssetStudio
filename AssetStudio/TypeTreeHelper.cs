@@ -99,37 +99,61 @@ namespace AssetStudio
             }
         }
 
+        [ThreadStatic]
+        private static Func<string, string, string, TypeTree?>? currentReferencedTypeResolver;
+
         private static SerializedType? ResolveReferencedType(SerializedFile? assetsFile, string className, string nsName, string asmName)
         {
             var refTypes = assetsFile?.m_RefTypes;
-            if (refTypes == null || string.IsNullOrEmpty(className))
+            if (string.IsNullOrEmpty(className))
             {
                 return null;
             }
 
-            for (int i = 0; i < refTypes.Count; i++)
+            if (refTypes != null)
             {
-                var rt = refTypes[i];
-                if (rt.m_KlassName == className && rt.m_NameSpace == nsName && rt.m_AsmName == asmName)
+                for (int i = 0; i < refTypes.Count; i++)
                 {
-                    return rt;
+                    var rt = refTypes[i];
+                    if (rt.m_KlassName == className && rt.m_NameSpace == nsName && rt.m_AsmName == asmName && rt.m_Type != null)
+                    {
+                        return rt;
+                    }
+                }
+
+                for (int i = 0; i < refTypes.Count; i++)
+                {
+                    var rt = refTypes[i];
+                    if (rt.m_KlassName == className && rt.m_NameSpace == nsName && rt.m_Type != null)
+                    {
+                        return rt;
+                    }
                 }
             }
 
-            for (int i = 0; i < refTypes.Count; i++)
+            // Builds without TypeTrees: the root TypeTree came from the game assemblies, so the referenced class does too.
+            var resolved = currentReferencedTypeResolver?.Invoke(className, nsName, asmName);
+            return resolved == null
+                ? null
+                : new SerializedType { classID = -1, m_Type = resolved, m_KlassName = className, m_NameSpace = nsName, m_AsmName = asmName };
+        }
+
+        private readonly struct ReferencedTypeResolverScope : IDisposable
+        {
+            private readonly Func<string, string, string, TypeTree?>? previous;
+
+            public ReferencedTypeResolverScope(TypeTree m_Type)
             {
-                var rt = refTypes[i];
-                if (rt.m_KlassName == className && rt.m_NameSpace == nsName)
-                {
-                    return rt;
-                }
+                previous = currentReferencedTypeResolver;
+                currentReferencedTypeResolver = m_Type.ReferencedTypeResolver ?? previous;
             }
 
-            return null;
+            public void Dispose() => currentReferencedTypeResolver = previous;
         }
 
         public static string ReadTypeString(TypeTree m_Type, ObjectReader reader)
         {
+            using var resolverScope = new ReferencedTypeResolverScope(m_Type);
             reader.Reset();
             var sb = new StringBuilder();
             var m_Nodes = m_Type.m_Nodes;
@@ -399,6 +423,7 @@ namespace AssetStudio
 
         public static OrderedDictionary ReadType(TypeTree m_Types, ObjectReader reader)
         {
+            using var resolverScope = new ReferencedTypeResolverScope(m_Types);
             reader.Reset();
             var obj = new OrderedDictionary();
             var m_Nodes = m_Types.m_Nodes;

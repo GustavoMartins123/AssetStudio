@@ -53,6 +53,11 @@ namespace AssetStudio
                 m_Height = reader.ReadInt32();
                 m_Depth = reader.ReadInt32();
                 m_MipCount = reader.ReadInt32();
+                bool mipmapLimitLayout = version[0] > 2022 || (version[0] == 2022 && version[1] >= 2); //2022.2 and up
+                if (mipmapLimitLayout)
+                {
+                    var m_MipsStripped = reader.ReadInt32();
+                }
                 m_DataSize = reader.ReadUInt32();
 
                 ResolveTextureFormat();
@@ -76,23 +81,21 @@ namespace AssetStudio
                     m_UsageMode = reader.ReadInt32();
                 }
 
-                if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2)) // 2022.2 and up
+                if (mipmapLimitLayout)
                 {
-                    if (reader.Position + 1 > objectEnd)
+                    // m_IsReadable, m_IgnoreMipmapLimit, align, m_MipmapLimitGroupName
+                    if (reader.Position + 4 > objectEnd)
                     {
                         IsTruncated = true;
-                        Logger.Warning($"Texture2DArray '{m_Name}' (PathID {m_PathID}): truncated mipmap limit flags.");
+                        Logger.Warning($"Texture2DArray '{m_Name}' (PathID {m_PathID}): truncated readable/mipmap limit flags.");
                         return;
                     }
+                    m_IsReadable = reader.ReadBoolean();
                     m_IgnoreMipmapLimit = reader.ReadBoolean();
                     reader.AlignStream();
-                    if (reader.Position + 4 <= objectEnd)
-                    {
-                        m_MipmapLimitGroupName = reader.ReadAlignedString();
-                    }
+                    m_MipmapLimitGroupName = reader.ReadAlignedString();
                 }
-
-                if (reader.Position + 1 <= objectEnd)
+                else if (reader.Position + 1 <= objectEnd)
                 {
                     m_IsReadable = reader.ReadBoolean();
                     reader.AlignStream();

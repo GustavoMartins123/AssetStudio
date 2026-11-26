@@ -7,7 +7,7 @@ This document gives a plain-language overview of what **AssetStudio** supports t
 ## Currently Supported (Available Now)
 
 ### Opening Projects & Managing Large Folders
-- **Unity versions**: Reads standard asset files and AssetBundles from Unity **3.4 through 6000.4** (both Mono and IL2CPP builds).
+- **Unity versions**: Reads standard asset files and AssetBundles from Unity **3.4 through 6000.5** (both Mono and IL2CPP builds). Unity 6000.5 builds made with extracted TypeTrees (`ContentBuildFlags.ExtractTypeTree`) are read together with their TypeTree data archive when it is opened with the bundles.
 - **Project Manager**: Save folders as named projects with remembered settings, icons, and fast reopen caches without modifying or copying the original files.
 - **Safe / Lazy Mode**: Opens very large folders in lightweight batches so memory usage stays low and files are loaded only when previewed or exported.
 - **Automatic dependency lookup**: Resolves linked textures, materials, and models across folders using the configured **Project Root** and Unity Addressables catalogs (`catalog.json` / `catalog.bin`).
