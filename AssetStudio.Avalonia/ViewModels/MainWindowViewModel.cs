@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
 using AssetStudio.Avalonia.Services.ProjectAnalysis;
+using AssetStudio.Avalonia.Services.Scripting;
 
 namespace AssetStudio.Avalonia.ViewModels
 {
@@ -29,6 +30,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? ExportSelectedObjectsMergeWithAnimationClipAsync { get; set; }
         public Func<Task>? ExportSceneGlbAsync { get; set; }
         public Func<Task>? ExportSelectedSubtreeGlbAsync { get; set; }
+        public Func<Task>? ExportSceneToUnityProjectAsync { get; set; }
 
         public Func<Task>? ExportAllAssetsAsync { get; set; }
         public Func<Task>? ExportSelectedAssetsAsync { get; set; }
@@ -84,6 +86,9 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? SaveScriptCodeAsync { get; set; }
         public Func<Task>? ExportGhidraScriptAsync { get; set; }
         public Func<Task>? SelectScriptsFolderAsync { get; set; }
+        public Func<Task>? ExportCSharpProjectAsync { get; set; }
+        public Func<AssemblyTypeEntry?, Task>? SelectAssemblyExplorerTypeAsync { get; set; }
+        public Func<ScriptUsageItem?, Task>? NavigateToScriptUsageAsync { get; set; }
 
         public Func<Task>? VideoPlayPauseAsync { get; set; }
         public Func<Task>? VideoStopAsync { get; set; }
@@ -120,6 +125,7 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportSelectedObjectsMergeWithAnimationClipAsync = null;
             ExportSceneGlbAsync = null;
             ExportSelectedSubtreeGlbAsync = null;
+            ExportSceneToUnityProjectAsync = null;
 
             ExportAllAssetsAsync = null;
             ExportSelectedAssetsAsync = null;
@@ -175,6 +181,9 @@ namespace AssetStudio.Avalonia.ViewModels
             SaveScriptCodeAsync = null;
             ExportGhidraScriptAsync = null;
             SelectScriptsFolderAsync = null;
+            ExportCSharpProjectAsync = null;
+            SelectAssemblyExplorerTypeAsync = null;
+            NavigateToScriptUsageAsync = null;
 
             VideoPlayPauseAsync = null;
             VideoStopAsync = null;
@@ -272,6 +281,7 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportSelectedObjectsMergeWithAnimationClipCommand = new AsyncRelayCommand(ExecuteExportSelectedObjectsMergeWithAnimationClipAsync, onException: HandleCommandException);
             ExportSceneGlbCommand = new AsyncRelayCommand(ExecuteExportSceneGlbAsync, onException: HandleCommandException);
             ExportSelectedSubtreeGlbCommand = new AsyncRelayCommand(ExecuteExportSelectedSubtreeGlbAsync, onException: HandleCommandException);
+            ExportSceneToUnityProjectCommand = new AsyncRelayCommand(ExecuteExportSceneToUnityProjectAsync, onException: HandleCommandException);
 
             ExportAllAssetsCommand = new AsyncRelayCommand(ExecuteExportAllAssetsAsync, onException: HandleCommandException);
             ExportSelectedAssetsCommand = new AsyncRelayCommand(ExecuteExportSelectedAssetsAsync, onException: HandleCommandException);
@@ -377,6 +387,21 @@ namespace AssetStudio.Avalonia.ViewModels
                 ExecuteSelectScriptsFolderAsync,
                 canExecute: () => !_disposed,
                 onException: HandleCommandException);
+            ExportCSharpProjectCommand = new AsyncRelayCommand(
+                ExecuteExportCSharpProjectAsync,
+                canExecute: () => !_disposed,
+                onException: HandleCommandException);
+            ToggleAssemblyExplorerCommand = new RelayCommand(
+                ExecuteToggleAssemblyExplorer,
+                canExecute: () => !_disposed);
+            SelectAssemblyExplorerTypeCommand = new AsyncRelayCommand<AssemblyTypeEntry>(
+                ExecuteSelectAssemblyExplorerTypeAsync,
+                canExecute: entry => !_disposed && entry != null,
+                onException: HandleCommandException);
+            NavigateToScriptUsageCommand = new AsyncRelayCommand<ScriptUsageItem>(
+                ExecuteNavigateToScriptUsageAsync,
+                canExecute: usage => !_disposed && usage?.IsNavigable == true,
+                onException: HandleCommandException);
 
             VideoPlayPauseCommand = new AsyncRelayCommand(ExecuteVideoPlayPauseAsync, onException: HandleCommandException);
             VideoStopCommand = new AsyncRelayCommand(ExecuteVideoStopAsync, onException: HandleCommandException);
@@ -436,6 +461,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand ExportSelectedObjectsMergeWithAnimationClipCommand { get; }
         public AsyncRelayCommand ExportSceneGlbCommand { get; }
         public AsyncRelayCommand ExportSelectedSubtreeGlbCommand { get; }
+        public AsyncRelayCommand ExportSceneToUnityProjectCommand { get; }
 
         public AsyncRelayCommand ExportAllAssetsCommand { get; }
         public AsyncRelayCommand ExportSelectedAssetsCommand { get; }
@@ -502,6 +528,10 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand SaveScriptCodeCommand { get; }
         public AsyncRelayCommand ExportGhidraScriptCommand { get; }
         public AsyncRelayCommand SelectScriptsFolderCommand { get; }
+        public AsyncRelayCommand ExportCSharpProjectCommand { get; }
+        public RelayCommand ToggleAssemblyExplorerCommand { get; }
+        public AsyncRelayCommand<AssemblyTypeEntry> SelectAssemblyExplorerTypeCommand { get; }
+        public AsyncRelayCommand<ScriptUsageItem> NavigateToScriptUsageCommand { get; }
 
         public AsyncRelayCommand VideoPlayPauseCommand { get; }
         public AsyncRelayCommand VideoStopCommand { get; }
@@ -975,6 +1005,9 @@ namespace AssetStudio.Avalonia.ViewModels
 
         private Task ExecuteExportSelectedSubtreeGlbAsync() =>
             InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportSelectedSubtreeGlbAsync, "Export Subtree to .glb (Instanced)", "subtree.glb");
+
+        private Task ExecuteExportSceneToUnityProjectAsync() =>
+            InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportSceneToUnityProjectAsync, "Exporting scene to Unity project...");
 
         private Task ExecuteExportAllAssetsAsync() =>
             InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportAllAssetsAsync, "Exporting all assets...");
@@ -1551,6 +1584,69 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
+        private async Task ExecuteExportCSharpProjectAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.ExportCSharpProjectAsync != null)
+            {
+                await CommandHandlers.ExportCSharpProjectAsync();
+                return;
+            }
+
+            var folder = await _dialogService.PickOpenFolderAsync(new FolderPickerRequest("Select Output Folder for C# Script Project (.sln/.csproj)"));
+            if (!string.IsNullOrWhiteSpace(folder))
+            {
+                StatusText = $"Ready to export C# script project to: {folder}";
+            }
+        }
+
+        private void ExecuteToggleAssemblyExplorer()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            PreviewSession.ToggleAssemblyExplorer();
+        }
+
+        private async Task ExecuteSelectAssemblyExplorerTypeAsync(AssemblyTypeEntry? entry)
+        {
+            if (_disposed || entry == null)
+            {
+                return;
+            }
+
+            if (CommandHandlers.SelectAssemblyExplorerTypeAsync != null)
+            {
+                await CommandHandlers.SelectAssemblyExplorerTypeAsync(entry);
+                return;
+            }
+
+            PreviewSession.SelectedAssemblyType = entry;
+            StatusText = $"Selected script type: {entry.FullName}";
+        }
+
+        private async Task ExecuteNavigateToScriptUsageAsync(ScriptUsageItem? usage)
+        {
+            if (_disposed || usage == null || !usage.IsNavigable)
+            {
+                return;
+            }
+
+            if (CommandHandlers.NavigateToScriptUsageAsync != null)
+            {
+                await CommandHandlers.NavigateToScriptUsageAsync(usage);
+                return;
+            }
+
+            await ExecuteNavigateToReferencedAssetAsync(usage.ToAssetReferenceItem());
+        }
+
         private async Task ExecuteVideoPlayPauseAsync()
         {
             if (CommandHandlers.VideoPlayPauseAsync != null)
@@ -1778,6 +1874,10 @@ namespace AssetStudio.Avalonia.ViewModels
             SaveScriptCodeCommand.NotifyCanExecuteChanged();
             ExportGhidraScriptCommand.NotifyCanExecuteChanged();
             SelectScriptsFolderCommand.NotifyCanExecuteChanged();
+            ExportCSharpProjectCommand.NotifyCanExecuteChanged();
+            ToggleAssemblyExplorerCommand.NotifyCanExecuteChanged();
+            SelectAssemblyExplorerTypeCommand.NotifyCanExecuteChanged();
+            NavigateToScriptUsageCommand.NotifyCanExecuteChanged();
         }
 
         private sealed class NoOpDialogService : IDialogService

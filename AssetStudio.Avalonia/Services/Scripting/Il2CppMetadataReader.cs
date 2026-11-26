@@ -219,6 +219,67 @@ public sealed class Il2CppMetadataReader
             : outcome;
     }
 
+    internal MetadataCatalogResult? TryReadCatalog(
+        string metadataPath,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(metadataPath) || !File.Exists(metadataPath))
+        {
+            return null;
+        }
+
+        var (index, _) = GetOrBuildIndex(metadataPath, cancellationToken);
+        if (index == null || index.Images.Length == 0)
+        {
+            return null;
+        }
+
+        var imagesOut = new List<MetadataCatalogImage>(index.Images.Length);
+        var totalAdded = 0;
+
+        for (var i = 0; i < index.Images.Length; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var img = index.Images[i];
+            if (string.IsNullOrWhiteSpace(img.Name))
+            {
+                continue;
+            }
+
+            var list = new List<MetadataCatalogType>(Math.Min(Math.Max(img.TypeCount, 0), 1024));
+            var start = Math.Max(0, img.TypeStart);
+            var end = Math.Min(index.Types.Length, start + Math.Max(0, img.TypeCount));
+            for (var t = start; t < end; t++)
+            {
+                var summary = index.Types[t];
+                if (summary.DeclaringTypeIndex >= 0)
+                {
+                    continue; // skip nested types
+                }
+
+                if (string.IsNullOrWhiteSpace(summary.Name)
+                    || AssemblyExplorerService.IsCompilerGeneratedTopLevelTypeName(summary.Name))
+                {
+                    continue;
+                }
+
+                list.Add(new MetadataCatalogType(
+                    summary.Namespace ?? string.Empty,
+                    summary.Name,
+                    AssemblyTypeKind.Class,
+                    0,
+                    0));
+                totalAdded++;
+            }
+
+            imagesOut.Add(new MetadataCatalogImage(img.Name, list));
+        }
+
+        return imagesOut.Count > 0
+            ? new MetadataCatalogResult(index.Version, imagesOut, totalAdded)
+            : null;
+    }
+
     public ScriptDecompilationResult? TryExtractType(
         string metadataPath,
         ScriptLookupRequest request,

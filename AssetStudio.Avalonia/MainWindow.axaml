@@ -5,6 +5,7 @@
         xmlns:local="using:AssetStudio.Avalonia"
         xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
         xmlns:svc="using:AssetStudio.Avalonia.Services"
+        xmlns:scripting="using:AssetStudio.Avalonia.Services.Scripting"
         xmlns:ffmpeg="using:AssetStudio.Avalonia.Controls"
         mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
         x:Class="AssetStudio.Avalonia.MainWindow"
@@ -164,6 +165,11 @@
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
+                <MenuItem x:Name="exportSceneUnityProjectMenuItem" Header="Export Scene to Unity Project (.unity)..." Command="{Binding ExportSceneToUnityProjectCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
             <MenuItem Header="_Export">
                 <MenuItem Header="All assets" Command="{Binding ExportAllAssetsCommand}">
@@ -217,6 +223,14 @@
                     <MenuItem Header="All assets" Command="{Binding ExportAllAssetsXmlCommand}" />
                     <MenuItem Header="Selected assets" Command="{Binding ExportSelectedAssetsXmlCommand}" />
                     <MenuItem Header="Filtered assets" Command="{Binding ExportFilteredAssetsXmlCommand}" />
+                </MenuItem>
+                <Separator />
+                <MenuItem x:Name="exportCSharpProjectMenuItem"
+                          Header="Export C# Script Project (.sln/.csproj)..."
+                          Command="{Binding ExportCSharpProjectCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
+                    </MenuItem.Icon>
                 </MenuItem>
                 <Separator />
                 <MenuItem Header="Error log" Command="{Binding ExportErrorLogCommand}">
@@ -1385,14 +1399,14 @@
                             </Grid>
                         </Grid>
                     </Border>
-                    <!-- Integrated Script Viewer (Mono / IL2CPP / TypeTree / Ghidra Export) -->
+                    <!-- Integrated Script Viewer (Mono / IL2CPP / TypeTree / Assembly Explorer / Ghidra & C# Project Export) -->
                     <Border x:Name="ScriptTabContent"
                             Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}"
                             IsVisible="{Binding PreviewSession.IsScriptTabActive}">
                         <Border.Resources>
                             <local:BoolToTextWrappingConverter x:Key="ScriptWordWrapConverter" />
                         </Border.Resources>
-                        <Grid RowDefinitions="Auto,Auto,Auto,*" Margin="8" RowSpacing="8">
+                        <Grid RowDefinitions="Auto,Auto,*" Margin="8" RowSpacing="8">
                             <Border Grid.Row="0" Classes="inspector-card">
                                 <StackPanel Spacing="6">
                                     <StackPanel Spacing="3">
@@ -1421,6 +1435,12 @@
                                                    TextTrimming="CharacterEllipsis" />
                                     </StackPanel>
                                     <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                        <Button x:Name="ScriptAssembliesToggleButton"
+                                                Classes="toolbar-btn"
+                                                Content="Assemblies"
+                                                Margin="0,0,4,4"
+                                                Command="{Binding ToggleAssemblyExplorerCommand}"
+                                                ToolTip.Tip="Toggle the Assembly / Type Explorer panel" />
                                         <Button x:Name="ScriptCopyButton"
                                                 Classes="toolbar-btn"
                                                 Content="Copy C#"
@@ -1433,6 +1453,12 @@
                                                 Margin="0,0,4,4"
                                                 Command="{Binding SaveScriptCodeCommand}"
                                                 ToolTip.Tip="Save the reconstructed C# class to a .cs file" />
+                                        <Button x:Name="ScriptExportCSharpProjectButton"
+                                                Classes="toolbar-btn"
+                                                Content="Export C# Project..."
+                                                Margin="0,0,4,4"
+                                                Command="{Binding ExportCSharpProjectCommand}"
+                                                ToolTip.Tip="Export a coherent C# solution (.sln/.csproj) with references and Unity .meta files" />
                                         <Button x:Name="ScriptExportGhidraButton"
                                                 Classes="toolbar-btn"
                                                 Content="Export Ghidra..."
@@ -1459,42 +1485,203 @@
                                            TextWrapping="Wrap" />
                             </Border>
 
-                            <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="8">
-                                <TextBox x:Name="ScriptSearchTextBox"
-                                         Grid.Column="0"
-                                         PlaceholderText="Search C# code (fields, methods, types, RVAs)..."
-                                         Text="{Binding PreviewSession.ScriptSearchText, Mode=TwoWay}" />
-                                <CheckBox x:Name="ScriptFilterLinesCheckBox"
-                                          Grid.Column="1"
-                                          Content="Filter lines"
-                                          VerticalAlignment="Center"
-                                          IsChecked="{Binding PreviewSession.IsScriptSearchFilterOnly, Mode=TwoWay}" />
-                                <CheckBox x:Name="ScriptWordWrapCheckBox"
-                                          Grid.Column="2"
-                                          Content="Wrap"
-                                          VerticalAlignment="Center"
-                                          IsChecked="{Binding PreviewSession.IsScriptWordWrapEnabled, Mode=TwoWay}"
-                                          ToolTip.Tip="Wrap long lines in the C# script viewer" />
-                                <Border Grid.Column="3"
-                                        Classes="badge-chip"
-                                        VerticalAlignment="Center"
-                                        IsVisible="{Binding PreviewSession.HasScriptSearchMatchSummary}">
-                                    <TextBlock x:Name="ScriptSearchMatchSummaryText"
-                                               Text="{Binding PreviewSession.ScriptSearchMatchSummary}"
-                                               FontSize="11" />
-                                </Border>
-                            </Grid>
+                            <Grid Grid.Row="2" ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                                <!-- Collapsible Assembly / Type Explorer (SCRIPT-01) -->
+                                <Border x:Name="AssemblyExplorerPanel"
+                                        Grid.Column="0"
+                                        Width="260"
+                                        Classes="inspector-card"
+                                        IsVisible="{Binding PreviewSession.IsAssemblyExplorerVisible}">
+                                    <Grid RowDefinitions="Auto,Auto,Auto,Auto,*" RowSpacing="6">
+                                        <StackPanel Grid.Row="0" Spacing="2">
+                                            <TextBlock Text="Assembly Explorer"
+                                                       FontWeight="SemiBold"
+                                                       FontSize="12" />
+                                            <TextBlock x:Name="AssemblyExplorerStatusText"
+                                                       Text="{Binding PreviewSession.AssemblyExplorerStatusText}"
+                                                       FontSize="10"
+                                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                       TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
 
-                            <TextBox x:Name="ScriptCodeTextBox"
-                                     Grid.Row="3"
-                                     AcceptsReturn="True"
-                                     TextWrapping="{Binding PreviewSession.IsScriptWordWrapEnabled, Converter={StaticResource ScriptWordWrapConverter}}"
-                                     IsReadOnly="True"
-                                     FontFamily="{StaticResource AppMonoFontFamily}"
-                                     FontSize="12"
-                                     ScrollViewer.HorizontalScrollBarVisibility="Auto"
-                                     ScrollViewer.VerticalScrollBarVisibility="Auto"
-                                     Text="{Binding PreviewSession.ScriptSourceCode, Mode=OneWay}" />
+                                        <ComboBox x:Name="AssemblyExplorerComboBox"
+                                                  Grid.Row="1"
+                                                  HorizontalAlignment="Stretch"
+                                                  MaxDropDownHeight="280"
+                                                  ItemsSource="{Binding PreviewSession.AssemblyFilterOptions}"
+                                                  SelectedItem="{Binding PreviewSession.SelectedAssemblyFilterOption, Mode=TwoWay}">
+                                            <ComboBox.ItemTemplate>
+                                                <DataTemplate x:DataType="vm:AssemblyExplorerFilterOption" x:CompileBindings="True">
+                                                    <TextBlock Text="{Binding DisplayLabel, Mode=OneTime}"
+                                                               FontSize="11"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                </DataTemplate>
+                                            </ComboBox.ItemTemplate>
+                                        </ComboBox>
+
+                                        <TextBox x:Name="AssemblyExplorerSearchTextBox"
+                                                 Grid.Row="2"
+                                                 PlaceholderText="Filter types, namespaces..."
+                                                 Text="{Binding PreviewSession.AssemblyExplorerSearchText, Mode=TwoWay}" />
+
+                                        <Grid Grid.Row="3" ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                                            <CheckBox x:Name="AssemblyExplorerGameOnlyCheckBox"
+                                                      Grid.Column="0"
+                                                      Content="Game only"
+                                                      FontSize="11"
+                                                      VerticalAlignment="Center"
+                                                      IsChecked="{Binding PreviewSession.ShowGameAssembliesOnly, Mode=TwoWay}" />
+                                            <Border Grid.Column="1"
+                                                    Classes="badge-chip"
+                                                    VerticalAlignment="Center"
+                                                    IsVisible="{Binding PreviewSession.HasAssemblyExplorerFilterSummary}">
+                                                <TextBlock Text="{Binding PreviewSession.AssemblyExplorerFilterSummary}"
+                                                           FontSize="10" />
+                                            </Border>
+                                        </Grid>
+
+                                        <Border Grid.Row="4"
+                                                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                BorderThickness="1"
+                                                CornerRadius="4">
+                                            <ListBox x:Name="AssemblyExplorerTypesListBox"
+                                                     Background="Transparent"
+                                                     BorderThickness="0"
+                                                     ItemsSource="{Binding PreviewSession.FilteredAssemblyTypes}"
+                                                     SelectedItem="{Binding PreviewSession.SelectedAssemblyType, Mode=TwoWay}">
+                                                <ListBox.ItemsPanel>
+                                                    <ItemsPanelTemplate>
+                                                        <VirtualizingStackPanel />
+                                                    </ItemsPanelTemplate>
+                                                </ListBox.ItemsPanel>
+                                                <ListBox.ItemTemplate>
+                                                    <DataTemplate x:DataType="scripting:AssemblyTypeEntry" x:CompileBindings="True">
+                                                        <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6" Margin="2,1">
+                                                            <Border Grid.Column="0"
+                                                                    Classes="badge-chip"
+                                                                    MinWidth="24"
+                                                                    Padding="4,1"
+                                                                    VerticalAlignment="Center">
+                                                                <TextBlock Text="{Binding KindBadge, Mode=OneTime}"
+                                                                           FontSize="9"
+                                                                           FontWeight="SemiBold"
+                                                                           HorizontalAlignment="Center" />
+                                                            </Border>
+                                                            <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
+                                                                <TextBlock Text="{Binding DisplayName, Mode=OneTime}"
+                                                                           FontSize="11"
+                                                                           FontWeight="SemiBold"
+                                                                           TextTrimming="CharacterEllipsis" />
+                                                                <TextBlock Text="{Binding SubtitleLine, Mode=OneTime}"
+                                                                           FontSize="10"
+                                                                           Opacity="0.72"
+                                                                           TextTrimming="CharacterEllipsis" />
+                                                            </StackPanel>
+                                                        </Grid>
+                                                    </DataTemplate>
+                                                </ListBox.ItemTemplate>
+                                            </ListBox>
+                                        </Border>
+                                    </Grid>
+                                </Border>
+
+                                <!-- Main C# Viewer + Bidirectional Used By Panel (SCRIPT-04) -->
+                                <Grid Grid.Column="1" RowDefinitions="Auto,*,Auto" RowSpacing="8">
+                                    <Grid Grid.Row="0" ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="8">
+                                        <TextBox x:Name="ScriptSearchTextBox"
+                                                 Grid.Column="0"
+                                                 PlaceholderText="Search C# code (fields, methods, types, RVAs)..."
+                                                 Text="{Binding PreviewSession.ScriptSearchText, Mode=TwoWay}" />
+                                        <CheckBox x:Name="ScriptFilterLinesCheckBox"
+                                                  Grid.Column="1"
+                                                  Content="Filter lines"
+                                                  VerticalAlignment="Center"
+                                                  IsChecked="{Binding PreviewSession.IsScriptSearchFilterOnly, Mode=TwoWay}" />
+                                        <CheckBox x:Name="ScriptWordWrapCheckBox"
+                                                  Grid.Column="2"
+                                                  Content="Wrap"
+                                                  VerticalAlignment="Center"
+                                                  IsChecked="{Binding PreviewSession.IsScriptWordWrapEnabled, Mode=TwoWay}"
+                                                  ToolTip.Tip="Wrap long lines in the C# script viewer" />
+                                        <Border Grid.Column="3"
+                                                Classes="badge-chip"
+                                                VerticalAlignment="Center"
+                                                IsVisible="{Binding PreviewSession.HasScriptSearchMatchSummary}">
+                                            <TextBlock x:Name="ScriptSearchMatchSummaryText"
+                                                       Text="{Binding PreviewSession.ScriptSearchMatchSummary}"
+                                                       FontSize="11" />
+                                        </Border>
+                                    </Grid>
+
+                                    <TextBox x:Name="ScriptCodeTextBox"
+                                             Grid.Row="1"
+                                             AcceptsReturn="True"
+                                             TextWrapping="{Binding PreviewSession.IsScriptWordWrapEnabled, Converter={StaticResource ScriptWordWrapConverter}}"
+                                             IsReadOnly="True"
+                                             FontFamily="{StaticResource AppMonoFontFamily}"
+                                             FontSize="12"
+                                             ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                             ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                             Text="{Binding PreviewSession.ScriptSourceCode, Mode=OneWay}" />
+
+                                    <Border x:Name="ScriptUsedByPanel"
+                                            Grid.Row="2"
+                                            Classes="inspector-card"
+                                            MaxHeight="175"
+                                            IsVisible="{Binding PreviewSession.IsScriptUsagePanelVisible}">
+                                        <Grid RowDefinitions="Auto,*" RowSpacing="4">
+                                            <TextBlock x:Name="ScriptUsedByHeaderText"
+                                                       Grid.Row="0"
+                                                       Text="{Binding PreviewSession.ScriptUsageHeaderText}"
+                                                       FontWeight="SemiBold"
+                                                       FontSize="11" />
+                                            <Border Grid.Row="1"
+                                                    BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="4">
+                                                <ListBox x:Name="ScriptUsageListBox"
+                                                         Background="Transparent"
+                                                         BorderThickness="0"
+                                                         ItemsSource="{Binding PreviewSession.ScriptUsageItems}"
+                                                         SelectedItem="{Binding PreviewSession.SelectedScriptUsageItem, Mode=TwoWay}">
+                                                    <ListBox.ItemsPanel>
+                                                        <ItemsPanelTemplate>
+                                                            <VirtualizingStackPanel />
+                                                        </ItemsPanelTemplate>
+                                                    </ListBox.ItemsPanel>
+                                                    <ListBox.ItemTemplate>
+                                                        <DataTemplate x:DataType="scripting:ScriptUsageItem" x:CompileBindings="True">
+                                                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8" Margin="2,2">
+                                                                <StackPanel Grid.Column="0" Spacing="1" VerticalAlignment="Center">
+                                                                    <TextBlock Text="{Binding DisplayName, Mode=OneTime}"
+                                                                               FontWeight="SemiBold"
+                                                                               FontSize="11"
+                                                                               TextTrimming="CharacterEllipsis" />
+                                                                    <TextBlock Text="{Binding DetailLine, Mode=OneTime}"
+                                                                               FontSize="10"
+                                                                               Opacity="0.78"
+                                                                               TextTrimming="CharacterEllipsis" />
+                                                                </StackPanel>
+                                                                <Button Grid.Column="1"
+                                                                        Content="Go"
+                                                                        Height="22"
+                                                                        MinWidth="40"
+                                                                        Padding="8,1"
+                                                                        FontSize="11"
+                                                                        VerticalAlignment="Center"
+                                                                        HorizontalContentAlignment="Center"
+                                                                        IsEnabled="{Binding IsNavigable, Mode=OneTime}"
+                                                                        Command="{Binding $parent[local:MainWindow].ViewModel.NavigateToScriptUsageCommand}"
+                                                                        CommandParameter="{Binding}" />
+                                                            </Grid>
+                                                        </DataTemplate>
+                                                    </ListBox.ItemTemplate>
+                                                </ListBox>
+                                            </Border>
+                                        </Grid>
+                                    </Border>
+                                </Grid>
+                            </Grid>
                         </Grid>
                     </Border>
                 </Panel>

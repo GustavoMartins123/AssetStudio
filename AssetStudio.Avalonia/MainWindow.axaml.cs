@@ -408,6 +408,7 @@ public partial class MainWindow : Window
         handlers.ExportSelectedObjectsMergeWithAnimationClipAsync = () => ExportSelectedObjectsMerge(true);
         handlers.ExportSceneGlbAsync = ExportSceneGlbCommandHandlerAsync;
         handlers.ExportSelectedSubtreeGlbAsync = ExportSelectedSubtreeGlbWithLazySupportAsync;
+        handlers.ExportSceneToUnityProjectAsync = ExportSceneToUnityProjectCommandHandlerAsync;
         WireSceneHierarchyViewModelHandlers();
 
         handlers.ExportAllAssetsAsync = () => ExportAllAssetsAsync(ExportMode.Convert);
@@ -462,6 +463,10 @@ public partial class MainWindow : Window
         handlers.SaveScriptCodeAsync = SaveScriptCodeCommandHandlerAsync;
         handlers.ExportGhidraScriptAsync = ExportGhidraScriptCommandHandlerAsync;
         handlers.SelectScriptsFolderAsync = SelectScriptsFolderCommandHandlerAsync;
+        handlers.ExportCSharpProjectAsync = ExportCSharpProjectCommandHandlerAsync;
+        handlers.SelectAssemblyExplorerTypeAsync = SelectAssemblyExplorerTypeCommandHandlerAsync;
+        handlers.NavigateToScriptUsageAsync = NavigateToScriptUsageCommandHandlerAsync;
+        WireScriptExplorerEvents();
 
         handlers.VideoPlayPauseAsync = ExecuteVideoPlayPauseAsync;
         handlers.VideoStopAsync = VideoStopAsync;

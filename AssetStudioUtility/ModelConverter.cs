@@ -44,6 +44,8 @@ namespace AssetStudio
         public bool HideAuxiliaryAndShadowOnlyRenderers { get; init; } = true;
         public IReadOnlyList<SceneScriptSpawnAttachment>? ScriptSpawnAttachments { get; init; }
         public int MaxScriptSpawnInstances { get; init; } = 512;
+        public int MaxTerrainGridResolution { get; init; } = TerrainMeshConverter.DefaultMaxGridResolution;
+        public int MaxTerrainBakedTextureSize { get; init; } = TerrainMeshConverter.DefaultMaxBakedTextureSize;
     }
 
     public class ModelConverter : IImported
@@ -60,6 +62,7 @@ namespace AssetStudio
         public int SkippedLodRendererCount { get; private set; }
         public int AttachedScriptSpawnCount { get; private set; }
         public int HiddenAuxiliaryRendererCount { get; private set; }
+        public int ExportedTerrainCount { get; private set; }
 
         public Avatar? SourceAvatar => avatar;
 
@@ -452,9 +455,11 @@ namespace AssetStudio
                     }
                 }
 
+                var targetFrame = transformDictionary.TryGetValue(m_Transform, out var foundFrame) ? foundFrame : null;
+                ConvertTerrainFromGameObject(m_GameObject, targetFrame, skipDisabledRenderers, sceneOptions);
+
                 if (sceneOptions.IncludeCamerasAndLights)
                 {
-                    var targetFrame = transformDictionary.TryGetValue(m_Transform, out var foundFrame) ? foundFrame : null;
                     ExtractCamerasAndLightsFromGameObject(m_GameObject, targetFrame, sceneOptions.SkipDisabledCamerasAndLights);
                 }
 
@@ -781,6 +786,114 @@ namespace AssetStudio
             }
 
             return null;
+        }
+
+        private void ConvertTerrainFromGameObject(
+            GameObject gameObject,
+            ImportedFrame? targetFrame,
+            bool skipDisabledRenderers,
+            SceneConversionOptions sceneOptions)
+        {
+            if (gameObject.m_Components == null)
+            {
+                return;
+            }
+
+            var terrainOptions = new TerrainConversionOptions
+            {
+                MaxGridResolution = sceneOptions.MaxTerrainGridResolution,
+                MaxBakedTextureSize = sceneOptions.MaxTerrainBakedTextureSize,
+                ImageFormat = imageFormat,
+                CompositeSplatmap = true
+            };
+
+            for (int i = 0; i < gameObject.m_Components.Length; i++)
+            {
+                var compPtr = gameObject.m_Components[i];
+                if (compPtr == null || compPtr.IsNull || !TryResolveComponent(gameObject, compPtr, out var comp))
+                {
+                    continue;
+                }
+
+                if (comp is not Terrain terrain)
+                {
+                    continue;
+                }
+
+                if ((skipDisabledRenderers && !terrain.Enabled) || !terrain.m_DrawHeightmap)
+                {
+                    continue;
+                }
+
+                TerrainData? terrainData = null;
+                if (terrain.m_TerrainData != null && !terrain.m_TerrainData.IsNull)
+                {
+                    if (!terrain.m_TerrainData.TryGet(out terrainData) || terrainData == null)
+                    {
+                        foreach (var sf in SnapshotAssetsFiles(terrain.assetsFile?.assetsManager))
+                        {
+                            if (sf.TryGetObject(terrain.m_TerrainData.m_PathID, out var tdObj) && tdObj is TerrainData foundTd)
+                            {
+                                terrainData = foundTd;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (terrainData == null || !terrainData.HasValidHeightmap)
+                {
+                    continue;
+                }
+
+                var baseName = !string.IsNullOrWhiteSpace(gameObject.m_Name)
+                    ? gameObject.m_Name
+                    : (!string.IsNullOrWhiteSpace(terrainData.m_Name) ? terrainData.m_Name : $"Terrain_{terrain.m_PathID}");
+
+                var converted = TerrainMeshConverter.ConvertToImported(
+                    terrain,
+                    terrainData,
+                    targetFrame,
+                    baseName,
+                    terrainOptions);
+                if (converted == null)
+                {
+                    continue;
+                }
+
+                // Ensure unique material & texture names across multiple terrains in a scene.
+                var matName = converted.Material.Name;
+                if (ImportedHelpers.FindMaterial(matName, MaterialList) != null)
+                {
+                    matName = $"{matName}_{terrain.m_PathID}";
+                    converted.Material.Name = matName;
+                    for (int s = 0; s < converted.Mesh.SubmeshList.Count; s++)
+                    {
+                        converted.Mesh.SubmeshList[s].Material = matName;
+                    }
+                }
+
+                if (converted.Texture != null)
+                {
+                    var texName = converted.Texture.Name;
+                    if (IsTextureNameAllocated(texName))
+                    {
+                        var ext = Path.GetExtension(texName);
+                        var stem = Path.GetFileNameWithoutExtension(texName);
+                        texName = $"{stem}_{terrain.m_PathID}{ext}";
+                        converted.Texture.Name = texName;
+                        for (int t = 0; t < converted.Material.Textures.Count; t++)
+                        {
+                            converted.Material.Textures[t].Name = texName;
+                        }
+                    }
+                    TextureList.Add(converted.Texture);
+                }
+
+                MaterialList.Add(converted.Material);
+                MeshList.Add(converted.Mesh);
+                ExportedTerrainCount++;
+            }
         }
 
         private void ExtractCamerasAndLightsFromGameObject(

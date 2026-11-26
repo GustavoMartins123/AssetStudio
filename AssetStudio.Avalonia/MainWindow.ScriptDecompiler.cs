@@ -8,6 +8,7 @@ using Avalonia.Media;
 using Avalonia.Threading;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -20,9 +21,46 @@ namespace AssetStudio.Avalonia;
 public partial class MainWindow
 {
     private readonly ScriptViewerService _scriptViewerService = new();
+    private readonly AssemblyExplorerService _assemblyExplorerService = new();
+    private readonly CSharpProjectExporterService _csharpProjectExporter = new();
     private AsyncPreviewRequestCoordinator _scriptRequestCoordinator => PreviewSession.ScriptCoordinator;
     private string? _customScriptsDirectory;
     private string? _lastLoadedAssemblyDirectory;
+    private string? _assemblyExplorerLoadedSourceKey;
+    private bool _scriptExplorerEventsWired;
+    private bool _suppressAssemblyTypeSelection;
+
+    private void WireScriptExplorerEvents()
+    {
+        if (_scriptExplorerEventsWired)
+        {
+            return;
+        }
+
+        _scriptExplorerEventsWired = true;
+        PreviewSession.PropertyChanged += OnPreviewSessionPropertyChangedForScriptExplorer;
+    }
+
+    private void OnPreviewSessionPropertyChangedForScriptExplorer(object? sender, PropertyChangedEventArgs e)
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        if (e.PropertyName == nameof(PreviewSessionViewModel.SelectedAssemblyType))
+        {
+            if (!_suppressAssemblyTypeSelection && PreviewSession.SelectedAssemblyType is AssemblyTypeEntry entry)
+            {
+                ViewModel.SelectAssemblyExplorerTypeCommand.Execute(entry);
+            }
+        }
+        else if (e.PropertyName == nameof(PreviewSessionViewModel.IsAssemblyExplorerVisible)
+            && PreviewSession.IsAssemblyExplorerVisible)
+        {
+            EnsureAssemblyExplorerLoadedIfNeeded();
+        }
+    }
 
     private void PreviewMonoScript(AssetItem assetItem, MonoScript m_MonoScript)
     {
@@ -123,15 +161,27 @@ public partial class MainWindow
 
     private async Task UpdateScriptForSelectedAssetAsync(AssetItem? overrideAsset = null)
     {
+        // Lazily populate Assembly Explorer ONLY when the user opens the Script tab (never on startup/project load)
+        EnsureAssemblyExplorerLoadedIfNeeded();
+
         var assetItem = overrideAsset ?? AssetListDataGrid.SelectedItem as AssetItem;
         if (assetItem == null)
         {
-            PreviewSession.ClearScript();
+            if (PreviewSession.SelectedAssemblyType == null)
+            {
+                PreviewSession.ClearScript();
+            }
             return;
         }
 
         if (assetItem.Type != ClassIDType.MonoScript && assetItem.Type != ClassIDType.MonoBehaviour)
         {
+            // Keep any explicitly clicked Assembly Explorer type visible if user hasn't picked a script asset
+            if (PreviewSession.SelectedAssemblyType != null && overrideAsset == null)
+            {
+                return;
+            }
+
             var nonScriptRequest = new ScriptLookupRequest
             {
                 ClassName = string.Empty,
@@ -139,8 +189,9 @@ public partial class MainWindow
             };
             PreviewSession.ShowScriptResult(ScriptDecompilationResult.Unavailable(
                 nonScriptRequest,
-                $"Selected asset '{assetItem.Name}' ({assetItem.DisplayType}) is not a MonoScript or MonoBehaviour. Select a script asset or MonoBehaviour to view C# code (or click 'Export Ghidra...' to export project IL2CPP symbols).",
+                $"Selected asset '{assetItem.Name}' ({assetItem.DisplayType}) is not a MonoScript or MonoBehaviour. Select a script asset, browse the Assembly Explorer, or export a C# project.",
                 fallbackCode: string.Empty));
+            PreviewSession.ClearScriptUsages();
             return;
         }
 
@@ -157,7 +208,7 @@ public partial class MainWindow
 
         try
         {
-            var result = await Task.Run(() =>
+            var resolved = await Task.Run(() =>
             {
                 token.ThrowIfCancellationRequested();
                 if (assetsManager.LazyLoading && assetItem.Handle != null && assetItem.Asset == null)
@@ -188,7 +239,9 @@ public partial class MainWindow
                     fallbackTypeTree: fallbackTypeTree,
                     fallbackTypeTreeSourceFile: fallbackSourceFile);
 
-                return _scriptViewerService.ResolveScript(request, token);
+                var decompResult = _scriptViewerService.ResolveScript(request, token);
+                MonoScript? directMonoScript = asset as MonoScript;
+                return (Result: decompResult, Identity: scriptIdentity, DirectMonoScript: directMonoScript);
             }, token);
 
             if (token.IsCancellationRequested
@@ -197,10 +250,23 @@ public partial class MainWindow
                 return;
             }
 
-            PreviewSession.CompleteScriptRequest(requestId, result);
-            StatusStripUpdate(result.Success
-                ? $"Script loaded: {result.Title} ({result.BackendBadge})"
-                : $"Script source not found for {result.Title}.");
+            PreviewSession.CompleteScriptRequest(requestId, resolved.Result);
+            StatusStripUpdate(resolved.Result.Success
+                ? $"Script loaded: {resolved.Result.Title} ({resolved.Result.BackendBadge})"
+                : $"Script source not found for {resolved.Result.Title}.");
+
+            var effectiveAsm = !string.IsNullOrWhiteSpace(resolved.Result.AssemblyName)
+                ? resolved.Result.AssemblyName
+                : resolved.Identity.AssemblyName;
+            var effectiveNs = !string.IsNullOrWhiteSpace(resolved.Result.Namespace)
+                ? resolved.Result.Namespace
+                : resolved.Identity.Namespace;
+            var effectiveClass = !string.IsNullOrWhiteSpace(resolved.Result.ClassName)
+                ? resolved.Result.ClassName
+                : resolved.Identity.ClassName;
+            var scriptHandle = assetItem.Type == ClassIDType.MonoScript ? assetItem.Handle : null;
+
+            RefreshScriptUsagesAsync(effectiveAsm, effectiveNs, effectiveClass, scriptHandle, resolved.DirectMonoScript);
         }
         catch (OperationCanceledException)
         {
@@ -791,11 +857,13 @@ public partial class MainWindow
         }
 
         _customScriptsDirectory = folder;
+        _assemblyExplorerLoadedSourceKey = null;
         _scriptViewerService.ClearCaches();
         StatusStripUpdate($"Scripts folder set to: {folder}");
 
         if (RightTabControl.SelectedIndex == 3)
         {
+            EnsureAssemblyExplorerLoadedIfNeeded(forceReload: true);
             await UpdateScriptForSelectedAssetAsync();
         }
         else if (AssetListDataGrid.SelectedItem is AssetItem selected && selected.Type == ClassIDType.MonoScript)
@@ -804,18 +872,389 @@ public partial class MainWindow
         }
     }
 
+    private DiscoveredScriptSources DiscoverCurrentScriptSources(out string sourceKey)
+    {
+        var projectRoot = ResolveEffectiveScriptProjectRoot();
+        var report = CurrentProjectAnalysisReport;
+        var projectAnalysisCacheDir = !string.IsNullOrWhiteSpace(projectRoot)
+            ? ProjectAnalysisService.Shared.GetProjectCacheDirectory(projectRoot)
+            : null;
+
+        sourceKey = string.Join("|",
+            projectRoot ?? string.Empty,
+            _customScriptsDirectory ?? string.Empty,
+            _lastLoadedAssemblyDirectory ?? string.Empty,
+            report?.GlobalMetadataPath ?? string.Empty,
+            report?.GameAssemblyPath ?? string.Empty);
+
+        return ScriptSourceDiscovery.Discover(
+            projectRoot: projectRoot,
+            customScriptsDirectory: _customScriptsDirectory,
+            knownIl2CppArtifacts: report?.Il2CppDumperArtifactPaths,
+            gameAssemblyPath: report?.GameAssemblyPath,
+            loadedAssemblyDirectory: _lastLoadedAssemblyDirectory,
+            globalMetadataPath: report?.GlobalMetadataPath,
+            projectAnalysisCacheDirectory: projectAnalysisCacheDir);
+    }
+
+    private void EnsureAssemblyExplorerLoadedIfNeeded(bool forceReload = false)
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        var discovered = DiscoverCurrentScriptSources(out var sourceKey);
+        if (!forceReload && string.Equals(_assemblyExplorerLoadedSourceKey, sourceKey, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _assemblyExplorerLoadedSourceKey = sourceKey;
+        var token = PreviewSession.BeginAssemblyExplorerLoad(out var requestId);
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                var catalog = _assemblyExplorerService.ScanDiscoveredSources(discovered, token);
+                if (token.IsCancellationRequested || !PreviewSession.IsAssemblyExplorerRequestCurrent(requestId, token))
+                {
+                    return;
+                }
+
+                PreviewSession.CompleteAssemblyExplorerLoad(requestId, catalog);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                if (PreviewSession.IsAssemblyExplorerRequestCurrent(requestId, token))
+                {
+                    PreviewSession.FailAssemblyExplorerLoad(requestId, ex.Message);
+                }
+            }
+        }, token);
+    }
+
+    private async Task SelectAssemblyExplorerTypeCommandHandlerAsync(AssemblyTypeEntry? entry)
+    {
+        if (IsWindowClosingOrClosed || entry == null)
+        {
+            return;
+        }
+
+        var token = PreviewSession.BeginScriptRequest(out var requestId, entry.FullName);
+        PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
+
+        try
+        {
+            var result = await Task.Run(() =>
+            {
+                token.ThrowIfCancellationRequested();
+                var discovered = DiscoverCurrentScriptSources(out _);
+                var managedDirs = new List<string>(discovered.ManagedDirectories);
+                var dummyDirs = new List<string>(discovered.DummyDllDirectories);
+
+                var entryDir = !string.IsNullOrWhiteSpace(entry.AssemblyPath)
+                    ? Path.GetDirectoryName(entry.AssemblyPath)
+                    : null;
+                if (!string.IsNullOrWhiteSpace(entryDir) && Directory.Exists(entryDir))
+                {
+                    if (entry.SourceKind == ScriptSourceKind.Il2CppDummyAssemblyDecompiled)
+                    {
+                        dummyDirs.Insert(0, entryDir);
+                    }
+                    else if (entry.SourceKind == ScriptSourceKind.MonoAssemblyDecompiled)
+                    {
+                        managedDirs.Insert(0, entryDir);
+                    }
+                }
+
+                var request = new ScriptLookupRequest
+                {
+                    AssemblyName = entry.AssemblyFileName,
+                    Namespace = entry.Namespace,
+                    ClassName = entry.ClassName,
+                    AssetName = entry.ClassName,
+                    ProjectRoot = ResolveEffectiveScriptProjectRoot(),
+                    CustomScriptsDirectory = _customScriptsDirectory,
+                    ManagedDirectories = managedDirs,
+                    DummyDllDirectories = dummyDirs,
+                    DumpCsPath = entry.SourceKind == ScriptSourceKind.Il2CppDumpCs && File.Exists(entry.AssemblyPath)
+                        ? entry.AssemblyPath
+                        : discovered.DumpCsPath,
+                    ScriptJsonPath = discovered.ScriptJsonPath,
+                    Il2CppHeaderPath = discovered.Il2CppHeaderPath,
+                    GameAssemblyPath = discovered.GameAssemblyPath,
+                    GlobalMetadataPath = entry.SourceKind == ScriptSourceKind.Il2CppGlobalMetadata && File.Exists(entry.AssemblyPath)
+                        ? entry.AssemblyPath
+                        : discovered.GlobalMetadataPath,
+                    ScriptingBackend = CurrentProjectAnalysisReport?.ScriptingBackend ?? UnityScriptingBackend.Unknown
+                };
+
+                return _scriptViewerService.ResolveScript(request, token);
+            }, token);
+
+            if (token.IsCancellationRequested || !PreviewSession.IsScriptRequestCurrent(requestId, token))
+            {
+                return;
+            }
+
+            PreviewSession.CompleteScriptRequest(requestId, result);
+            StatusStripUpdate(result.Success
+                ? $"Script loaded: {result.Title} ({result.BackendBadge})"
+                : $"Script source not found for {entry.FullName}.");
+
+            RefreshScriptUsagesAsync(entry.AssemblyName, entry.Namespace, entry.ClassName, selectedMonoScriptHandle: null, selectedMonoScript: null);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (PreviewSession.IsScriptRequestCurrent(requestId, token))
+            {
+                PreviewSession.FailScriptRequest(requestId, ex.Message);
+                StatusStripUpdate($"Script decompilation error: {ex.Message}");
+            }
+        }
+    }
+
+    private void RefreshScriptUsagesAsync(
+        string? assemblyName,
+        string? ns,
+        string? className,
+        AssetHandle? selectedMonoScriptHandle,
+        MonoScript? selectedMonoScript)
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(className) && selectedMonoScript == null && selectedMonoScriptHandle == null)
+        {
+            PreviewSession.ClearScriptUsages();
+            return;
+        }
+
+        var token = PreviewSession.BeginScriptUsageRequest(out var requestId);
+        var loadedFilesSnapshot = GetLoadedFilesSnapshot();
+        var scanSnapshot = currentScanResult;
+        var cacheFolder = GetCurrentCacheFolderPath();
+        var isLazy = assetsManager.LazyLoading;
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                Action<string, List<AssetReferenceItem>, List<AssetReferenceItem>, int>? semanticLoader = null;
+                if (scanSnapshot != null && !string.IsNullOrWhiteSpace(cacheFolder))
+                {
+                    var signature = _sqliteCache.GetFolderSignature(scanSnapshot);
+                    semanticLoader = (uid, usedByOut, usesOut, limit) =>
+                        _sqliteCache.LoadAssetReferencesFromSemanticCache(cacheFolder, signature, uid, usedByOut, usesOut, limit);
+                }
+
+                Func<AssetHandle, MonoScript?>? lazyVerifier = null;
+                if (isLazy)
+                {
+                    lazyVerifier = handle =>
+                    {
+                        if (handle.RealObject is MonoScript cached)
+                        {
+                            return cached;
+                        }
+                        var tempItem = new AssetItem(handle, 0);
+                        EnsureLazyAssetReadyForPreview(tempItem);
+                        return tempItem.Asset as MonoScript;
+                    };
+                }
+
+                var ctx = new ScriptUsageLookupContext
+                {
+                    ProjectIndex = assetsManager.ProjectIndex,
+                    LoadedFiles = loadedFilesSnapshot,
+                    SemanticCacheLoader = semanticLoader,
+                    BoundedLazyMonoScriptLoader = lazyVerifier,
+                    MaxResults = 250
+                };
+
+                var usageResult = ScriptUsageLookupService.FindUsages(
+                    assemblyName,
+                    ns,
+                    className,
+                    selectedMonoScriptHandle,
+                    selectedMonoScript,
+                    ctx,
+                    token);
+
+                if (token.IsCancellationRequested || !PreviewSession.IsScriptUsageRequestCurrent(requestId, token))
+                {
+                    return;
+                }
+
+                PreviewSession.CompleteScriptUsageRequest(requestId, usageResult);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch
+            {
+                if (PreviewSession.IsScriptUsageRequestCurrent(requestId, token))
+                {
+                    PreviewSession.CompleteScriptUsageRequest(requestId, ScriptUsageLookupResult.Empty);
+                }
+            }
+        }, token);
+    }
+
+    private async Task NavigateToScriptUsageCommandHandlerAsync(ScriptUsageItem? usage)
+    {
+        if (IsWindowClosingOrClosed || usage == null || !usage.IsNavigable)
+        {
+            return;
+        }
+
+        await NavigateToReferencedAssetCommandHandlerAsync(usage.ToAssetReferenceItem());
+    }
+
+    private async Task ExportCSharpProjectCommandHandlerAsync()
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        var discovered = DiscoverCurrentScriptSources(out _);
+        if (!discovered.HasAnySource)
+        {
+            await ViewModel.DialogService.ShowMessageAsync(
+                "Export C# Script Project",
+                "No managed assemblies, IL2CPP DummyDlls, dump.cs, or global-metadata.dat were detected for this project.\n\nUse 'Scripts Folder...' in the Script tab to point to a Managed or Il2CppDumper folder first.");
+            return;
+        }
+
+        var outFolder = await ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
+            title: "Select Output Folder for C# Script Project (.sln/.csproj)"));
+        if (string.IsNullOrWhiteSpace(outFolder))
+        {
+            return;
+        }
+
+        var projectRoot = ResolveEffectiveScriptProjectRoot();
+        var rawProjectName = !string.IsNullOrWhiteSpace(projectContext?.Project.Name)
+            ? projectContext!.Project.Name
+            : (!string.IsNullOrWhiteSpace(projectRoot)
+                ? Path.GetFileName(projectRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                : "ExportedScripts");
+        var projectName = ScriptExportPathSanitizer.SanitizeSegment(rawProjectName, "ExportedScripts");
+
+        var options = new CSharpProjectExportOptions
+        {
+            OutputDirectory = outFolder,
+            ProjectName = projectName,
+            LayoutMode = CSharpProjectLayoutMode.StandaloneDotNetSolution,
+            IncludeEngineAndThirdPartyAssemblies = false,
+            GenerateUnityMetaFiles = true,
+            GenerateAsmdefFiles = true,
+            CopyReferenceDlls = true,
+            ManagedDirectories = discovered.ManagedDirectories,
+            DummyDllDirectories = discovered.DummyDllDirectories,
+            DumpCsPath = discovered.DumpCsPath,
+            ScriptJsonPath = discovered.ScriptJsonPath,
+            GlobalMetadataPath = discovered.GlobalMetadataPath,
+            GameAssemblyPath = discovered.GameAssemblyPath,
+            ProjectRoot = projectRoot,
+            CustomScriptsDirectory = _customScriptsDirectory
+        };
+
+        var progress = new Progress<CSharpProjectExportProgress>(p =>
+        {
+            StatusStripUpdate($"Exporting C# project: {p.StatusMessage} ({p.CompletedTypes:N0} types)");
+        });
+
+        StatusStripUpdate($"Exporting C# script project '{projectName}'...");
+        CSharpProjectExportResult exportResult;
+        try
+        {
+            exportResult = await _csharpProjectExporter.ExportAsync(options, progress);
+        }
+        catch (Exception ex)
+        {
+            StatusStripUpdate($"C# project export failed: {ex.Message}");
+            await ViewModel.DialogService.ShowErrorAsync("Export C# Script Project Failed", ex.Message);
+            return;
+        }
+
+        if (exportResult.Success)
+        {
+            StatusStripUpdate(exportResult.SummaryMessage);
+            var details = new StringBuilder();
+            details.AppendLine(exportResult.SummaryMessage);
+            details.AppendLine();
+            details.AppendLine($"Mode: {exportResult.Mode}");
+            details.AppendLine($"Game Assemblies: {exportResult.GameAssembliesCount:N0}");
+            details.AppendLine($"Reference DLLs: {exportResult.ReferenceAssembliesCount:N0}");
+            details.AppendLine($"Types Exported: {exportResult.TotalTypesExported:N0}");
+            if (exportResult.FailedTypesCount > 0)
+            {
+                details.AppendLine($"Stub Fallbacks (Decompile Errors): {exportResult.FailedTypesCount:N0}");
+            }
+            if (exportResult.BrokenCycles.Count > 0)
+            {
+                details.AppendLine($"Dependency Cycles Broken: {exportResult.BrokenCycles.Count:N0}");
+            }
+            if (!string.IsNullOrWhiteSpace(exportResult.SolutionPath))
+            {
+                details.AppendLine($"Solution: {exportResult.SolutionPath}");
+            }
+            details.AppendLine($"Report: {exportResult.ReportPath}");
+
+            await ViewModel.DialogService.ShowMessageAsync("C# Script Project Export Complete", details.ToString().TrimEnd());
+        }
+        else
+        {
+            StatusStripUpdate($"C# project export failed: {exportResult.ErrorMessage}");
+            await ViewModel.DialogService.ShowErrorAsync("Export C# Script Project Failed", exportResult.ErrorMessage);
+        }
+    }
+
     private void ResetScriptDecompilerCaches()
     {
         _scriptRequestCoordinator.CancelCurrent();
+        PreviewSession.AssemblyExplorerCoordinator.CancelCurrent();
+        PreviewSession.ScriptUsageCoordinator.CancelCurrent();
         _customScriptsDirectory = null;
         _lastLoadedAssemblyDirectory = null;
+        _assemblyExplorerLoadedSourceKey = null;
         _scriptViewerService.ClearCaches();
-        PreviewSession.ClearScript();
+        _suppressAssemblyTypeSelection = true;
+        try
+        {
+            PreviewSession.ClearScript();
+            PreviewSession.ClearAssemblyExplorer();
+        }
+        finally
+        {
+            _suppressAssemblyTypeSelection = false;
+        }
     }
 
     private void DisposeScriptDecompilerService()
     {
+        if (_scriptExplorerEventsWired)
+        {
+            _scriptExplorerEventsWired = false;
+            PreviewSession.PropertyChanged -= OnPreviewSessionPropertyChangedForScriptExplorer;
+        }
         _scriptRequestCoordinator.CancelCurrent();
+        PreviewSession.AssemblyExplorerCoordinator.CancelCurrent();
+        PreviewSession.ScriptUsageCoordinator.CancelCurrent();
         _scriptViewerService.Dispose();
     }
 }

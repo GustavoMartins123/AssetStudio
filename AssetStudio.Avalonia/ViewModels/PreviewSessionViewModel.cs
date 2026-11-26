@@ -56,6 +56,21 @@ namespace AssetStudio.Avalonia.ViewModels
         All = Red | Green | Blue | Alpha,
     }
 
+    public sealed class AssemblyExplorerFilterOption
+    {
+        public string? AssemblyShortName { get; }
+        public string DisplayLabel { get; }
+        public bool IsAllOption => AssemblyShortName == null;
+
+        public AssemblyExplorerFilterOption(string? assemblyShortName, string displayLabel)
+        {
+            AssemblyShortName = assemblyShortName;
+            DisplayLabel = displayLabel;
+        }
+
+        public override string ToString() => DisplayLabel;
+    }
+
     public sealed class PreviewSessionViewModel : ViewModelBase, IDisposable
     {
         public const int MaxPreviewTextChars = 100_000;
@@ -69,6 +84,8 @@ namespace AssetStudio.Avalonia.ViewModels
         private readonly AsyncPreviewRequestCoordinator _referencesCoordinator = new();
         private readonly AsyncPreviewRequestCoordinator _inspectorCoordinator = new();
         private readonly AsyncPreviewRequestCoordinator _scriptCoordinator = new();
+        private readonly AsyncPreviewRequestCoordinator _assemblyExplorerCoordinator = new();
+        private readonly AsyncPreviewRequestCoordinator _scriptUsageCoordinator = new();
         private readonly AnimationPreviewLoadCoordinator _animationCoordinator = new();
         private readonly AssetNavigationHistory _navigationHistory = new();
 
@@ -161,6 +178,23 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _scriptClassName = string.Empty;
         private IReadOnlyList<ScriptMethodSymbol> _scriptMethodSymbols = Array.Empty<ScriptMethodSymbol>();
 
+        // Block 1: Lazy Assembly Explorer (SCRIPT-01) & Script Used By (SCRIPT-04)
+        private AssemblyCatalogSnapshot _assemblyCatalog = AssemblyCatalogSnapshot.Empty;
+        private bool _isAssemblyExplorerVisible;
+        private bool _userToggledAssemblyExplorer;
+        private bool _isAssemblyExplorerLoading;
+        private bool _hasAssemblyExplorerCatalog;
+        private string _assemblyExplorerStatusText = DefaultAssemblyExplorerStatus;
+        private string _assemblyExplorerSearchText = string.Empty;
+        private bool _showGameAssembliesOnly = true;
+        private AssemblyExplorerFilterOption? _selectedAssemblyFilterOption;
+        private AssemblyTypeEntry? _selectedAssemblyType;
+        private string _assemblyExplorerFilterSummary = string.Empty;
+        private bool _isScriptUsageLoading;
+        private bool _hasScriptUsages;
+        private string _scriptUsageHeaderText = DefaultScriptUsageHeader;
+        private ScriptUsageItem? _selectedScriptUsageItem;
+
         public const string DefaultReferencesTargetTitle = "No asset selected";
         public const string DefaultReferencesSummary = "Select an asset to inspect references.";
         public const string DefaultReferencedByHeader = "Referenced By / Used By (0)";
@@ -170,6 +204,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public const string DefaultNavigateForwardTooltip = "Forward (Alt+Right)";
         public const string DefaultScriptTitle = "No script selected";
         public const string DefaultScriptSummary = "Select a MonoScript or MonoBehaviour to view C# code.";
+        public const string DefaultAssemblyExplorerStatus = "Open Script tab to scan assemblies lazily.";
+        public const string DefaultScriptUsageHeader = "Used By (0)";
 
         public PreviewSessionViewModel(Action<Action>? dispatchToUi = null)
         {
@@ -181,6 +217,9 @@ namespace AssetStudio.Avalonia.ViewModels
             FilteredReferencesItems = new BulkObservableCollection<AssetReferenceItem>();
             MonoBehaviourTreeRoots = new BulkObservableCollection<AssetPropertyNode>();
             InspectorComponents = new BulkObservableCollection<GameObjectComponentInfo>();
+            AssemblyFilterOptions = new BulkObservableCollection<AssemblyExplorerFilterOption>();
+            FilteredAssemblyTypes = new BulkObservableCollection<AssemblyTypeEntry>();
+            ScriptUsageItems = new BulkObservableCollection<ScriptUsageItem>();
         }
 
         internal AsyncPreviewRequestCoordinator PreviewCoordinator => _previewCoordinator;
@@ -192,6 +231,10 @@ namespace AssetStudio.Avalonia.ViewModels
         internal AsyncPreviewRequestCoordinator InspectorCoordinator => _inspectorCoordinator;
 
         internal AsyncPreviewRequestCoordinator ScriptCoordinator => _scriptCoordinator;
+
+        internal AsyncPreviewRequestCoordinator AssemblyExplorerCoordinator => _assemblyExplorerCoordinator;
+
+        internal AsyncPreviewRequestCoordinator ScriptUsageCoordinator => _scriptUsageCoordinator;
 
         internal AnimationPreviewLoadCoordinator AnimationCoordinator => _animationCoordinator;
 
@@ -234,6 +277,12 @@ namespace AssetStudio.Avalonia.ViewModels
         public BulkObservableCollection<AssetPropertyNode> MonoBehaviourTreeRoots { get; }
 
         public BulkObservableCollection<GameObjectComponentInfo> InspectorComponents { get; }
+
+        public BulkObservableCollection<AssemblyExplorerFilterOption> AssemblyFilterOptions { get; }
+
+        public BulkObservableCollection<AssemblyTypeEntry> FilteredAssemblyTypes { get; }
+
+        public BulkObservableCollection<ScriptUsageItem> ScriptUsageItems { get; }
 
         public ShaderPreviewViewModel ShaderPreview { get; }
 
@@ -972,6 +1021,142 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public IReadOnlyList<ScriptMethodSymbol> ScriptMethodSymbols => _scriptMethodSymbols;
 
+        // Block 1: Lazy Assembly Explorer (SCRIPT-01) & Script Used By (SCRIPT-04) properties
+
+        public bool IsAssemblyExplorerVisible
+        {
+            get => _isAssemblyExplorerVisible;
+            set => SetProperty(ref _isAssemblyExplorerVisible, value);
+        }
+
+        public bool IsAssemblyExplorerLoading
+        {
+            get => _isAssemblyExplorerLoading;
+            private set => SetProperty(ref _isAssemblyExplorerLoading, value);
+        }
+
+        public bool HasAssemblyExplorerCatalog
+        {
+            get => _hasAssemblyExplorerCatalog;
+            private set => SetProperty(ref _hasAssemblyExplorerCatalog, value);
+        }
+
+        public string AssemblyExplorerStatusText
+        {
+            get => _assemblyExplorerStatusText;
+            private set => SetProperty(ref _assemblyExplorerStatusText, value ?? DefaultAssemblyExplorerStatus);
+        }
+
+        public string AssemblyExplorerSearchText
+        {
+            get => _assemblyExplorerSearchText;
+            set
+            {
+                var normalized = value ?? string.Empty;
+                if (SetProperty(ref _assemblyExplorerSearchText, normalized))
+                {
+                    lock (_stateLock)
+                    {
+                        ApplyAssemblyExplorerFilterCore();
+                    }
+                }
+            }
+        }
+
+        public bool ShowGameAssembliesOnly
+        {
+            get => _showGameAssembliesOnly;
+            set
+            {
+                if (SetProperty(ref _showGameAssembliesOnly, value))
+                {
+                    lock (_stateLock)
+                    {
+                        RebuildAssemblyFilterOptionsAndFilterCore();
+                    }
+                }
+            }
+        }
+
+        public AssemblyExplorerFilterOption? SelectedAssemblyFilterOption
+        {
+            get => _selectedAssemblyFilterOption;
+            set
+            {
+                if (SetProperty(ref _selectedAssemblyFilterOption, value))
+                {
+                    lock (_stateLock)
+                    {
+                        ApplyAssemblyExplorerFilterCore();
+                    }
+                }
+            }
+        }
+
+        public AssemblyTypeEntry? SelectedAssemblyType
+        {
+            get => _selectedAssemblyType;
+            set => SetProperty(ref _selectedAssemblyType, value);
+        }
+
+        public string AssemblyExplorerFilterSummary
+        {
+            get => _assemblyExplorerFilterSummary;
+            private set
+            {
+                var normalized = value ?? string.Empty;
+                var prevHas = HasAssemblyExplorerFilterSummary;
+                if (SetProperty(ref _assemblyExplorerFilterSummary, normalized) && HasAssemblyExplorerFilterSummary != prevHas)
+                {
+                    OnPropertyChanged(nameof(HasAssemblyExplorerFilterSummary));
+                }
+            }
+        }
+
+        public bool HasAssemblyExplorerFilterSummary => !string.IsNullOrWhiteSpace(_assemblyExplorerFilterSummary);
+
+        public bool IsScriptUsageLoading
+        {
+            get => _isScriptUsageLoading;
+            private set
+            {
+                var prevVis = IsScriptUsagePanelVisible;
+                if (SetProperty(ref _isScriptUsageLoading, value) && IsScriptUsagePanelVisible != prevVis)
+                {
+                    OnPropertyChanged(nameof(IsScriptUsagePanelVisible));
+                }
+            }
+        }
+
+        public bool HasScriptUsages
+        {
+            get => _hasScriptUsages;
+            private set
+            {
+                var prevVis = IsScriptUsagePanelVisible;
+                if (SetProperty(ref _hasScriptUsages, value) && IsScriptUsagePanelVisible != prevVis)
+                {
+                    OnPropertyChanged(nameof(IsScriptUsagePanelVisible));
+                }
+            }
+        }
+
+        public bool IsScriptUsagePanelVisible => _hasScriptUsages || _isScriptUsageLoading;
+
+        public string ScriptUsageHeaderText
+        {
+            get => _scriptUsageHeaderText;
+            private set => SetProperty(ref _scriptUsageHeaderText, value ?? DefaultScriptUsageHeader);
+        }
+
+        public ScriptUsageItem? SelectedScriptUsageItem
+        {
+            get => _selectedScriptUsageItem;
+            set => SetProperty(ref _selectedScriptUsageItem, value);
+        }
+
+        public AssemblyCatalogSnapshot AssemblyCatalog => _assemblyCatalog;
+
         public static string TruncatePreviewText(string? text, string fallbackText = "")
         {
             if (text == null)
@@ -1382,6 +1567,8 @@ namespace AssetStudio.Avalonia.ViewModels
             _referencesCoordinator.CancelCurrent();
             _inspectorCoordinator.CancelCurrent();
             _scriptCoordinator.CancelCurrent();
+            _assemblyExplorerCoordinator.CancelCurrent();
+            _scriptUsageCoordinator.CancelCurrent();
             _animationCoordinator.CancelCurrent();
             Interlocked.Increment(ref _previewVersion);
             _dispatchToUi(() =>
@@ -1391,6 +1578,8 @@ namespace AssetStudio.Avalonia.ViewModels
                 IsReferencesLoading = false;
                 IsGameObjectInspectorLoading = false;
                 IsScriptLoading = false;
+                IsAssemblyExplorerLoading = false;
+                IsScriptUsageLoading = false;
             });
         }
 
@@ -1539,6 +1728,326 @@ namespace AssetStudio.Avalonia.ViewModels
             ScriptSearchMatchSummary = string.Empty;
             ScriptFullSourceCode = string.Empty;
             ScriptSourceCode = string.Empty;
+            ClearScriptUsagesCore();
+        }
+
+        // Block 1: Lazy Assembly Explorer (SCRIPT-01) operations
+
+        public bool ToggleAssemblyExplorer()
+        {
+            _userToggledAssemblyExplorer = true;
+            IsAssemblyExplorerVisible = !_isAssemblyExplorerVisible;
+            return _isAssemblyExplorerVisible;
+        }
+
+        public CancellationToken BeginAssemblyExplorerLoad(out long requestId)
+        {
+            var token = _assemblyExplorerCoordinator.BeginNewRequest(out requestId);
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    IsAssemblyExplorerLoading = true;
+                    AssemblyExplorerStatusText = "Scanning managed assemblies...";
+                }
+            });
+            return token;
+        }
+
+        public bool IsAssemblyExplorerRequestCurrent(long requestId, CancellationToken cancellationToken = default)
+        {
+            return !cancellationToken.IsCancellationRequested && _assemblyExplorerCoordinator.IsCurrent(requestId);
+        }
+
+        public bool CompleteAssemblyExplorerLoad(long requestId, AssemblyCatalogSnapshot catalog)
+        {
+            ArgumentNullException.ThrowIfNull(catalog);
+            if (!_assemblyExplorerCoordinator.IsCurrent(requestId))
+            {
+                return false;
+            }
+
+            _dispatchToUi(() =>
+            {
+                if (!_assemblyExplorerCoordinator.IsCurrent(requestId))
+                {
+                    return;
+                }
+
+                lock (_stateLock)
+                {
+                    ApplyAssemblyCatalogCore(catalog);
+                }
+            });
+            return true;
+        }
+
+        public bool FailAssemblyExplorerLoad(long requestId, string errorMessage)
+        {
+            if (!_assemblyExplorerCoordinator.IsCurrent(requestId))
+            {
+                return false;
+            }
+
+            _dispatchToUi(() =>
+            {
+                if (!_assemblyExplorerCoordinator.IsCurrent(requestId))
+                {
+                    return;
+                }
+
+                lock (_stateLock)
+                {
+                    IsAssemblyExplorerLoading = false;
+                    AssemblyExplorerStatusText = $"Assembly scan error: {errorMessage}";
+                }
+            });
+            return true;
+        }
+
+        public void SetAssemblyCatalog(AssemblyCatalogSnapshot catalog)
+        {
+            ArgumentNullException.ThrowIfNull(catalog);
+            _assemblyExplorerCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ApplyAssemblyCatalogCore(catalog);
+                }
+            });
+        }
+
+        public void ClearAssemblyExplorer()
+        {
+            _assemblyExplorerCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ClearAssemblyExplorerCore();
+                }
+            });
+        }
+
+        private void ApplyAssemblyCatalogCore(AssemblyCatalogSnapshot catalog)
+        {
+            IsAssemblyExplorerLoading = false;
+            _assemblyCatalog = catalog;
+            HasAssemblyExplorerCatalog = catalog.HasAnyTypes;
+            AssemblyExplorerStatusText = catalog.SourceDescription;
+
+            // If Game-only filter would show 0 assemblies (e.g. only engine/custom filtered DLLs),
+            // automatically uncheck ShowGameAssembliesOnly so the user sees the discovered assemblies.
+            if (_showGameAssembliesOnly
+                && catalog.HasAnyAssemblies
+                && !HasAnyGameAssembly(catalog))
+            {
+                SetProperty(ref _showGameAssembliesOnly, false, nameof(ShowGameAssembliesOnly));
+            }
+
+            RebuildAssemblyFilterOptionsAndFilterCore();
+
+            if (!_userToggledAssemblyExplorer && catalog.HasAnyTypes)
+            {
+                IsAssemblyExplorerVisible = true;
+            }
+        }
+
+        private void ClearAssemblyExplorerCore()
+        {
+            IsAssemblyExplorerLoading = false;
+            _assemblyCatalog = AssemblyCatalogSnapshot.Empty;
+            HasAssemblyExplorerCatalog = false;
+            _userToggledAssemblyExplorer = false;
+            IsAssemblyExplorerVisible = false;
+            AssemblyExplorerStatusText = DefaultAssemblyExplorerStatus;
+            SetProperty(ref _assemblyExplorerSearchText, string.Empty, nameof(AssemblyExplorerSearchText));
+            SetProperty(ref _showGameAssembliesOnly, true, nameof(ShowGameAssembliesOnly));
+            SetProperty(ref _selectedAssemblyFilterOption, null, nameof(SelectedAssemblyFilterOption));
+            SetProperty(ref _selectedAssemblyType, null, nameof(SelectedAssemblyType));
+            AssemblyExplorerFilterSummary = string.Empty;
+            if (AssemblyFilterOptions.Count > 0) AssemblyFilterOptions.Clear();
+            if (FilteredAssemblyTypes.Count > 0) FilteredAssemblyTypes.Clear();
+        }
+
+        private void RebuildAssemblyFilterOptionsAndFilterCore()
+        {
+            var previousSelection = _selectedAssemblyFilterOption?.AssemblyShortName;
+            var options = new List<AssemblyExplorerFilterOption>();
+
+            if (_assemblyCatalog.HasAnyAssemblies)
+            {
+                var visibleAssemblies = new List<AssemblyInfoEntry>();
+                var totalVisibleTypes = 0;
+                for (var i = 0; i < _assemblyCatalog.Assemblies.Count; i++)
+                {
+                    var asm = _assemblyCatalog.Assemblies[i];
+                    if (_showGameAssembliesOnly && !asm.IsGameAssembly)
+                    {
+                        continue;
+                    }
+                    visibleAssemblies.Add(asm);
+                    totalVisibleTypes += asm.TypeCount;
+                }
+
+                var allLabel = _showGameAssembliesOnly
+                    ? string.Create(CultureInfo.InvariantCulture, $"All Game Assemblies ({visibleAssemblies.Count:N0} • {totalVisibleTypes:N0} types)")
+                    : string.Create(CultureInfo.InvariantCulture, $"All Assemblies ({visibleAssemblies.Count:N0} • {totalVisibleTypes:N0} types)");
+                options.Add(new AssemblyExplorerFilterOption(null, allLabel));
+
+                for (var i = 0; i < visibleAssemblies.Count; i++)
+                {
+                    var asm = visibleAssemblies[i];
+                    options.Add(new AssemblyExplorerFilterOption(asm.AssemblyName, asm.DisplayLabel));
+                }
+            }
+
+            AssemblyFilterOptions.ReplaceAll(options);
+
+            AssemblyExplorerFilterOption? restored = null;
+            if (previousSelection != null)
+            {
+                for (var i = 0; i < options.Count; i++)
+                {
+                    if (string.Equals(options[i].AssemblyShortName, previousSelection, StringComparison.OrdinalIgnoreCase))
+                    {
+                        restored = options[i];
+                        break;
+                    }
+                }
+            }
+
+            restored ??= options.Count > 0 ? options[0] : null;
+            SetProperty(ref _selectedAssemblyFilterOption, restored, nameof(SelectedAssemblyFilterOption));
+            ApplyAssemblyExplorerFilterCore();
+        }
+
+        private void ApplyAssemblyExplorerFilterCore()
+        {
+            if (!_assemblyCatalog.HasAnyTypes)
+            {
+                if (FilteredAssemblyTypes.Count > 0)
+                {
+                    FilteredAssemblyTypes.Clear();
+                }
+                AssemblyExplorerFilterSummary = string.Empty;
+                return;
+            }
+
+            var asmFilter = _selectedAssemblyFilterOption?.AssemblyShortName;
+            var result = _assemblyCatalog.Filter(
+                query: _assemblyExplorerSearchText,
+                showEngineAssemblies: !_showGameAssembliesOnly,
+                assemblyShortNameFilter: asmFilter,
+                maxResults: 5000);
+
+            FilteredAssemblyTypes.ReplaceAll(result.Items);
+            AssemblyExplorerFilterSummary = result.WasTruncated
+                ? string.Create(CultureInfo.InvariantCulture, $"{result.Items.Count:N0}+ / {result.TotalMatchCount:N0}")
+                : string.Create(CultureInfo.InvariantCulture, $"{result.TotalMatchCount:N0} type{(result.TotalMatchCount == 1 ? string.Empty : "s")}");
+        }
+
+        private static bool HasAnyGameAssembly(AssemblyCatalogSnapshot catalog)
+        {
+            for (var i = 0; i < catalog.Assemblies.Count; i++)
+            {
+                if (catalog.Assemblies[i].IsGameAssembly)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Block 1: Script Used By (SCRIPT-04) operations
+
+        public CancellationToken BeginScriptUsageRequest(out long requestId)
+        {
+            var token = _scriptUsageCoordinator.BeginNewRequest(out requestId);
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    IsScriptUsageLoading = true;
+                    ScriptUsageHeaderText = "Used By (scanning...)";
+                }
+            });
+            return token;
+        }
+
+        public bool IsScriptUsageRequestCurrent(long requestId, CancellationToken cancellationToken = default)
+        {
+            return !cancellationToken.IsCancellationRequested && _scriptUsageCoordinator.IsCurrent(requestId);
+        }
+
+        public bool CompleteScriptUsageRequest(long requestId, ScriptUsageLookupResult result)
+        {
+            ArgumentNullException.ThrowIfNull(result);
+            if (!_scriptUsageCoordinator.IsCurrent(requestId))
+            {
+                return false;
+            }
+
+            _dispatchToUi(() =>
+            {
+                if (!_scriptUsageCoordinator.IsCurrent(requestId))
+                {
+                    return;
+                }
+
+                lock (_stateLock)
+                {
+                    ApplyScriptUsagesCore(result);
+                }
+            });
+            return true;
+        }
+
+        public void ShowScriptUsages(ScriptUsageLookupResult result)
+        {
+            ArgumentNullException.ThrowIfNull(result);
+            _scriptUsageCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ApplyScriptUsagesCore(result);
+                }
+            });
+        }
+
+        public void ClearScriptUsages()
+        {
+            _scriptUsageCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ClearScriptUsagesCore();
+                }
+            });
+        }
+
+        private void ApplyScriptUsagesCore(ScriptUsageLookupResult result)
+        {
+            IsScriptUsageLoading = false;
+            SelectedScriptUsageItem = null;
+            ScriptUsageItems.ReplaceAll(result.Items);
+            HasScriptUsages = result.Items.Count > 0;
+            ScriptUsageHeaderText = result.HeaderText;
+        }
+
+        private void ClearScriptUsagesCore()
+        {
+            IsScriptUsageLoading = false;
+            SelectedScriptUsageItem = null;
+            if (ScriptUsageItems.Count > 0)
+            {
+                ScriptUsageItems.Clear();
+            }
+            HasScriptUsages = false;
+            ScriptUsageHeaderText = DefaultScriptUsageHeader;
         }
 
         private void ApplyScriptSearchCore()
@@ -2393,6 +2902,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     ClearGameObjectInspectorCore();
                     ClearNavigationHistoryCore();
                     ClearScriptCore();
+                    ClearAssemblyExplorerCore();
                     _dialoguePlainTextScript = string.Empty;
                     _dialogueDetailsText = string.Empty;
                     HasDialoguePreview = false;
@@ -2422,6 +2932,8 @@ namespace AssetStudio.Avalonia.ViewModels
             _referencesCoordinator.Dispose();
             _inspectorCoordinator.Dispose();
             _scriptCoordinator.Dispose();
+            _assemblyExplorerCoordinator.Dispose();
+            _scriptUsageCoordinator.Dispose();
             _animationCoordinator.Dispose();
         }
     }

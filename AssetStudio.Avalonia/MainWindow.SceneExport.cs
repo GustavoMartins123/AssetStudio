@@ -1,5 +1,6 @@
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.Services.Scripting;
 using AssetStudio.Avalonia.ViewModels;
 using Avalonia.Threading;
 using System;
@@ -14,7 +15,17 @@ namespace AssetStudio.Avalonia;
 public partial class MainWindow
 {
     private readonly SceneGlbExportService _sceneGlbExportService = new();
+    private readonly UnityProjectExporterService _unityProjectExporterService = new();
     private SceneExportOptions _lastSceneExportOptions = new();
+
+    private sealed class PreparedSceneExportData
+    {
+        public required List<GameObject> RootGameObjects { get; init; }
+        public required List<SerializedFile> ClosureSeeds { get; init; }
+        public SceneDependencyClosureResult? DependencyClosure { get; init; }
+        public List<SceneScriptSpawnAttachment>? CompanionAttachments { get; init; }
+        public bool UsedInactiveFallback { get; init; }
+    }
 
     private sealed class SceneExportResolverContext
     {
@@ -128,189 +139,23 @@ public partial class MainWindow
                 ctsToken.ThrowIfCancellationRequested();
                 ReportSceneExportProgress(4, $"Loading {selectedBindings.Count} selected scene(s)...");
 
-                var rootGameObjects = new List<GameObject>();
-                var seenRoots = new HashSet<GameObject>();
-                var seedSerializedFiles = new List<SerializedFile>();
-                var seenSeedFiles = new HashSet<SerializedFile>();
-
                 var requiredObjectTypes = SceneGlbExportService.GetRequiredSceneObjectTypes(
                     includeAnimations: includeAnimations,
                     exportCamerasAndLights: sceneExportOptions.ExportCamerasAndLights,
                     resolveStaticScriptSpawns: sceneExportOptions.ResolveStaticScriptSpawns);
 
-                // Step 1: Resolve and load every selected scene (supports additive multi-scene merging!).
-                for (var i = 0; i < selectedBindings.Count; i++)
-                {
-                    ctsToken.ThrowIfCancellationRequested();
-                    var binding = selectedBindings[i];
+                var prepared = PrepareSelectedScenesForExport(
+                    selectedBindings,
+                    displaySceneName,
+                    sceneExportOptions,
+                    requiredObjectTypes,
+                    cacheFolder,
+                    cacheSignature,
+                    projectRoot,
+                    includeInactiveRoots: sceneExportOptions.IncludeInactive,
+                    ctsToken);
 
-                    if (binding.LoadedSceneRootNode != null)
-                    {
-                        var nodeRoots = SceneGlbExportService.CollectRootGameObjectsFromSceneNode(binding.LoadedSceneRootNode);
-                        foreach (var go in nodeRoots)
-                        {
-                            if (go != null && seenRoots.Add(go))
-                            {
-                                rootGameObjects.Add(go);
-                                if (go.assetsFile != null && seenSeedFiles.Add(go.assetsFile))
-                                {
-                                    seedSerializedFiles.Add(go.assetsFile);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    var targetFiles = EnsureSceneCandidateSerializedFilesLoaded(binding, ctsToken);
-                    foreach (var sf in targetFiles)
-                    {
-                        if (sf != null && seenSeedFiles.Add(sf))
-                        {
-                            seedSerializedFiles.Add(sf);
-                        }
-                    }
-                }
-
-                // Step 1b: Resolve modular companion stage preset bundles (if any) BEFORE dependency closure
-                // so cross-bundle Mesh/Material/Texture2D dependencies of companion stage prefabs are also loaded!
-                var companionGroups = new List<(string StageStem, IReadOnlyList<SerializedFile> CompanionFiles)>();
-                var companionSerializedFilesSet = new HashSet<SerializedFile>();
-                for (var i = 0; i < selectedBindings.Count; i++)
-                {
-                    ctsToken.ThrowIfCancellationRequested();
-                    var binding = selectedBindings[i];
-                    var stageStem = ProjectLoadingService.ExtractSceneStageStem(binding.Candidate.Name, binding.Candidate.ScenePath);
-                    if (stageStem.Length < 6 || binding.CompanionStageFiles == null || binding.CompanionStageFiles.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    var groupFiles = new List<SerializedFile>();
-                    foreach (var (compSfName, compOrigPath) in binding.CompanionStageFiles)
-                    {
-                        var compDiskPath = TryResolveExistingPath(compOrigPath) ?? ResolveSceneDependencyDiskPath(compSfName);
-                        if (!string.IsNullOrWhiteSpace(compDiskPath) && File.Exists(compDiskPath))
-                        {
-                            if (!assetsManager.TryFindSerializedFile(compSfName, null, out var existingComp) || existingComp?.reader == null)
-                            {
-                                RemovePendingFileFromProgressiveQueue(compDiskPath);
-                                assetsManager.LoadFilesForPreview(compDiskPath);
-                                if (!string.IsNullOrWhiteSpace(compSfName))
-                                {
-                                    assetsManager.WaitForAssetsFileLoaded(compSfName, 5000);
-                                }
-                            }
-                        }
-
-                        if (assetsManager.TryFindSerializedFile(compSfName, null, out var loadedComp) && loadedComp?.reader != null)
-                        {
-                            if (!groupFiles.Contains(loadedComp))
-                            {
-                                groupFiles.Add(loadedComp);
-                            }
-                            companionSerializedFilesSet.Add(loadedComp);
-                        }
-                    }
-
-                    if (groupFiles.Count > 0)
-                    {
-                        companionGroups.Add((stageStem, groupFiles));
-                    }
-                }
-
-                // Step 2: Transitive cross-bundle dependency closure (SQLite SourceFileExternals BFS + levelN<->sharedassetsN + Addressables).
-                var closureSeeds = companionSerializedFilesSet.Count > 0
-                    ? seedSerializedFiles.Concat(companionSerializedFilesSet).Distinct().ToList()
-                    : seedSerializedFiles;
-
-                SceneDependencyClosureResult? dependencyClosure = null;
-                if (closureSeeds.Count > 0)
-                {
-                    ReportSceneExportProgress(10, $"Resolving cross-bundle dependencies for '{displaySceneName}'...");
-                    dependencyClosure = SceneGlbExportService.ResolveAndLoadSceneDependencies(
-                        assetsManager: assetsManager,
-                        seedFiles: closureSeeds,
-                        sqliteCache: _sqliteCache,
-                        cacheFolderPath: cacheFolder,
-                        cacheSignature: cacheSignature,
-                        projectRoot: projectRoot,
-                        resolveSourcePathByFileName: ResolveSceneDependencyDiskPath,
-                        beforeLoadFile: RemovePendingFileFromProgressiveQueue,
-                        maxDepth: sceneExportOptions.MaxExternalDependencyDepth,
-                        maxAdditionalFiles: sceneExportOptions.MaxExternalFilesToLoad,
-                        cancellationToken: ctsToken);
-
-                    HashSet<ClassIDType>? companionObjectTypes = null;
-                    if (companionSerializedFilesSet.Count > 0)
-                    {
-                        companionObjectTypes = new HashSet<ClassIDType>(requiredObjectTypes)
-                        {
-                            ClassIDType.MonoBehaviour,
-                            ClassIDType.MonoScript
-                        };
-                    }
-
-                    // Materialize scene + companion + dependency objects.
-                    ReportSceneExportProgress(16, $"Materializing hierarchy & components ({dependencyClosure.AllLoadedFiles.Count} file(s))...");
-                    foreach (var sf in dependencyClosure.AllLoadedFiles)
-                    {
-                        var typesForSf = companionObjectTypes != null && companionSerializedFilesSet.Contains(sf)
-                            ? companionObjectTypes
-                            : requiredObjectTypes;
-                        MaterializeSceneObjectsForSerializedFile(sf, typesForSf, ctsToken);
-                    }
-                }
-
-                // Step 3: Collect roots for any lazily loaded scene files not already coming from loaded SceneTreeNodes.
-                var lazySeedFiles = seedSerializedFiles
-                    .Where(sf => !selectedBindings.Any(b => b.LoadedSceneRootNode != null && rootGameObjects.Any(go => ReferenceEquals(go.assetsFile, sf))))
-                    .ToList();
-
-                var usedInactiveFallback = false;
-                if (lazySeedFiles.Count > 0)
-                {
-                    var collectedLazyRoots = sceneExportOptions.IncludeInactive
-                        ? lazySeedFiles.SelectMany(sf => SceneGlbExportService.CollectRootGameObjectsFromSerializedFile(sf, includeInactive: true)).ToList()
-                        : SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(lazySeedFiles, out usedInactiveFallback);
-
-                    // Fallback to sibling CABs in the same scene bundle(s) if a metadata-only CAB (e.g. *.sharedAssets)
-                    // had no GameObjects of its own. Works for both single-scene and additive multi-scene exports.
-                    if (collectedLazyRoots.Count == 0)
-                    {
-                        var candidatePaths = selectedBindings
-                            .Select(static b => b.Candidate.OriginalPath)
-                            .Where(static p => !string.IsNullOrWhiteSpace(p))
-                            .Distinct(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase)
-                            .ToList();
-
-                        if (candidatePaths.Count > 0)
-                        {
-                            var siblingFiles = GetLoadedFilesSnapshot()
-                                .Where(sf => sf?.reader != null
-                                    && !seenSeedFiles.Contains(sf)
-                                    && candidatePaths.Any(srcPath => IsSameLazySource(sf.originalPath, srcPath) || IsSameLazySource(sf.fullName, srcPath)))
-                                .ToList();
-                            foreach (var sf in siblingFiles)
-                            {
-                                MaterializeSceneObjectsForSerializedFile(sf, requiredObjectTypes, ctsToken);
-                            }
-                            if (siblingFiles.Count > 0)
-                            {
-                                collectedLazyRoots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(siblingFiles, out usedInactiveFallback);
-                            }
-                        }
-                    }
-
-                    foreach (var go in collectedLazyRoots)
-                    {
-                        if (go != null && seenRoots.Add(go))
-                        {
-                            rootGameObjects.Add(go);
-                        }
-                    }
-                }
-
-                if (rootGameObjects.Count == 0)
+                if (prepared.RootGameObjects.Count == 0)
                 {
                     result = new SceneGlbExportResult
                     {
@@ -322,32 +167,20 @@ public partial class MainWindow
                     return;
                 }
 
-                // Step 4: Resolve modular stage preset attachments (if any) + optional SceneScriptSpawnAnalyzer.
-                List<SceneScriptSpawnAttachment>? companionAttachments = null;
-                if (companionGroups.Count > 0)
-                {
-                    companionAttachments = SceneGlbExportService.ResolveCompanionStagePresetAttachments(
-                        rootGameObjects,
-                        companionGroups,
-                        assemblyLoader,
-                        ctsToken,
-                        preferredStagePresetName: sceneExportOptions.PreferredStagePresetName);
-                }
-
                 SceneScriptSpawnAnalysisOptions? scriptSpawnOptions = null;
                 if (sceneExportOptions.ResolveStaticScriptSpawns)
                 {
                     scriptSpawnOptions = BuildSceneScriptSpawnAnalysisOptions(
                         sceneExportOptions,
-                        dependencyClosure?.AddressablesCatalogs,
+                        prepared.DependencyClosure?.AddressablesCatalogs,
                         projectRoot,
                         requiredObjectTypes,
                         ctsToken);
                 }
 
                 var effectiveIncludeInactive = sceneExportOptions.IncludeInactive
-                    || usedInactiveFallback
-                    || !rootGameObjects.Any(static go => go != null && go.m_IsActive);
+                    || prepared.UsedInactiveFallback
+                    || !prepared.RootGameObjects.Any(static go => go != null && go.m_IsActive);
 
                 var options = new SceneGlbExportOptions
                 {
@@ -372,16 +205,16 @@ public partial class MainWindow
                     ScaleFactor = (float)exportOptions.ScaleFactor,
                     ImageFormat = exportOptions.ConvertTextureFormat,
                     Binary = !saveFile.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase),
-                    ResolvedDependencies = dependencyClosure?.ResolvedDependencies,
-                    MissingDependencies = dependencyClosure?.MissingDependencies,
-                    SceneSerializedFiles = closureSeeds,
+                    ResolvedDependencies = prepared.DependencyClosure?.ResolvedDependencies,
+                    MissingDependencies = prepared.DependencyClosure?.MissingDependencies,
+                    SceneSerializedFiles = prepared.ClosureSeeds,
                     ScriptSpawnAnalysisOptions = scriptSpawnOptions,
-                    PreResolvedScriptSpawnAttachments = companionAttachments
+                    PreResolvedScriptSpawnAttachments = prepared.CompanionAttachments
                 };
 
                 var resolverContext = new SceneExportResolverContext();
                 result = _sceneGlbExportService.ExportScene(
-                    rootGameObjects,
+                    prepared.RootGameObjects,
                     options,
                     textureResolver: ResolveTextureForModelConverter,
                     progressCallback: (pct, _, status) =>
@@ -406,6 +239,486 @@ public partial class MainWindow
         }
 
         await CompleteSceneGlbExportUiAsync(result, exportFolder);
+    }
+
+    internal async Task ExportSceneToUnityProjectCommandHandlerAsync()
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        var (candidates, bindingMap) = GatherAvailableSceneExportCandidates();
+        if (candidates.Count == 0)
+        {
+            await ViewModel.DialogService.ShowMessageAsync(
+                "Export Scene to Unity Project",
+                "No loaded Scene Hierarchy, BuildSettings scene, .unity scene bundle, streamed scene bundle, or Addressables SceneProvider entry was detected.\n\n" +
+                "Load a Unity game folder or scene file (such as level0 or a scene bundle) first.");
+            return;
+        }
+
+        var dialogRequest = new SceneExportDialogRequest(
+            scenes: candidates,
+            initialOptions: _lastSceneExportOptions,
+            dialogTitle: "Export Unity Scene to Unity Project");
+
+        var dialogResult = await ViewModel.DialogService.ShowSceneExportDialogAsync(dialogRequest);
+        if (dialogResult == null || dialogResult.SelectedScenes.Count == 0)
+        {
+            return;
+        }
+
+        _lastSceneExportOptions = dialogResult.Options;
+
+        var selectedBindings = new List<SceneCandidateBinding>(dialogResult.SelectedScenes.Count);
+        foreach (var selectedCandidate in dialogResult.SelectedScenes)
+        {
+            if (bindingMap.TryGetValue(selectedCandidate.Id, out var binding))
+            {
+                selectedBindings.Add(binding);
+            }
+            else
+            {
+                selectedBindings.Add(new SceneCandidateBinding { Candidate = selectedCandidate });
+            }
+        }
+
+        var primaryCandidate = selectedBindings[0].Candidate;
+        var suggestedBaseName = selectedBindings.Count == 1
+            ? primaryCandidate.Name
+            : $"{primaryCandidate.Name}_Combined";
+        var outputSceneName = string.IsNullOrWhiteSpace(suggestedBaseName) ? "Scene" : suggestedBaseName;
+
+        var selectedFolder = await ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
+            title: "Select Output Folder for Unity Project",
+            suggestedStartDirectory: GetSuggestedExportStartDirectory()));
+        if (string.IsNullOrWhiteSpace(selectedFolder))
+        {
+            return;
+        }
+
+        SaveExportFolder(selectedFolder);
+
+        var discoveredScripts = DiscoverCurrentScriptSources(out _);
+        var includeScriptsInUnityProject = false;
+        if (discoveredScripts.HasAnySource)
+        {
+            includeScriptsInUnityProject = await ViewModel.DialogService.ConfirmAsync(
+                "Include C# Scripts in Unity Project",
+                "Script sources were detected for this project.\n\n" +
+                "Would you also like to export the game's C# scripts into Assets/Scripts/ with matching deterministic .cs.meta GUIDs so MonoBehaviour components link automatically in Unity?");
+        }
+
+        var projectFolderName = UnityProjectExporterService.SanitizeFileName(outputSceneName, "Scene") + "_UnityProject";
+        var projectOutputDir = Path.Combine(selectedFolder, projectFolderName);
+
+        var displaySceneName = selectedBindings.Count == 1
+            ? primaryCandidate.Name
+            : $"{primaryCandidate.Name} (+{selectedBindings.Count - 1} additive)";
+
+        var ctsToken = ExportState.BeginExport(
+            ExportOperationMode.SplitObjects,
+            100,
+            projectOutputDir,
+            $"Preparing Unity project export for '{displaySceneName}'...");
+        StatusStripUpdate($"Exporting scene '{displaySceneName}' to Unity project '{projectFolderName}'...");
+
+        UnityProjectExportResult? result = null;
+        try
+        {
+            var sceneExportOptions = dialogResult.Options;
+            var cacheFolder = GetCurrentCacheFolderPath();
+            var cacheSignature = currentScanResult != null && !string.IsNullOrWhiteSpace(cacheFolder)
+                ? _sqliteCache.GetFolderSignature(currentScanResult)
+                : null;
+            var projectRoot = !string.IsNullOrWhiteSpace(assetsManager.ProjectRoot)
+                ? assetsManager.ProjectRoot
+                : cacheFolder;
+
+            await Task.Run(() =>
+            {
+                using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
+                using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
+
+                ctsToken.ThrowIfCancellationRequested();
+                ReportSceneExportProgress(4, $"Loading {selectedBindings.Count} selected scene(s)...");
+
+                var requiredObjectTypes = SceneGlbExportService.GetRequiredSceneObjectTypes(
+                    includeAnimations: exportOptions.ExportAnimations,
+                    exportCamerasAndLights: true,
+                    resolveStaticScriptSpawns: true);
+                requiredObjectTypes.Add(ClassIDType.Texture2D);
+
+                var prepared = PrepareSelectedScenesForExport(
+                    selectedBindings,
+                    displaySceneName,
+                    sceneExportOptions,
+                    requiredObjectTypes,
+                    cacheFolder,
+                    cacheSignature,
+                    projectRoot,
+                    includeInactiveRoots: true,
+                    ctsToken);
+
+                if (prepared.RootGameObjects.Count == 0)
+                {
+                    result = new UnityProjectExportResult
+                    {
+                        Success = false,
+                        OutputDirectory = projectOutputDir,
+                        SceneName = outputSceneName,
+                        ErrorMessage = $"No GameObject hierarchy was found inside '{displaySceneName}'."
+                    };
+                    return;
+                }
+
+                // Append any resolved companion stage preset roots cleanly alongside base scene roots.
+                var rootsToExport = new List<GameObject>(prepared.RootGameObjects);
+                if (prepared.CompanionAttachments is { Count: > 0 })
+                {
+                    var seenExportRoots = new HashSet<GameObject>(rootsToExport);
+                    for (int i = 0; i < prepared.CompanionAttachments.Count; i++)
+                    {
+                        var prefabRoot = prepared.CompanionAttachments[i]?.PrefabRoot;
+                        if (prefabRoot != null && seenExportRoots.Add(prefabRoot))
+                        {
+                            rootsToExport.Add(prefabRoot);
+                        }
+                    }
+                }
+
+                Func<string, CancellationToken, UnityProjectScriptExportSummary?>? includeScriptsCallback = null;
+                if (includeScriptsInUnityProject && discoveredScripts.HasAnySource)
+                {
+                    var effectiveScriptRoot = ResolveEffectiveScriptProjectRoot();
+                    var customScriptsDir = _customScriptsDirectory;
+                    includeScriptsCallback = (scriptsOutputDir, ct) =>
+                    {
+                        ReportSceneExportProgress(92, "Exporting C# scripts into Assets/Scripts with matching GUIDs...");
+                        var scriptExportResult = _csharpProjectExporter.Export(
+                            new CSharpProjectExportOptions
+                            {
+                                OutputDirectory = scriptsOutputDir,
+                                ProjectName = ScriptExportPathSanitizer.SanitizeSegment(outputSceneName, "ExportedScripts"),
+                                LayoutMode = CSharpProjectLayoutMode.UnityAssetsScripts,
+                                IncludeEngineAndThirdPartyAssemblies = false,
+                                GenerateUnityMetaFiles = true,
+                                GenerateAsmdefFiles = true,
+                                CopyReferenceDlls = false,
+                                ManagedDirectories = discoveredScripts.ManagedDirectories,
+                                DummyDllDirectories = discoveredScripts.DummyDllDirectories,
+                                DumpCsPath = discoveredScripts.DumpCsPath,
+                                ScriptJsonPath = discoveredScripts.ScriptJsonPath,
+                                GlobalMetadataPath = discoveredScripts.GlobalMetadataPath,
+                                GameAssemblyPath = discoveredScripts.GameAssemblyPath,
+                                ProjectRoot = effectiveScriptRoot,
+                                CustomScriptsDirectory = customScriptsDir
+                            },
+                            cancellationToken: ct);
+
+                        var warnings = new List<string>();
+                        if (!scriptExportResult.Success && !string.IsNullOrWhiteSpace(scriptExportResult.ErrorMessage))
+                        {
+                            warnings.Add(scriptExportResult.ErrorMessage);
+                        }
+                        if (scriptExportResult.FailedTypesCount > 0)
+                        {
+                            warnings.Add($"{scriptExportResult.FailedTypesCount:N0} type(s) emitted as comment stubs due to decompiler errors.");
+                        }
+
+                        return new UnityProjectScriptExportSummary
+                        {
+                            ExportedScriptFiles = scriptExportResult.TotalTypesExported,
+                            ExportedAssemblies = scriptExportResult.GameAssembliesCount,
+                            OutputDirectory = scriptsOutputDir,
+                            Warnings = warnings
+                        };
+                    };
+                }
+
+                var resolverContext = new SceneExportResolverContext();
+                var unityOptions = new UnityProjectExportOptions
+                {
+                    OutputDirectory = projectOutputDir,
+                    SceneName = outputSceneName,
+                    ScenePath = primaryCandidate.ScenePath,
+                    IncludeInactive = true,
+                    ExportMeshes = true,
+                    ExportTextures = true,
+                    ExportMaterials = true,
+                    ExportMonoBehaviours = true,
+                    ExportTerrains = true,
+                    ExportColliders = true,
+                    WriteManifest = sceneExportOptions.WriteManifest,
+                    IncludeScriptsCallback = includeScriptsCallback,
+                    MeshResolver = renderer => ResolveSceneMeshForRenderer(renderer, resolverContext),
+                    MaterialResolver = (renderer, mesh, slotIndex) => ResolveSceneMaterialForSubmesh(renderer, mesh, slotIndex, resolverContext),
+                    TextureResolver = ResolveTextureForModelConverter,
+                    AssemblyLoader = assemblyLoader,
+                    AdditionalSceneNames = selectedBindings.Skip(1).Select(static b => b.Candidate.Name).ToList(),
+                    ResolvedDependencies = prepared.DependencyClosure?.ResolvedDependencies,
+                    MissingDependencies = prepared.DependencyClosure?.MissingDependencies
+                };
+
+                result = _unityProjectExporterService.ExportSceneToUnityProject(
+                    rootsToExport,
+                    unityOptions,
+                    progressCallback: (pct, _, status) =>
+                    {
+                        var mappedPct = 20 + (int)(Math.Clamp(pct, 0, 100) * 0.8);
+                        ReportSceneExportProgress(mappedPct, status);
+                    },
+                    cancellationToken: ctsToken);
+            }, ctsToken);
+        }
+        catch (OperationCanceledException)
+        {
+            result = new UnityProjectExportResult
+            {
+                Success = false,
+                OutputDirectory = projectOutputDir,
+                SceneName = outputSceneName,
+                ErrorMessage = "Unity project export cancelled."
+            };
+        }
+
+        await CompleteUnityProjectExportUiAsync(result, projectOutputDir);
+    }
+
+    private PreparedSceneExportData PrepareSelectedScenesForExport(
+        List<SceneCandidateBinding> selectedBindings,
+        string displaySceneName,
+        SceneExportOptions sceneExportOptions,
+        HashSet<ClassIDType> requiredObjectTypes,
+        string? cacheFolder,
+        string? cacheSignature,
+        string? projectRoot,
+        bool includeInactiveRoots,
+        CancellationToken ctsToken)
+    {
+        var rootGameObjects = new List<GameObject>();
+        var seenRoots = new HashSet<GameObject>();
+        var seedSerializedFiles = new List<SerializedFile>();
+        var seenSeedFiles = new HashSet<SerializedFile>();
+
+        // Step 1: Resolve and load every selected scene (supports additive multi-scene merging!).
+        for (var i = 0; i < selectedBindings.Count; i++)
+        {
+            ctsToken.ThrowIfCancellationRequested();
+            var binding = selectedBindings[i];
+
+            if (binding.LoadedSceneRootNode != null)
+            {
+                var nodeRoots = SceneGlbExportService.CollectRootGameObjectsFromSceneNode(binding.LoadedSceneRootNode);
+                foreach (var go in nodeRoots)
+                {
+                    if (go != null && seenRoots.Add(go))
+                    {
+                        rootGameObjects.Add(go);
+                        if (go.assetsFile != null && seenSeedFiles.Add(go.assetsFile))
+                        {
+                            seedSerializedFiles.Add(go.assetsFile);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            var targetFiles = EnsureSceneCandidateSerializedFilesLoaded(binding, ctsToken);
+            foreach (var sf in targetFiles)
+            {
+                if (sf != null && seenSeedFiles.Add(sf))
+                {
+                    seedSerializedFiles.Add(sf);
+                }
+            }
+        }
+
+        // Step 1b: Resolve modular companion stage preset bundles (if any) BEFORE dependency closure
+        // so cross-bundle Mesh/Material/Texture2D dependencies of companion stage prefabs are also loaded.
+        var companionGroups = new List<(string StageStem, IReadOnlyList<SerializedFile> CompanionFiles)>();
+        var companionSerializedFilesSet = new HashSet<SerializedFile>();
+        for (var i = 0; i < selectedBindings.Count; i++)
+        {
+            ctsToken.ThrowIfCancellationRequested();
+            var binding = selectedBindings[i];
+            var stageStem = ProjectLoadingService.ExtractSceneStageStem(binding.Candidate.Name, binding.Candidate.ScenePath);
+            if (stageStem.Length < 6 || binding.CompanionStageFiles == null || binding.CompanionStageFiles.Count == 0)
+            {
+                continue;
+            }
+
+            var groupFiles = new List<SerializedFile>();
+            foreach (var (compSfName, compOrigPath) in binding.CompanionStageFiles)
+            {
+                var compDiskPath = TryResolveExistingPath(compOrigPath) ?? ResolveSceneDependencyDiskPath(compSfName);
+                if (!string.IsNullOrWhiteSpace(compDiskPath) && File.Exists(compDiskPath))
+                {
+                    if (!assetsManager.TryFindSerializedFile(compSfName, null, out var existingComp) || existingComp?.reader == null)
+                    {
+                        RemovePendingFileFromProgressiveQueue(compDiskPath);
+                        assetsManager.LoadFilesForPreview(compDiskPath);
+                        if (!string.IsNullOrWhiteSpace(compSfName))
+                        {
+                            assetsManager.WaitForAssetsFileLoaded(compSfName, 5000);
+                        }
+                    }
+                }
+
+                if (assetsManager.TryFindSerializedFile(compSfName, null, out var loadedComp) && loadedComp?.reader != null)
+                {
+                    if (!groupFiles.Contains(loadedComp))
+                    {
+                        groupFiles.Add(loadedComp);
+                    }
+                    companionSerializedFilesSet.Add(loadedComp);
+                }
+            }
+
+            if (groupFiles.Count > 0)
+            {
+                companionGroups.Add((stageStem, groupFiles));
+            }
+        }
+
+        // Step 2: Transitive cross-bundle dependency closure (SQLite SourceFileExternals BFS + levelN<->sharedassetsN + Addressables).
+        var closureSeeds = companionSerializedFilesSet.Count > 0
+            ? seedSerializedFiles.Concat(companionSerializedFilesSet).Distinct().ToList()
+            : seedSerializedFiles;
+
+        SceneDependencyClosureResult? dependencyClosure = null;
+        if (closureSeeds.Count > 0)
+        {
+            ReportSceneExportProgress(10, $"Resolving cross-bundle dependencies for '{displaySceneName}'...");
+            dependencyClosure = SceneGlbExportService.ResolveAndLoadSceneDependencies(
+                assetsManager: assetsManager,
+                seedFiles: closureSeeds,
+                sqliteCache: _sqliteCache,
+                cacheFolderPath: cacheFolder,
+                cacheSignature: cacheSignature,
+                projectRoot: projectRoot,
+                resolveSourcePathByFileName: ResolveSceneDependencyDiskPath,
+                beforeLoadFile: RemovePendingFileFromProgressiveQueue,
+                maxDepth: sceneExportOptions.MaxExternalDependencyDepth,
+                maxAdditionalFiles: sceneExportOptions.MaxExternalFilesToLoad,
+                cancellationToken: ctsToken);
+
+            HashSet<ClassIDType>? companionObjectTypes = null;
+            if (companionSerializedFilesSet.Count > 0)
+            {
+                companionObjectTypes = new HashSet<ClassIDType>(requiredObjectTypes)
+                {
+                    ClassIDType.MonoBehaviour,
+                    ClassIDType.MonoScript
+                };
+            }
+
+            ReportSceneExportProgress(16, $"Materializing hierarchy & components ({dependencyClosure.AllLoadedFiles.Count} file(s))...");
+            foreach (var sf in dependencyClosure.AllLoadedFiles)
+            {
+                var typesForSf = companionObjectTypes != null && companionSerializedFilesSet.Contains(sf)
+                    ? companionObjectTypes
+                    : requiredObjectTypes;
+                MaterializeSceneObjectsForSerializedFile(sf, typesForSf, ctsToken);
+            }
+        }
+
+        // Step 3: Collect roots for any lazily loaded scene files not already coming from loaded SceneTreeNodes.
+        var lazySeedFiles = seedSerializedFiles
+            .Where(sf => !selectedBindings.Any(b => b.LoadedSceneRootNode != null && rootGameObjects.Any(go => ReferenceEquals(go.assetsFile, sf))))
+            .ToList();
+
+        var usedInactiveFallback = false;
+        if (lazySeedFiles.Count > 0)
+        {
+            var collectedLazyRoots = includeInactiveRoots
+                ? lazySeedFiles.SelectMany(sf => SceneGlbExportService.CollectRootGameObjectsFromSerializedFile(sf, includeInactive: true)).ToList()
+                : SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(lazySeedFiles, out usedInactiveFallback);
+
+            if (collectedLazyRoots.Count == 0)
+            {
+                var candidatePaths = selectedBindings
+                    .Select(static b => b.Candidate.OriginalPath)
+                    .Where(static p => !string.IsNullOrWhiteSpace(p))
+                    .Distinct(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (candidatePaths.Count > 0)
+                {
+                    var siblingFiles = GetLoadedFilesSnapshot()
+                        .Where(sf => sf?.reader != null
+                            && !seenSeedFiles.Contains(sf)
+                            && candidatePaths.Any(srcPath => IsSameLazySource(sf.originalPath, srcPath) || IsSameLazySource(sf.fullName, srcPath)))
+                        .ToList();
+                    foreach (var sf in siblingFiles)
+                    {
+                        MaterializeSceneObjectsForSerializedFile(sf, requiredObjectTypes, ctsToken);
+                    }
+                    if (siblingFiles.Count > 0)
+                    {
+                        collectedLazyRoots = includeInactiveRoots
+                            ? siblingFiles.SelectMany(sf => SceneGlbExportService.CollectRootGameObjectsFromSerializedFile(sf, includeInactive: true)).ToList()
+                            : SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(siblingFiles, out usedInactiveFallback);
+                    }
+                }
+            }
+
+            foreach (var go in collectedLazyRoots)
+            {
+                if (go != null && seenRoots.Add(go))
+                {
+                    rootGameObjects.Add(go);
+                }
+            }
+        }
+
+        // Step 4: Resolve modular companion stage preset attachments (if any).
+        List<SceneScriptSpawnAttachment>? companionAttachments = null;
+        if (companionGroups.Count > 0 && rootGameObjects.Count > 0)
+        {
+            companionAttachments = SceneGlbExportService.ResolveCompanionStagePresetAttachments(
+                rootGameObjects,
+                companionGroups,
+                assemblyLoader,
+                ctsToken,
+                preferredStagePresetName: sceneExportOptions.PreferredStagePresetName);
+        }
+
+        return new PreparedSceneExportData
+        {
+            RootGameObjects = rootGameObjects,
+            ClosureSeeds = closureSeeds,
+            DependencyClosure = dependencyClosure,
+            CompanionAttachments = companionAttachments,
+            UsedInactiveFallback = usedInactiveFallback
+        };
+    }
+
+    private async Task CompleteUnityProjectExportUiAsync(UnityProjectExportResult? result, string? exportFolder)
+    {
+        ViewModel.LoadingProgress = 100;
+        if (result != null && result.Success)
+        {
+            ExportState.Complete(1, statusText: result.SummaryMessage, errorLogPath: null);
+            StatusStripUpdate(result.SummaryMessage);
+
+            if (exportOptions.OpenAfterExport && !string.IsNullOrEmpty(exportFolder))
+            {
+                OpenFolder(exportFolder);
+            }
+            else
+            {
+                await ViewModel.DialogService.ShowMessageAsync("Unity Project Export Complete", result.SummaryMessage);
+            }
+        }
+        else
+        {
+            var errorMsg = result?.ErrorMessage ?? "Unity project export failed.";
+            ExportState.Fail(errorMsg, null);
+            StatusStripUpdate($"Unity project export failed: {errorMsg}");
+            await ViewModel.DialogService.ShowErrorAsync("Unity Project Export Failed", errorMsg);
+        }
     }
 
     private async Task ExportSelectedSubtreeGlbCommandHandlerAsync()

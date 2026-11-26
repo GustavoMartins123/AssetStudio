@@ -2923,6 +2923,12 @@ namespace AssetStudio
                     return new Sprite(objectReader);
                 case ClassIDType.SpriteAtlas:
                     return new SpriteAtlas(objectReader);
+                case ClassIDType.Terrain:
+                    return new Terrain(objectReader);
+                case ClassIDType.TerrainData:
+                    return new TerrainData(objectReader);
+                case ClassIDType.TerrainLayer:
+                    return new TerrainLayer(objectReader);
                 case ClassIDType.TextAsset:
                     return new TextAsset(objectReader);
                 case ClassIDType.Texture2D:

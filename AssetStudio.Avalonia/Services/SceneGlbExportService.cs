@@ -241,7 +241,8 @@ public sealed class SceneGlbExportService
         ClassIDType.SkinnedMeshRenderer,
         ClassIDType.LODGroup,
         ClassIDType.Animator,
-        ClassIDType.Animation
+        ClassIDType.Animation,
+        ClassIDType.Terrain
     };
 
     private static readonly HashSet<string> UnityBuiltInVirtualResources = new(StringComparer.OrdinalIgnoreCase)
@@ -269,7 +270,15 @@ public sealed class SceneGlbExportService
             ClassIDType.Animator,
             ClassIDType.Avatar,
             ClassIDType.Animation,
-            ClassIDType.LODGroup
+            ClassIDType.LODGroup,
+            ClassIDType.Terrain,
+            ClassIDType.TerrainData,
+            ClassIDType.TerrainLayer,
+            ClassIDType.MeshCollider,
+            ClassIDType.BoxCollider,
+            ClassIDType.SphereCollider,
+            ClassIDType.CapsuleCollider,
+            ClassIDType.TerrainCollider
         };
 
         if (exportCamerasAndLights)
