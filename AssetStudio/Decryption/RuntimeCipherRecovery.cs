@@ -9,7 +9,7 @@ namespace AssetStudio
 {
     public sealed class CapturedCipher
     {
-        internal CapturedCipher(byte[] key, bool ivFromStreamPrefix, byte[] fixedIv, byte[] mask, int verifiedBytes, int zeroBlocksAfterMask)
+        internal CapturedCipher(CapturedKey key, bool ivFromStreamPrefix, byte[] fixedIv, byte[] mask, int verifiedBytes, int zeroBlocksAfterMask)
         {
             Key = key;
             IvFromStreamPrefix = ivFromStreamPrefix;
@@ -19,7 +19,7 @@ namespace AssetStudio
             ZeroBlocksAfterMask = zeroBlocksAfterMask;
         }
 
-        public byte[] Key { get; }
+        public CapturedKey Key { get; }
         public bool IvFromStreamPrefix { get; }
         public byte[] FixedIv { get; }
         public byte[] Mask { get; }
@@ -29,13 +29,12 @@ namespace AssetStudio
 
     public static class RuntimeCipherRecovery
     {
-        private const int MinimumVerifiedBytes = 64;
-        private const int MinimumEvidenceBytes = 16;
+        private const int MinimumEvidenceBytes = 64;
 
-        public static bool TryRecover(byte[] key, IReadOnlyList<string> sampleFiles, IReadOnlyList<PlaintextBundleDump> dumps, out CapturedCipher? cipher)
+        public static bool TryRecover(CapturedKey key, IReadOnlyList<string> sampleFiles, IReadOnlyList<PlaintextBundleDump> dumps, out CapturedCipher? cipher)
         {
             cipher = null;
-            if (key.Length is not (16 or 24 or 32) || sampleFiles.Count == 0 || dumps.Count == 0)
+            if (sampleFiles.Count == 0 || dumps.Count == 0)
             {
                 return false;
             }
@@ -57,14 +56,11 @@ namespace AssetStudio
                 return false;
             }
 
-            using var aes = Aes.Create();
-            aes.Key = key;
-            aes.Mode = CipherMode.ECB;
-            aes.Padding = PaddingMode.None;
-            using var decryptor = aes.CreateDecryptor();
+            using var state = new CipherState(key);
+            int[] offsets = key.Mode == CapturedCipherMode.Ecb ? new[] { 0 } : key.Mode == CapturedCipherMode.Ctr ? new[] { 16 } : new[] { 0, key.BlockSize };
             CapturedCipher? best = null;
             long bestScore = -1;
-            foreach (PlaintextBundleDump dump in dumps.OrderByDescending(item => item.Data.Length))
+            foreach (PlaintextBundleDump dump in dumps.OrderByDescending(static item => item.Data.Length))
             {
                 if (!GameMemoryCapture.TryReadBundleHeader(dump.Data, out long declaredSize, out _))
                 {
@@ -73,13 +69,10 @@ namespace AssetStudio
 
                 foreach ((string path, long length) in lengths)
                 {
-                    for (int mode = 0; mode < 2; mode++)
+                    foreach (int offset in offsets)
                     {
-                        bool ivPrefix = mode == 1;
-                        int offset = ivPrefix ? 16 : 0;
-                        long cipherLength = length - offset;
-                        long padding = cipherLength - declaredSize;
-                        if (padding is < 1 or > 16 || cipherLength % 16 != 0)
+                        long padding = length - offset - declaredSize;
+                        if ((key.Padding ? padding is < 1 or > 16 : padding != 0) || (length - offset) % key.BlockSize != 0)
                         {
                             continue;
                         }
@@ -94,7 +87,7 @@ namespace AssetStudio
                             continue;
                         }
 
-                        CapturedCipher? candidate = TryDerive(decryptor, key, ivPrefix, dump.Data, declaredSize, head);
+                        CapturedCipher? candidate = TryDerive(state, key, offset > 0, dump.Data, declaredSize, head);
                         if (candidate == null || !IsTrustworthy(candidate))
                         {
                             continue;
@@ -114,9 +107,9 @@ namespace AssetStudio
             return best != null;
         }
 
-        public static bool IsMaskConfirmed(CapturedCipher cipher) => cipher.VerifiedBytes >= MinimumVerifiedBytes || cipher.ZeroBlocksAfterMask > 0;
+        public static bool IsMaskConfirmed(CapturedCipher cipher) => cipher.VerifiedBytes >= MinimumEvidenceBytes || cipher.ZeroBlocksAfterMask > 0;
 
-        private static bool IsTrustworthy(CapturedCipher cipher) => cipher.VerifiedBytes >= MinimumEvidenceBytes || cipher.ZeroBlocksAfterMask > 0;
+        private static bool IsTrustworthy(CapturedCipher cipher) => cipher.VerifiedBytes >= cipher.Key.BlockSize || cipher.ZeroBlocksAfterMask > 0;
 
         public static int ValidateOnFiles(CapturedCipher cipher, IReadOnlyList<string> files, out int checkedCount, int maxFiles = 8)
         {
@@ -157,16 +150,18 @@ namespace AssetStudio
         public static bool TryOpenDecoded(Stream raw, CapturedCipher cipher, out Stream decoded)
         {
             decoded = Stream.Null;
+            CapturedKey key = cipher.Key;
+            int blockSize = key.BlockSize;
             byte[] iv = cipher.FixedIv;
             long skip = 0;
             if (cipher.IvFromStreamPrefix)
             {
-                if (raw.Length < 48)
+                if (raw.Length < blockSize * 3)
                 {
                     return false;
                 }
 
-                iv = new byte[16];
+                iv = new byte[blockSize];
                 raw.Position = 0;
                 int read = 0;
                 while (read < iv.Length)
@@ -180,87 +175,167 @@ namespace AssetStudio
                     read += count;
                 }
 
-                skip = 16;
+                skip = blockSize;
             }
 
-            var cipherStream = new CipherTransformStream(
-                raw,
-                StreamCipherAlgorithm.AesCbc,
-                cipher.Key,
-                iv,
-                headerSkipBytes: skip,
-                rangeLength: -1,
-                pkcs7Padding: true)
+            Stream cipherStream;
+            if (key.Kind == CapturedCipherKind.Rijndael256)
             {
-                LeaveBaseStreamOpen = true,
-            };
+                cipherStream = new RijndaelCbcTransformStream(raw, new RijndaelBlockCipher(key.Key, 256), iv, headerSkipBytes: skip, pkcs7Padding: key.Padding)
+                {
+                    LeaveBaseStreamOpen = true,
+                };
+            }
+            else
+            {
+                cipherStream = new CipherTransformStream(
+                    raw,
+                    key.Mode == CapturedCipherMode.Cbc ? StreamCipherAlgorithm.AesCbc
+                        : key.Mode == CapturedCipherMode.Ecb ? StreamCipherAlgorithm.AesEcb
+                        : StreamCipherAlgorithm.AesCtr,
+                    key.Key,
+                    key.Mode == CapturedCipherMode.Ecb ? null : iv,
+                    headerSkipBytes: skip,
+                    rangeLength: -1,
+                    pkcs7Padding: key.Padding,
+                    counterStart: key.CounterStart,
+                    counterLittleEndian: key.CounterLittleEndian)
+                {
+                    LeaveBaseStreamOpen = true,
+                };
+            }
+
             decoded = cipher.Mask.Length > 0 ? new HeaderMaskStream(cipherStream, cipher.Mask) : cipherStream;
             return true;
         }
 
-        private static CapturedCipher? TryDerive(ICryptoTransform decryptor, byte[] key, bool ivPrefix, byte[] plain, long declaredSize, byte[] head)
+        private static CapturedCipher? TryDerive(CipherState state, CapturedKey key, bool ivPrefix, byte[] plain, long declaredSize, byte[] head)
         {
-            int offset = ivPrefix ? 16 : 0;
+            int blockSize = key.BlockSize;
+            int offset = ivPrefix ? blockSize : 0;
             int usable = (int)Math.Min(declaredSize, plain.Length);
-            int availableBlocks = (head.Length - offset) / 16;
-            int blocks = Math.Min(usable / 16, availableBlocks);
+            int availableBlocks = (head.Length - offset) / blockSize;
+            int blocks = Math.Min(usable / blockSize, availableBlocks);
             if (blocks < 2)
             {
                 return null;
             }
 
-            var mask = new byte[blocks * 16];
-            var iv = new byte[16];
+            var mask = new byte[blocks * blockSize];
+            var iv = new byte[blockSize];
             if (ivPrefix)
             {
-                Array.Copy(head, 0, iv, 0, 16);
+                Array.Copy(head, 0, iv, 0, blockSize);
             }
 
-            var block = new byte[16];
-            var decrypted = new byte[16];
             for (int i = 0; i < blocks; i++)
             {
-                Array.Copy(head, offset + i * 16, block, 0, 16);
-                decryptor.TransformBlock(block, 0, 16, decrypted, 0);
-                for (int m = 0; m < 16; m++)
+                ComputeUnmasked(state, key, head, offset, i, iv);
+                for (int m = 0; m < blockSize; m++)
                 {
-                    int p = i * 16 + m;
-                    byte previous = i == 0 ? iv[m] : head[offset + (i - 1) * 16 + m];
-                    mask[p] = (byte)(plain[p] ^ decrypted[m] ^ previous);
+                    mask[i * blockSize + m] = (byte)(plain[i * blockSize + m] ^ state.Block[m]);
                 }
 
-                if (i == 0 && !ivPrefix)
+                if (i == 0 && key.Mode == CapturedCipherMode.Cbc && !ivPrefix)
                 {
-                    Array.Copy(mask, 0, iv, 0, 16);
-                    Array.Clear(mask, 0, 16);
+                    Array.Copy(mask, 0, iv, 0, blockSize);
+                    Array.Clear(mask, 0, blockSize);
                 }
             }
 
             int first = 0;
-            while (first < blocks && IsZeroBlock(mask, first))
+            while (first < blocks && IsZeroBlock(mask, first, blockSize))
             {
                 first++;
             }
 
             int maskBlocks = first >= blocks ? 0 : first;
-            while (maskBlocks < blocks && !IsZeroBlock(mask, maskBlocks))
+            while (maskBlocks < blocks && !IsZeroBlock(mask, maskBlocks, blockSize))
             {
                 maskBlocks++;
             }
 
             int zeroBlocksAfterMask = 0;
-            while (maskBlocks + zeroBlocksAfterMask < blocks && IsZeroBlock(mask, maskBlocks + zeroBlocksAfterMask))
+            while (maskBlocks + zeroBlocksAfterMask < blocks && IsZeroBlock(mask, maskBlocks + zeroBlocksAfterMask, blockSize))
             {
                 zeroBlocksAfterMask++;
             }
 
-            int verified = CountVerifiedBytes(key, iv, offset, mask, maskBlocks, head, plain, usable, availableBlocks);
-            return new CapturedCipher(key, ivPrefix, iv, mask.AsSpan(0, maskBlocks * 16).ToArray(), verified, zeroBlocksAfterMask);
+            int verified = 0;
+            bool matching = true;
+            for (int i = maskBlocks; i < blocks && matching; i++)
+            {
+                ComputeUnmasked(state, key, head, offset, i, iv);
+                int limit = Math.Min(blockSize, usable - i * blockSize);
+                for (int m = 0; m < limit; m++)
+                {
+                    if (state.Block[m] != plain[i * blockSize + m])
+                    {
+                        matching = false;
+                        break;
+                    }
+
+                    verified++;
+                }
+            }
+
+            return new CapturedCipher(key, ivPrefix, iv, mask.AsSpan(0, maskBlocks * blockSize).ToArray(), verified, zeroBlocksAfterMask);
         }
 
-        private static bool IsZeroBlock(byte[] mask, int block)
+        private static void ComputeUnmasked(CipherState state, CapturedKey key, byte[] head, int offset, int index, byte[] iv)
         {
-            for (int i = block * 16; i < block * 16 + 16; i++)
+            int blockSize = key.BlockSize;
+            ReadOnlySpan<byte> cipher = head.AsSpan(offset + index * blockSize, blockSize);
+            Span<byte> output = state.Block;
+            switch (key.Mode)
+            {
+                case CapturedCipherMode.Cbc:
+                {
+                    DecryptBlock(state, key, cipher, output);
+                    ReadOnlySpan<byte> previous = index == 0 ? iv : head.AsSpan(offset + (index - 1) * blockSize, blockSize);
+                    for (int i = 0; i < blockSize; i++)
+                    {
+                        output[i] ^= previous[i];
+                    }
+
+                    break;
+                }
+
+                case CapturedCipherMode.Ecb:
+                {
+                    DecryptBlock(state, key, cipher, output);
+                    break;
+                }
+
+                default:
+                {
+                    GameMemoryCapture.BuildCounterBlock(iv, (ulong)index + key.CounterStart, key.CounterLittleEndian, state.Counter);
+                    state.Aes!.EncryptEcb(state.Counter, output, PaddingMode.None);
+                    for (int i = 0; i < blockSize; i++)
+                    {
+                        output[i] ^= cipher[i];
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        private static void DecryptBlock(CipherState state, CapturedKey key, ReadOnlySpan<byte> cipher, Span<byte> output)
+        {
+            if (key.Kind == CapturedCipherKind.Rijndael256)
+            {
+                RijndaelBlockCipher.DecryptBlock(state.Schedule, 256, state.RijndaelRounds, cipher, output);
+            }
+            else
+            {
+                state.Aes!.DecryptEcb(cipher, output, PaddingMode.None);
+            }
+        }
+
+        private static bool IsZeroBlock(byte[] mask, int block, int blockSize)
+        {
+            for (int i = block * blockSize; i < (block + 1) * blockSize; i++)
             {
                 if (mask[i] != 0)
                 {
@@ -269,33 +344,6 @@ namespace AssetStudio
             }
 
             return true;
-        }
-
-        private static int CountVerifiedBytes(byte[] key, byte[] iv, int offset, byte[] mask, int maskBlocks, byte[] head, byte[] plain, int usable, int availableBlocks)
-        {
-            int length = Math.Min((usable + 15) / 16, availableBlocks) * 16;
-            using var aes = Aes.Create();
-            aes.Key = key;
-            aes.IV = iv;
-            aes.Mode = CipherMode.CBC;
-            aes.Padding = PaddingMode.None;
-            using var transform = aes.CreateDecryptor();
-            var output = new byte[length];
-            transform.TransformBlock(head, offset, length, output, 0);
-            int masked = Math.Min(maskBlocks * 16, length);
-            for (int i = 0; i < masked; i++)
-            {
-                output[i] ^= mask[i];
-            }
-
-            int verified = 0;
-            int limit = Math.Min(usable, length);
-            while (masked + verified < limit && output[masked + verified] == plain[masked + verified])
-            {
-                verified++;
-            }
-
-            return verified;
         }
 
         private static byte[] ReadHead(string path, int count)
@@ -316,6 +364,37 @@ namespace AssetStudio
             }
 
             return total == size ? buffer : buffer.AsSpan(0, total).ToArray();
+        }
+
+        private sealed class CipherState : IDisposable
+        {
+            public CipherState(CapturedKey key)
+            {
+                Block = new byte[key.BlockSize];
+                Counter = new byte[16];
+                if (key.Kind == CapturedCipherKind.Rijndael256)
+                {
+                    Schedule = new uint[RijndaelBlockCipher.MaxKeyScheduleWords];
+                    RijndaelRounds = RijndaelBlockCipher.ExpandDecryptKey(key.Key, 256, Schedule);
+                    return;
+                }
+
+                Aes = Aes.Create();
+                Aes.Mode = CipherMode.ECB;
+                Aes.Padding = PaddingMode.None;
+                Aes.Key = key.Key;
+            }
+
+            public Aes? Aes { get; }
+            public uint[] Schedule { get; } = Array.Empty<uint>();
+            public int RijndaelRounds { get; }
+            public byte[] Block { get; }
+            public byte[] Counter { get; }
+
+            public void Dispose()
+            {
+                Aes?.Dispose();
+            }
         }
     }
 }

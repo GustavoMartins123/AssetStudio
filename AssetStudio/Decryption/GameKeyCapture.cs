@@ -109,6 +109,7 @@ namespace AssetStudio
         LaunchFailed,
         ExitedEarly,
         TimedOut,
+        UnconfirmedKey,
         Cancelled,
     }
 
@@ -167,12 +168,17 @@ namespace AssetStudio
 
         public static DecryptionProfile BuildProfile(GameCaptureTarget target, CapturedCipher cipher)
         {
+            CapturedKey key = cipher.Key;
+            string algorithm = key.Kind == CapturedCipherKind.Rijndael256 ? "rijndael-cbc"
+                : key.Mode == CapturedCipherMode.Cbc ? "aes-cbc"
+                : key.Mode == CapturedCipherMode.Ecb ? "aes-ecb"
+                : "aes-ctr";
             var profile = new DecryptionProfile
             {
-                Id = "captured-aes-cbc-" + DateTime.Now.ToString("yyyyMMdd-HHmmss"),
-                Algorithm = "aes-cbc",
-                KeyHex = Convert.ToHexString(cipher.Key),
-                Padding = "pkcs7",
+                Id = "captured-" + algorithm + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss"),
+                Algorithm = algorithm,
+                KeyHex = Convert.ToHexString(key.Key),
+                Padding = key.Padding ? "pkcs7" : "none",
                 ValidateUnityHeader = true,
             };
 
@@ -184,13 +190,24 @@ namespace AssetStudio
                 profile.PathPattern = pathPattern;
             }
 
+            if (key.Kind == CapturedCipherKind.Rijndael256)
+            {
+                profile.BlockSizeBits = 256;
+            }
+
             if (cipher.IvFromStreamPrefix)
             {
                 profile.IvFromStreamPrefix = true;
             }
-            else
+            else if (key.Mode != CapturedCipherMode.Ecb)
             {
                 profile.IvHex = Convert.ToHexString(cipher.FixedIv);
+            }
+
+            if (key.Mode == CapturedCipherMode.Ctr)
+            {
+                profile.CounterStart = key.CounterStart;
+                profile.CounterLittleEndian = key.CounterLittleEndian;
             }
 
             if (cipher.Mask.Length > 0)
@@ -229,12 +246,14 @@ namespace AssetStudio
                     $"{target.GameName} is already running. Close it first: the key is only present in memory while the game starts up.");
             }
 
-            List<byte[]> tails = GameMemoryCapture.LoadTails(target.SampleFiles);
+            List<FileTail> tails = KeyValidationContext.LoadTails(target.SampleFiles);
             if (tails.Count == 0)
             {
                 return new GameCaptureResult(GameCaptureStatus.NoSuitableFiles,
                     "No block-aligned encrypted files were found to validate a captured key.");
             }
+
+            KeyValidationContext validation = KeyValidationContext.Create(tails, target.SampleFiles, null);
 
             TimeSpan limit = timeout ?? DefaultTimeout;
             using var tracker = new OwnedProcessTracker(target);
@@ -267,7 +286,7 @@ namespace AssetStudio
             DecryptionProfile? profile = null;
             int validated = 0;
             int checkedCount = 0;
-            var foundKeys = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            var foundKeys = new Dictionary<string, CapturedKey>(StringComparer.Ordinal);
             var foundDumps = new Dictionary<string, PlaintextBundleDump>(StringComparer.Ordinal);
             try
             {
@@ -302,7 +321,7 @@ namespace AssetStudio
                     GameMemoryScanResult scan;
                     try
                     {
-                        scan = await Task.Run(() => GameMemoryCapture.ScanProcess(primary.Id, tails, GameMemoryCapture.DefaultDumpBytes, cancellationToken), cancellationToken);
+                        scan = await Task.Run(() => GameMemoryCapture.ScanProcess(primary.Id, validation, GameMemoryCapture.DefaultDumpBytes, cancellationToken), cancellationToken);
                     }
                     catch (GameMemoryAccessException)
                     {
@@ -311,21 +330,28 @@ namespace AssetStudio
                         break;
                     }
 
-                    foreach (byte[] key in scan.Keys)
+                    foreach (CapturedKey key in scan.Keys)
                     {
-                        foundKeys[Convert.ToHexString(key)] = key;
+                        foundKeys[key.Id] = key;
                     }
 
+                    bool newDumps = false;
                     foreach (PlaintextBundleDump dump in scan.Dumps)
                     {
+                        newDumps |= !foundDumps.ContainsKey(dump.Id);
                         foundDumps[dump.Id] = dump;
+                    }
+
+                    if (newDumps)
+                    {
+                        validation = KeyValidationContext.Create(tails, target.SampleFiles, foundDumps.Values.ToArray());
                     }
 
                     if (foundKeys.Count > 0 && foundDumps.Count > 0)
                     {
                         Report("Key found. Recovering IV and header mask…", 85);
                         CapturedCipher? best = null;
-                        foreach (byte[] key in foundKeys.Values)
+                        foreach (CapturedKey key in foundKeys.Values)
                         {
                             if (!RuntimeCipherRecovery.TryRecover(key, target.SampleFiles, foundDumps.Values.ToArray(), out CapturedCipher? candidate) || candidate == null)
                             {
@@ -346,7 +372,7 @@ namespace AssetStudio
                             cipher = best;
                             profile = BuildProfile(target, best);
                             status = GameCaptureStatus.Succeeded;
-                            message = $"Captured a {best.Key.Length * 8}-bit key validated on {validated} of {checkedCount} file(s).";
+                            message = $"Captured {best.Key.DisplayName} ({best.Key.Key.Length * 8}-bit) validated on {validated} of {checkedCount} file(s).";
                             break;
                         }
 
@@ -365,6 +391,12 @@ namespace AssetStudio
             {
                 Report("Closing the game…", 95);
                 await tracker.CloseAllAsync();
+            }
+
+            if (status == GameCaptureStatus.TimedOut && foundKeys.Count > 0)
+            {
+                status = GameCaptureStatus.UnconfirmedKey;
+                message = "A key candidate was found, but no decrypted bundle in memory could confirm its IV and header mask.";
             }
 
             Report(status == GameCaptureStatus.Succeeded ? "Done. The game was closed." : message, status == GameCaptureStatus.Succeeded ? 100 : 0);

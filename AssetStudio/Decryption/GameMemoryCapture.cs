@@ -24,6 +24,42 @@ namespace AssetStudio
         public int NativeErrorCode { get; }
     }
 
+    public enum CapturedCipherKind
+    {
+        Aes,
+        Rijndael256,
+    }
+
+    public enum CapturedCipherMode
+    {
+        Cbc,
+        Ecb,
+        Ctr,
+    }
+
+    public sealed class CapturedKey
+    {
+        internal CapturedKey(byte[] key, CapturedCipherKind kind, CapturedCipherMode mode, bool padding, uint counterStart = 0, bool counterLittleEndian = false)
+        {
+            Key = key;
+            Kind = kind;
+            Mode = mode;
+            Padding = padding;
+            CounterStart = counterStart;
+            CounterLittleEndian = counterLittleEndian;
+        }
+
+        public byte[] Key { get; }
+        public CapturedCipherKind Kind { get; }
+        public CapturedCipherMode Mode { get; }
+        public bool Padding { get; }
+        public uint CounterStart { get; }
+        public bool CounterLittleEndian { get; }
+        public int BlockSize => Kind == CapturedCipherKind.Aes ? 16 : 32;
+        public string Id => $"{Kind}|{Mode}|{Padding}|{CounterStart}|{CounterLittleEndian}|{Convert.ToHexString(Key)}";
+        public string DisplayName => (Kind == CapturedCipherKind.Aes ? "AES" : "Rijndael-256") + "-" + Mode.ToString().ToUpperInvariant() + (Padding ? " (PKCS7)" : string.Empty);
+    }
+
     public sealed class PlaintextBundleDump
     {
         internal PlaintextBundleDump(byte[] data, long declaredSize, string revision, long address)
@@ -50,57 +86,135 @@ namespace AssetStudio
         }
     }
 
-    public sealed class GameMemoryScanResult
+    public sealed class FileTail
     {
-        internal GameMemoryScanResult(IReadOnlyList<byte[]> keys, IReadOnlyList<PlaintextBundleDump> dumps)
+        internal FileTail(byte[] bytes, long length)
         {
-            Keys = keys;
-            Dumps = dumps;
+            Bytes = bytes;
+            Length = length;
         }
 
-        public IReadOnlyList<byte[]> Keys { get; }
-        public IReadOnlyList<PlaintextBundleDump> Dumps { get; }
+        public byte[] Bytes { get; }
+        public long Length { get; }
     }
 
-    public static class GameMemoryCapture
+    public sealed class KnownPlainProbe
     {
-        public const int DefaultDumpBytes = 65536;
-        public const int TailBytes = 32;
-        private const int ChunkSize = 4 << 20;
-        private const int OverlapBytes = 256;
-        private const int MinimumTailFileBytes = 64;
-
-        [ThreadStatic]
-        private static Aes? tailCipher;
-
-        public static byte[] ReadTail(string path)
+        internal KnownPlainProbe(PlaintextBundleDump dump, string filePath, int offset, bool padding, int blockIndex, byte[] ivBlock, byte[] cipherBlock, byte[] previousCipherBlock, byte[] plainBlock)
         {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            if (stream.Length < MinimumTailFileBytes || stream.Length % 16 != 0)
-            {
-                return Array.Empty<byte>();
-            }
-
-            stream.Seek(-TailBytes, SeekOrigin.End);
-            var tail = new byte[TailBytes];
-            int total = 0;
-            while (total < tail.Length)
-            {
-                int read = stream.Read(tail, total, tail.Length - total);
-                if (read <= 0)
-                {
-                    break;
-                }
-
-                total += read;
-            }
-
-            return total == tail.Length ? tail : Array.Empty<byte>();
+            Dump = dump;
+            FilePath = filePath;
+            Offset = offset;
+            Padding = padding;
+            BlockIndex = blockIndex;
+            IvBlock = ivBlock;
+            CipherBlock = cipherBlock;
+            PreviousCipherBlock = previousCipherBlock;
+            PlainBlock = plainBlock;
         }
 
-        public static List<byte[]> LoadTails(IEnumerable<string> files, int maxTails = 8)
+        public PlaintextBundleDump Dump { get; }
+        public string FilePath { get; }
+        public int Offset { get; }
+        public bool Padding { get; }
+        public int BlockIndex { get; }
+        public byte[] IvBlock { get; }
+        public byte[] CipherBlock { get; }
+        public byte[] PreviousCipherBlock { get; }
+        public byte[] PlainBlock { get; }
+    }
+
+    public sealed class KeyValidationContext
+    {
+        public const int MaximumProbes = 24;
+        private const int MaximumTails = 8;
+
+        internal KeyValidationContext(IReadOnlyList<FileTail> tails, IReadOnlyList<KnownPlainProbe> probes)
         {
-            var tails = new List<byte[]>();
+            Tails = tails;
+            Probes = probes;
+        }
+
+        public IReadOnlyList<FileTail> Tails { get; }
+        public IReadOnlyList<KnownPlainProbe> Probes { get; }
+
+        public static KeyValidationContext Create(IReadOnlyList<FileTail> tails, IReadOnlyList<string> sampleFiles, IReadOnlyList<PlaintextBundleDump>? dumps)
+        {
+            var probes = new List<KnownPlainProbe>();
+            if (dumps != null)
+            {
+                foreach (PlaintextBundleDump dump in dumps.OrderByDescending(static item => item.Data.Length))
+                {
+                    if (probes.Count >= MaximumProbes)
+                    {
+                        break;
+                    }
+
+                    int lastBlock = (int)Math.Min(dump.DeclaredSize, dump.Data.Length) / 16 - 1;
+                    if (lastBlock < 2)
+                    {
+                        continue;
+                    }
+
+                    foreach (string file in sampleFiles)
+                    {
+                        long length;
+                        try
+                        {
+                            length = new FileInfo(file).Length;
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            continue;
+                        }
+
+                        foreach (int offset in new[] { 0, 16 })
+                        {
+                            long padding = length - offset - dump.DeclaredSize;
+                            if (padding is < 0 or > 16 || (length - offset) % 16 != 0)
+                            {
+                                continue;
+                            }
+
+                            foreach (int blockIndex in new[] { 256, 16, lastBlock }.Distinct())
+                            {
+                                if (blockIndex > lastBlock || probes.Count >= MaximumProbes)
+                                {
+                                    continue;
+                                }
+
+                                try
+                                {
+                                    using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                                    var cipher = new byte[32];
+                                    stream.Seek(offset + (blockIndex - 1) * 16L, SeekOrigin.Begin);
+                                    stream.ReadExactly(cipher);
+                                    var iv = new byte[16];
+                                    if (offset == 16)
+                                    {
+                                        stream.Seek(0, SeekOrigin.Begin);
+                                        stream.ReadExactly(iv);
+                                    }
+
+                                    var plain = new byte[16];
+                                    dump.Data.AsSpan(blockIndex * 16, 16).CopyTo(plain);
+                                    probes.Add(new KnownPlainProbe(dump, file, offset, padding > 0, blockIndex, iv, cipher.AsSpan(16, 16).ToArray(), cipher.AsSpan(0, 16).ToArray(), plain));
+                                }
+                                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or EndOfStreamException)
+                                {
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return new KeyValidationContext(tails, probes);
+        }
+
+        public static List<FileTail> LoadTails(IEnumerable<string> files, int maxTails = MaximumTails)
+        {
+            var tails = new List<FileTail>();
             var ordered = new List<(string Path, long Length)>();
             foreach (string file in files)
             {
@@ -113,20 +227,25 @@ namespace AssetStudio
                 }
             }
 
-            foreach ((string path, _) in ordered.OrderByDescending(item => item.Length))
+            foreach ((string path, long length) in ordered.OrderByDescending(static item => item.Length))
             {
                 if (tails.Count >= maxTails)
                 {
                     break;
                 }
 
+                if (length < 64 || length % 16 != 0)
+                {
+                    continue;
+                }
+
                 try
                 {
-                    byte[] tail = ReadTail(path);
-                    if (tail.Length > 0)
-                    {
-                        tails.Add(tail);
-                    }
+                    var bytes = new byte[64];
+                    using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    stream.Seek(-64, SeekOrigin.End);
+                    stream.ReadExactly(bytes);
+                    tails.Add(new FileTail(bytes, length));
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -135,50 +254,44 @@ namespace AssetStudio
 
             return tails;
         }
+    }
 
-        public static bool IsKeyAccepted(int tailMatches, int tailCount) => tailMatches >= Math.Min(2, tailCount);
-
-        public static int CountTailMatches(ReadOnlySpan<byte> key, IReadOnlyList<byte[]> tails)
+    public sealed class GameMemoryScanResult
+    {
+        internal GameMemoryScanResult(IReadOnlyList<CapturedKey> keys, IReadOnlyList<PlaintextBundleDump> dumps)
         {
-            tailCipher ??= Aes.Create();
-            tailCipher.Mode = CipherMode.ECB;
-            tailCipher.Padding = PaddingMode.None;
-            tailCipher.Key = key.ToArray();
-            Span<byte> last = stackalloc byte[16];
-            int matches = 0;
-            for (int t = 0; t < tails.Count; t++)
-            {
-                byte[] tail = tails[t];
-                tailCipher.DecryptEcb(tail.AsSpan(16, 16), last, PaddingMode.None);
-                for (int i = 0; i < 16; i++)
-                {
-                    last[i] ^= tail[i];
-                }
-
-                int pad = last[15];
-                if (pad is < 1 or > 16)
-                {
-                    continue;
-                }
-
-                bool valid = true;
-                for (int i = 16 - pad; i < 16; i++)
-                {
-                    if (last[i] != pad)
-                    {
-                        valid = false;
-                        break;
-                    }
-                }
-
-                if (valid)
-                {
-                    matches++;
-                }
-            }
-
-            return matches;
+            Keys = keys;
+            Dumps = dumps;
         }
+
+        public IReadOnlyList<CapturedKey> Keys { get; }
+        public IReadOnlyList<PlaintextBundleDump> Dumps { get; }
+    }
+
+    public static class GameMemoryCapture
+    {
+        public const int DefaultDumpBytes = 65536;
+        private const int ChunkSize = 4 << 20;
+        private const int OverlapBytes = 256;
+        private const int MaximumWindowArrayBytes = 64;
+        private const int MaximumTextLength = 64;
+        private const ulong MaximumClassPointer = 0x7FFFFFFFFFFFUL;
+        private const int AesBlockSize = 16;
+
+        [ThreadStatic]
+        private static Aes? aes;
+
+        [ThreadStatic]
+        private static byte[]? aesKey16;
+
+        [ThreadStatic]
+        private static byte[]? aesKey24;
+
+        [ThreadStatic]
+        private static byte[]? aesKey32;
+
+        [ThreadStatic]
+        private static uint[]? rijndaelSchedule;
 
         public static bool TryReadBundleHeader(ReadOnlySpan<byte> data, out long declaredSize, out string revision)
         {
@@ -223,21 +336,18 @@ namespace AssetStudio
             return true;
         }
 
-        public static void ScanBuffer(ReadOnlySpan<byte> data, IReadOnlyList<byte[]> tails, int maxDumpBytes, IDictionary<string, byte[]> keys, IDictionary<string, PlaintextBundleDump> dumps)
+        public static void ScanBuffer(ReadOnlySpan<byte> data, KeyValidationContext context, int maxDumpBytes, IDictionary<string, CapturedKey> keys, IDictionary<string, PlaintextBundleDump> dumps, long address = 0)
         {
-            ScanBuffer(data, tails, maxDumpBytes, keys, dumps, 0);
-        }
-
-        public static void ScanBuffer(ReadOnlySpan<byte> data, IReadOnlyList<byte[]> tails, int maxDumpBytes, IDictionary<string, byte[]> keys, IDictionary<string, PlaintextBundleDump> dumps, long address)
-        {
+            ArgumentNullException.ThrowIfNull(context);
             if (data.Length < 64 || data.IndexOfAnyExcept((byte)0) < 0)
             {
                 return;
             }
 
-            if (tails.Count > 0)
+            if (context.Tails.Count > 0 || context.Probes.Count > 0)
             {
-                ScanManagedKeyArrays(data, tails, keys);
+                ScanManagedArrays(data, context, keys);
+                ScanManagedStrings(data, context, keys);
             }
 
             if (maxDumpBytes > 0)
@@ -246,13 +356,312 @@ namespace AssetStudio
             }
         }
 
-        private static void ScanManagedKeyArrays(ReadOnlySpan<byte> data, IReadOnlyList<byte[]> tails, IDictionary<string, byte[]> keys)
+        public static GameMemoryScanResult ScanProcess(int processId, KeyValidationContext context, int maxDumpBytes = DefaultDumpBytes, CancellationToken cancellationToken = default)
         {
-            int threshold = Math.Min(2, tails.Count);
-            for (int offset = 32; offset + 32 <= data.Length; offset += 8)
+            ArgumentNullException.ThrowIfNull(context);
+            if (!OperatingSystem.IsWindows())
+            {
+                throw new PlatformNotSupportedException("Capturing keys from a running game is only available on Windows.");
+            }
+
+            var keys = new ConcurrentDictionary<string, CapturedKey>();
+            var dumps = new ConcurrentDictionary<string, PlaintextBundleDump>();
+            IntPtr process = ProcessMemoryReader.Open(processId, out int errorCode);
+            if (process == IntPtr.Zero)
+            {
+                throw new GameMemoryAccessException(errorCode);
+            }
+
+            try
+            {
+                var chunks = ProcessMemoryReader.EnumerateReadableChunks(process, ChunkSize);
+                var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 2), CancellationToken = cancellationToken };
+                Parallel.ForEach(chunks, options, chunk =>
+                {
+                    int length = (int)Math.Min(chunk.Size + OverlapBytes, chunk.RegionEnd - chunk.Address);
+                    byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+                    try
+                    {
+                        if (ProcessMemoryReader.TryRead(process, chunk.Address, buffer, length))
+                        {
+                            ScanBuffer(buffer.AsSpan(0, length), context, maxDumpBytes, keys, dumps, chunk.Address);
+                        }
+                        else
+                        {
+                            for (long offset = 0; offset < chunk.Size; offset += 65536)
+                            {
+                                int piece = (int)Math.Min(65536, chunk.Size - offset);
+                                if (ProcessMemoryReader.TryRead(process, chunk.Address + offset, buffer, piece))
+                                {
+                                    ScanBuffer(buffer.AsSpan(0, piece), context, maxDumpBytes, keys, dumps, chunk.Address + offset);
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
+                });
+            }
+            finally
+            {
+                ProcessMemoryReader.Close(process);
+            }
+
+            return new GameMemoryScanResult(
+                keys.Values.OrderBy(static key => key.Key.Length).ThenBy(static key => key.Id, StringComparer.Ordinal).ToArray(),
+                dumps.Values.OrderByDescending(static dump => dump.Data.Length).ThenBy(static dump => dump.Address).ToArray());
+        }
+
+        internal static CapturedKey? Identify(ReadOnlySpan<byte> key, KeyValidationContext context, bool exhaustive, int requiredMatches)
+        {
+            if (key.Length is not (16 or 24 or 32) || requiredMatches <= 0)
+            {
+                return null;
+            }
+
+            int cbc = 0;
+            int ecb = 0;
+            int eligible = 0;
+            if (context.Tails.Count >= requiredMatches)
+            {
+                Aes cipher = GetAes(key);
+                Span<byte> last = stackalloc byte[AesBlockSize];
+                foreach (FileTail tail in context.Tails)
+                {
+                    cipher.DecryptEcb(tail.Bytes.AsSpan(48, AesBlockSize), last, PaddingMode.None);
+                    eligible++;
+                    if (HasValidPadding(last))
+                    {
+                        ecb++;
+                    }
+
+                    for (int i = 0; i < AesBlockSize; i++)
+                    {
+                        last[i] ^= tail.Bytes[32 + i];
+                    }
+
+                    if (HasValidPadding(last))
+                    {
+                        cbc++;
+                    }
+                }
+
+                if (eligible >= requiredMatches)
+                {
+                    if (cbc >= requiredMatches)
+                    {
+                        return new CapturedKey(key.ToArray(), CapturedCipherKind.Aes, CapturedCipherMode.Cbc, true);
+                    }
+
+                    if (ecb >= requiredMatches)
+                    {
+                        return new CapturedKey(key.ToArray(), CapturedCipherKind.Aes, CapturedCipherMode.Ecb, true);
+                    }
+                }
+            }
+
+            if (!exhaustive)
+            {
+                return null;
+            }
+
+            CapturedKey? probed = IdentifyByProbes(key, context);
+            if (probed != null)
+            {
+                return probed;
+            }
+
+            return IdentifyRijndael(key, context, requiredMatches);
+        }
+
+        private static CapturedKey? IdentifyByProbes(ReadOnlySpan<byte> key, KeyValidationContext context)
+        {
+            if (context.Probes.Count == 0)
+            {
+                return null;
+            }
+
+            Aes cipher = GetAes(key);
+            Span<byte> block = stackalloc byte[AesBlockSize];
+            Span<byte> counter = stackalloc byte[AesBlockSize];
+            foreach (KnownPlainProbe probe in context.Probes)
+            {
+                cipher.DecryptEcb(probe.CipherBlock, block, PaddingMode.None);
+                if (probe.Offset == 0 && block.SequenceEqual(probe.PlainBlock))
+                {
+                    return new CapturedKey(key.ToArray(), CapturedCipherKind.Aes, CapturedCipherMode.Ecb, probe.Padding);
+                }
+
+                for (int i = 0; i < AesBlockSize; i++)
+                {
+                    block[i] ^= probe.PreviousCipherBlock[i];
+                }
+
+                if (block.SequenceEqual(probe.PlainBlock))
+                {
+                    return new CapturedKey(key.ToArray(), CapturedCipherKind.Aes, CapturedCipherMode.Cbc, probe.Padding);
+                }
+
+                if (probe.Offset != 16 || probe.Padding)
+                {
+                    continue;
+                }
+
+                for (int variant = 0; variant < 4; variant++)
+                {
+                    uint start = (uint)(variant & 1);
+                    bool littleEndian = (variant & 2) != 0;
+                    BuildCounterBlock(probe.IvBlock, (ulong)probe.BlockIndex + start, littleEndian, counter);
+                    cipher.EncryptEcb(counter, block, PaddingMode.None);
+                    for (int i = 0; i < AesBlockSize; i++)
+                    {
+                        block[i] ^= probe.CipherBlock[i];
+                    }
+
+                    if (block.SequenceEqual(probe.PlainBlock))
+                    {
+                        return new CapturedKey(key.ToArray(), CapturedCipherKind.Aes, CapturedCipherMode.Ctr, false, start, littleEndian);
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private static CapturedKey? IdentifyRijndael(ReadOnlySpan<byte> key, KeyValidationContext context, int requiredMatches)
+        {
+            rijndaelSchedule ??= new uint[RijndaelBlockCipher.MaxKeyScheduleWords];
+            int rounds = RijndaelBlockCipher.ExpandDecryptKey(key, 256, rijndaelSchedule);
+            if (rounds < 0 || context.Tails.Count < requiredMatches)
+            {
+                return null;
+            }
+
+            const int blockSize = 32;
+            Span<byte> block = stackalloc byte[blockSize];
+            int cbc = 0;
+            int ecb = 0;
+            int eligible = 0;
+            foreach (FileTail tail in context.Tails)
+            {
+                if (tail.Length % blockSize != 0)
+                {
+                    continue;
+                }
+
+                RijndaelBlockCipher.DecryptBlock(rijndaelSchedule, 256, rounds, tail.Bytes.AsSpan(32, blockSize), block);
+                eligible++;
+                if (HasValidPadding(block))
+                {
+                    ecb++;
+                }
+
+                for (int i = 0; i < blockSize; i++)
+                {
+                    block[i] ^= tail.Bytes[i];
+                }
+
+                if (HasValidPadding(block))
+                {
+                    cbc++;
+                }
+            }
+
+            if (eligible < requiredMatches)
+            {
+                return null;
+            }
+
+            if (cbc >= requiredMatches)
+            {
+                return new CapturedKey(key.ToArray(), CapturedCipherKind.Rijndael256, CapturedCipherMode.Cbc, true);
+            }
+
+            return ecb >= requiredMatches
+                ? new CapturedKey(key.ToArray(), CapturedCipherKind.Rijndael256, CapturedCipherMode.Ecb, true)
+                : null;
+        }
+
+        internal static void BuildCounterBlock(ReadOnlySpan<byte> iv, ulong addition, bool littleEndian, Span<byte> target)
+        {
+            iv.CopyTo(target);
+            ulong carry = addition;
+            if (littleEndian)
+            {
+                for (int i = 0; i < target.Length && carry != 0; i++)
+                {
+                    ulong sum = target[i] + (carry & 0xFFUL);
+                    target[i] = (byte)sum;
+                    carry = (carry >> 8) + (sum >> 8);
+                }
+            }
+            else
+            {
+                for (int i = target.Length - 1; i >= 0 && carry != 0; i--)
+                {
+                    ulong sum = target[i] + (carry & 0xFFUL);
+                    target[i] = (byte)sum;
+                    carry = (carry >> 8) + (sum >> 8);
+                }
+            }
+        }
+
+        private static Aes GetAes(ReadOnlySpan<byte> key)
+        {
+            aes ??= Aes.Create();
+            aes.Mode = CipherMode.ECB;
+            aes.Padding = PaddingMode.None;
+            if (key.Length == 16)
+            {
+                aesKey16 ??= new byte[16];
+                key.CopyTo(aesKey16);
+                aes.Key = aesKey16;
+            }
+            else if (key.Length == 24)
+            {
+                aesKey24 ??= new byte[24];
+                key.CopyTo(aesKey24);
+                aes.Key = aesKey24;
+            }
+            else
+            {
+                aesKey32 ??= new byte[32];
+                key.CopyTo(aesKey32);
+                aes.Key = aesKey32;
+            }
+
+            return aes;
+        }
+
+        private static bool HasValidPadding(ReadOnlySpan<byte> block)
+        {
+            int pad = block[block.Length - 1];
+            if (pad < 1 || pad > block.Length)
+            {
+                return false;
+            }
+
+            for (int i = block.Length - pad; i < block.Length; i++)
+            {
+                if (block[i] != pad)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static void ScanManagedArrays(ReadOnlySpan<byte> data, KeyValidationContext context, IDictionary<string, CapturedKey> keys)
+        {
+            int required = Math.Min(2, context.Tails.Count);
+            int strict = context.Tails.Count;
+            for (int offset = 32; offset + 16 <= data.Length; offset += 8)
             {
                 long length = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(offset - 8, 8));
-                if (length is not (16 or 24 or 32))
+                if (length < 16 || length > MaximumWindowArrayBytes)
                 {
                     continue;
                 }
@@ -264,19 +673,212 @@ namespace AssetStudio
                 }
 
                 long classPointer = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(offset - 32, 8));
-                if (classPointer <= 0 || (ulong)classPointer > 0x7FFFFFFFFFFFUL)
+                if (classPointer <= 0 || (ulong)classPointer > MaximumClassPointer || offset + length > data.Length)
                 {
                     continue;
                 }
 
-                ReadOnlySpan<byte> key = data.Slice(offset, (int)length);
-                if (!IsKeyAccepted(CountTailMatches(key, tails), tails.Count))
+                ReadOnlySpan<byte> bytes = data.Slice(offset, (int)length);
+                if (length is 16 or 24 or 32)
                 {
-                    continue;
+                    Add(keys, Identify(bytes, context, true, required));
                 }
 
-                keys[Convert.ToHexString(key)] = key.ToArray();
+                AddTextCandidates(bytes, context, keys, required);
+                if (length > 32)
+                {
+                    for (int start = 0; start + 16 <= length; start += 8)
+                    {
+                        for (int size = 32; size >= 16; size -= 8)
+                        {
+                            if (start + size <= length)
+                            {
+                                Add(keys, Identify(bytes.Slice(start, size), context, false, strict));
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        private static void ScanManagedStrings(ReadOnlySpan<byte> data, KeyValidationContext context, IDictionary<string, CapturedKey> keys)
+        {
+            int required = Math.Min(2, context.Tails.Count);
+            Span<byte> chars = stackalloc byte[MaximumTextLength];
+            Span<byte> decoded = stackalloc byte[32];
+            for (int offset = 20; offset + 32 <= data.Length; offset += 8)
+            {
+                int length = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset - 4, 4));
+                if (length < 16 || length > MaximumTextLength)
+                {
+                    continue;
+                }
+
+                long classPointer = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(offset - 20, 8));
+                if (classPointer <= 0 || (ulong)classPointer > MaximumClassPointer || offset + (long)length * 2 > data.Length)
+                {
+                    continue;
+                }
+
+                bool ascii = true;
+                for (int i = 0; i < length; i++)
+                {
+                    if (data[offset + i * 2 + 1] != 0)
+                    {
+                        ascii = false;
+                        break;
+                    }
+
+                    chars[i] = data[offset + i * 2];
+                }
+
+                if (!ascii)
+                {
+                    continue;
+                }
+
+                ReadOnlySpan<byte> text = chars.Slice(0, length);
+                if (length is 16 or 24 or 32)
+                {
+                    Add(keys, Identify(text, context, true, required));
+                }
+
+                if (length is 32 or 48 or 64 && TryDecodeHex(text, decoded, out int written))
+                {
+                    Add(keys, Identify(decoded.Slice(0, written), context, true, required));
+                }
+
+                if (length is 22 or 24 or 32 or 43 or 44 && TryDecodeBase64(text, decoded, out written) && written is 16 or 24 or 32)
+                {
+                    Add(keys, Identify(decoded.Slice(0, written), context, true, required));
+                }
+            }
+        }
+
+        private static void AddTextCandidates(ReadOnlySpan<byte> bytes, KeyValidationContext context, IDictionary<string, CapturedKey> keys, int required)
+        {
+            foreach (byte b in bytes)
+            {
+                if (b < 0x20 || b > 0x7E)
+                {
+                    return;
+                }
+            }
+
+            Span<byte> decoded = stackalloc byte[32];
+            if (bytes.Length is 32 or 48 or 64 && TryDecodeHex(bytes, decoded, out int written))
+            {
+                Add(keys, Identify(decoded.Slice(0, written), context, true, required));
+            }
+
+            if (bytes.Length is 24 or 32 or 44 && TryDecodeBase64(bytes, decoded, out written) && written is 16 or 24 or 32)
+            {
+                Add(keys, Identify(decoded.Slice(0, written), context, true, required));
+            }
+        }
+
+        private static void Add(IDictionary<string, CapturedKey> keys, CapturedKey? key)
+        {
+            if (key != null)
+            {
+                keys[key.Id] = key;
+            }
+        }
+
+        private static bool TryDecodeHex(ReadOnlySpan<byte> text, Span<byte> output, out int written)
+        {
+            written = 0;
+            for (int i = 0; i + 1 < text.Length; i += 2)
+            {
+                int high = HexValue(text[i]);
+                int low = HexValue(text[i + 1]);
+                if (high < 0 || low < 0 || written >= output.Length)
+                {
+                    return false;
+                }
+
+                output[written++] = (byte)(high << 4 | low);
+            }
+
+            return written > 0;
+        }
+
+        private static int HexValue(byte value)
+        {
+            if (value is >= (byte)'0' and <= (byte)'9')
+            {
+                return value - '0';
+            }
+
+            if (value is >= (byte)'a' and <= (byte)'f')
+            {
+                return value - 'a' + 10;
+            }
+
+            return value is >= (byte)'A' and <= (byte)'F' ? value - 'A' + 10 : -1;
+        }
+
+        private static bool TryDecodeBase64(ReadOnlySpan<byte> text, Span<byte> output, out int written)
+        {
+            written = 0;
+            uint accumulator = 0;
+            int bits = 0;
+            int padding = 0;
+            for (int i = 0; i < text.Length; i++)
+            {
+                byte value = text[i];
+                if (value == (byte)'=')
+                {
+                    padding++;
+                    continue;
+                }
+
+                if (padding > 0)
+                {
+                    return false;
+                }
+
+                int digit = Base64Value(value);
+                if (digit < 0)
+                {
+                    return false;
+                }
+
+                accumulator = (accumulator << 6) | (uint)digit;
+                bits += 6;
+                if (bits >= 8)
+                {
+                    bits -= 8;
+                    if (written >= output.Length)
+                    {
+                        return false;
+                    }
+
+                    output[written++] = (byte)(accumulator >> bits);
+                }
+            }
+
+            return written > 0 && (padding == 0 || text.Length % 4 == 0);
+        }
+
+        private static int Base64Value(byte value)
+        {
+            if (value is >= (byte)'A' and <= (byte)'Z')
+            {
+                return value - 'A';
+            }
+
+            if (value is >= (byte)'a' and <= (byte)'z')
+            {
+                return value - 'a' + 26;
+            }
+
+            if (value is >= (byte)'0' and <= (byte)'9')
+            {
+                return value - '0' + 52;
+            }
+
+            return value == (byte)'+' ? 62 : value == (byte)'/' ? 63 : -1;
         }
 
         private static void ScanPlaintextBundles(ReadOnlySpan<byte> data, int maxDumpBytes, IDictionary<string, PlaintextBundleDump> dumps, long address)
@@ -304,63 +906,6 @@ namespace AssetStudio
                     dumps[dump.Id] = dump;
                 }
             }
-        }
-
-        public static GameMemoryScanResult ScanProcess(int processId, IReadOnlyList<byte[]> tails, int maxDumpBytes = DefaultDumpBytes, CancellationToken cancellationToken = default)
-        {
-            if (!OperatingSystem.IsWindows())
-            {
-                throw new PlatformNotSupportedException("Capturing keys from a running game is only available on Windows.");
-            }
-
-            var keys = new ConcurrentDictionary<string, byte[]>();
-            var dumps = new ConcurrentDictionary<string, PlaintextBundleDump>();
-            IntPtr process = ProcessMemoryReader.Open(processId, out int errorCode);
-            if (process == IntPtr.Zero)
-            {
-                throw new GameMemoryAccessException(errorCode);
-            }
-
-            try
-            {
-                var chunks = ProcessMemoryReader.EnumerateReadableChunks(process, ChunkSize);
-                var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 2), CancellationToken = cancellationToken };
-                Parallel.ForEach(chunks, options, chunk =>
-                {
-                    int length = (int)Math.Min(chunk.Size + OverlapBytes, chunk.RegionEnd - chunk.Address);
-                    byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
-                    try
-                    {
-                        if (ProcessMemoryReader.TryRead(process, chunk.Address, buffer, length))
-                        {
-                            ScanBuffer(buffer.AsSpan(0, length), tails, maxDumpBytes, keys, dumps, chunk.Address);
-                        }
-                        else
-                        {
-                            for (long offset = 0; offset < chunk.Size; offset += 65536)
-                            {
-                                int piece = (int)Math.Min(65536, chunk.Size - offset);
-                                if (ProcessMemoryReader.TryRead(process, chunk.Address + offset, buffer, piece))
-                                {
-                                    ScanBuffer(buffer.AsSpan(0, piece), tails, maxDumpBytes, keys, dumps, chunk.Address + offset);
-                                }
-                            }
-                        }
-                    }
-                    finally
-                    {
-                        ArrayPool<byte>.Shared.Return(buffer);
-                    }
-                });
-            }
-            finally
-            {
-                ProcessMemoryReader.Close(process);
-            }
-
-            return new GameMemoryScanResult(
-                keys.Values.OrderBy(key => key.Length).ThenBy(key => Convert.ToHexString(key), StringComparer.Ordinal).ToArray(),
-                dumps.Values.OrderByDescending(dump => dump.Data.Length).ThenBy(dump => dump.Address).ToArray());
         }
     }
 }

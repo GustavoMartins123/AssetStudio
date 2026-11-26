@@ -19,6 +19,253 @@ namespace AssetStudio.Tests
         private const string GameName = "Sample Game";
         private const string Revision = "6000.3.13f1";
 
+        public static TheoryData<string> CipherScenarios => new()
+        {
+            "cbc-fixed-iv", "cbc-iv-prefix", "cbc-no-padding", "ecb-pkcs7", "ecb-no-padding", "rijndael256-cbc", "ctr-big-endian", "ctr-little-endian",
+        };
+
+        [Theory]
+        [MemberData(nameof(CipherScenarios))]
+        public void Capture_IdentifiesTheScheme_RecoversTheMask_AndDecryptsThroughThePipeline(string scenario)
+        {
+            bool padding = scenario is "cbc-fixed-iv" or "cbc-iv-prefix" or "ecb-pkcs7" or "rijndael256-cbc";
+            bool ivPrefix = scenario is "cbc-iv-prefix" or "ctr-big-endian" or "ctr-little-endian";
+            int maskLength = scenario switch
+            {
+                "cbc-fixed-iv" or "cbc-no-padding" => 256,
+                "cbc-iv-prefix" or "ctr-big-endian" => 4096,
+                "ecb-pkcs7" => 512,
+                "rijndael256-cbc" => 96,
+                _ => 0,
+            };
+            var random = new Random(41);
+            byte[] key = new byte[32];
+            byte[] iv = new byte[32];
+            byte[] mask = new byte[maskLength];
+            random.NextBytes(key);
+            random.NextBytes(iv);
+            random.NextBytes(mask);
+
+            int alignment = padding && scenario != "rijndael256-cbc" ? 1 : 16;
+            byte[] smallPlain = BuildBundle(2800, alignment, 9);
+            byte[] bigPlain = BuildBundle(20000, alignment, 8);
+            string root = CreateTempDirectory();
+            string bundleDir = CreateGameLayout(root);
+            string? profileId = null;
+            try
+            {
+                string smallPath = Path.Combine(bundleDir, "small.enc");
+                string bigPath = Path.Combine(bundleDir, "big.enc");
+                File.WriteAllBytes(smallPath, Encrypt(scenario, smallPlain, key, iv, mask));
+                File.WriteAllBytes(bigPath, Encrypt(scenario, bigPlain, key, iv, mask));
+                string[] files = { smallPath, bigPath };
+
+                List<FileTail> tails = KeyValidationContext.LoadTails(files);
+                Assert.Equal(2, tails.Count);
+                var image = new ManagedImage(random);
+                image.AddArray(key).AddArray(new byte[32]);
+                image.AddDump(MakeDump(bigPlain, maskLength >= 4096 ? 32760 : 8184));
+                image.AddDump(MakeDump(smallPlain, smallPlain.Length));
+
+                (List<CapturedKey> keys, List<PlaintextBundleDump> dumps) = Scan(image.ToArray(), KeyValidationContext.Create(tails, files, null));
+                Assert.Equal(2, dumps.Count);
+                if (padding)
+                {
+                    Assert.Single(keys);
+                }
+                else
+                {
+                    Assert.Empty(keys);
+                    (keys, _) = Scan(image.ToArray(), KeyValidationContext.Create(tails, files, dumps));
+                }
+
+                CapturedKey captured = Assert.Single(keys);
+                Assert.Equal(key, captured.Key);
+                Assert.Equal(scenario == "rijndael256-cbc" ? CapturedCipherKind.Rijndael256 : CapturedCipherKind.Aes, captured.Kind);
+                Assert.Equal(scenario.StartsWith("ecb", StringComparison.Ordinal) ? CapturedCipherMode.Ecb
+                    : scenario.StartsWith("ctr", StringComparison.Ordinal) ? CapturedCipherMode.Ctr
+                    : CapturedCipherMode.Cbc, captured.Mode);
+                Assert.Equal(padding, captured.Padding);
+                Assert.Equal(scenario == "ctr-little-endian" ? 1u : 0u, captured.CounterStart);
+                Assert.Equal(scenario == "ctr-little-endian", captured.CounterLittleEndian);
+
+                Assert.True(RuntimeCipherRecovery.TryRecover(captured, files, dumps, out CapturedCipher? cipher));
+                Assert.NotNull(cipher);
+                Assert.Equal(ivPrefix, cipher!.IvFromStreamPrefix);
+                Assert.Equal(mask.Length, cipher.Mask.Length);
+                int blockSize = captured.BlockSize;
+                if (ivPrefix || captured.Mode != CapturedCipherMode.Cbc)
+                {
+                    Assert.Equal(mask, cipher.Mask);
+                }
+                else
+                {
+                    Assert.Equal(new byte[blockSize], cipher.Mask.Take(blockSize).ToArray());
+                    Assert.Equal(mask.Skip(blockSize).ToArray(), cipher.Mask.Skip(blockSize).ToArray());
+                    Assert.Equal(Xor(iv.AsSpan(0, blockSize).ToArray(), mask.Take(blockSize).ToArray()), cipher.FixedIv);
+                }
+                Assert.True(RuntimeCipherRecovery.IsMaskConfirmed(cipher));
+                Assert.Equal(2, RuntimeCipherRecovery.ValidateOnFiles(cipher, files, out int checkedCount));
+                Assert.Equal(2, checkedCount);
+
+                DecryptionProfile profile = GameKeyCapture.BuildProfile(GameCaptureTarget.TryResolve(bigPath)!, cipher);
+                Assert.True(profile.Validate(out string? error), error);
+                Assert.Equal(scenario == "rijndael256-cbc" ? "rijndael-cbc"
+                    : scenario.StartsWith("ctr", StringComparison.Ordinal) ? "aes-ctr"
+                    : scenario.StartsWith("ecb", StringComparison.Ordinal) ? "aes-ecb"
+                    : "aes-cbc", profile.Algorithm);
+                Assert.Equal(padding, profile.Padding == "pkcs7");
+                DecryptionHelper.RegisterProfile(profile);
+                profileId = profile.Id;
+                AssertDecrypted(bigPath, bigPlain);
+                AssertDecrypted(smallPath, smallPlain);
+            }
+            finally
+            {
+                if (profileId != null)
+                {
+                    DecryptionHelper.RemoveProfile(profileId);
+                }
+
+                TryDeleteDirectory(root);
+            }
+        }
+
+        [Fact]
+        public void GameMemoryCapture_FindsKeysStoredAsManagedStrings()
+        {
+            var random = new Random(51);
+            foreach (string format in new[] { "hex", "base64", "passphrase" })
+            {
+                byte[] key = new byte[32];
+                random.NextBytes(key);
+                string text = format switch
+                {
+                    "hex" => Convert.ToHexString(key),
+                    "base64" => Convert.ToBase64String(key),
+                    _ => RandomText(32, random),
+                };
+                if (format == "passphrase")
+                {
+                    key = Encoding.ASCII.GetBytes(text);
+                }
+
+                string folder = CreateTempDirectory();
+                try
+                {
+                    string[] files = WriteCbcFiles(folder, key, random);
+                    List<FileTail> tails = KeyValidationContext.LoadTails(files);
+                    var image = new ManagedImage(random);
+                    image.AddString("This sentence is not a key at all, honestly!");
+                    image.AddString(Convert.ToHexString(new byte[16]));
+                    image.AddString(Convert.ToBase64String(new byte[24]));
+                    image.AddString(text);
+                    (List<CapturedKey> keys, _) = Scan(image.ToArray(), KeyValidationContext.Create(tails, files, null));
+                    CapturedKey captured = Assert.Single(keys);
+                    Assert.True(key.SequenceEqual(captured.Key), format);
+                }
+                finally
+                {
+                    TryDeleteDirectory(folder);
+                }
+            }
+        }
+
+        [Fact]
+        public void GameMemoryCapture_FindsKeyInsideALargerBuffer_AndEncodedInAByteArray()
+        {
+            var random = new Random(61);
+            byte[] key = new byte[32];
+            random.NextBytes(key);
+            string folder = CreateTempDirectory();
+            try
+            {
+                string[] files = WriteCbcFiles(folder, key, random);
+                List<FileTail> tails = KeyValidationContext.LoadTails(files);
+                var noise = new byte[48];
+                random.NextBytes(noise);
+                var largerBuffer = new ManagedImage(random);
+                largerBuffer.AddArray(noise);
+                largerBuffer.AddArray(key.Concat(new byte[16]).ToArray());
+                (List<CapturedKey> fromBuffer, _) = Scan(largerBuffer.ToArray(), KeyValidationContext.Create(tails, files, null));
+                CapturedKey inBuffer = Assert.Single(fromBuffer);
+                Assert.True(key.SequenceEqual(inBuffer.Key));
+
+                var encodedText = new ManagedImage(random);
+                encodedText.AddArray(Encoding.ASCII.GetBytes(Convert.ToHexString(key)));
+                (List<CapturedKey> fromText, _) = Scan(encodedText.ToArray(), KeyValidationContext.Create(tails, files, null));
+                CapturedKey inText = Assert.Single(fromText);
+                Assert.True(key.SequenceEqual(inText.Key));
+            }
+            finally
+            {
+                TryDeleteDirectory(folder);
+            }
+        }
+
+        [Fact]
+        public void GameMemoryCapture_FindsShortKeys_AfterLargerCandidates()
+        {
+            var random = new Random(81);
+            foreach (int keyLength in new[] { 16, 24 })
+            {
+                byte[] key = new byte[keyLength];
+                random.NextBytes(key);
+                string folder = CreateTempDirectory();
+                try
+                {
+                    string[] files = WriteCbcFiles(folder, key, random);
+                    List<FileTail> tails = KeyValidationContext.LoadTails(files);
+                    var image = new ManagedImage(random);
+                    for (int i = 0; i < 50; i++)
+                    {
+                        var noise = new byte[32];
+                        random.NextBytes(noise);
+                        image.AddArray(noise);
+                    }
+
+                    image.AddArray(key);
+                    (List<CapturedKey> keys, _) = Scan(image.ToArray(), KeyValidationContext.Create(tails, files, null));
+                    CapturedKey captured = Assert.Single(keys);
+                    Assert.True(key.SequenceEqual(captured.Key), "key length " + keyLength);
+                    Assert.Equal(CapturedCipherKind.Aes, captured.Kind);
+                }
+                finally
+                {
+                    TryDeleteDirectory(folder);
+                }
+            }
+        }
+
+        [Fact]
+        public void GameMemoryCapture_IgnoresKeysThatDoNotMatchTheFiles()
+        {
+            var random = new Random(71);
+            byte[] key = new byte[32];
+            random.NextBytes(key);
+            string folder = CreateTempDirectory();
+            try
+            {
+                string[] files = WriteCbcFiles(folder, key, random);
+                List<FileTail> tails = KeyValidationContext.LoadTails(files);
+                var image = new ManagedImage(random);
+                for (int i = 0; i < 200; i++)
+                {
+                    var noise = new byte[32];
+                    random.NextBytes(noise);
+                    image.AddArray(noise);
+                }
+
+                (List<CapturedKey> keys, List<PlaintextBundleDump> dumps) = Scan(image.ToArray(), KeyValidationContext.Create(tails, files, null));
+                Assert.Empty(keys);
+                Assert.Empty(dumps);
+            }
+            finally
+            {
+                TryDeleteDirectory(folder);
+            }
+        }
+
         [Fact]
         public void RawHeaderMask_RoundTrips_AndRequiresMatchingLength()
         {
@@ -42,196 +289,6 @@ namespace AssetStudio.Tests
             Assert.False(new HeaderMaskProfile { Type = "raw" }.Validate(out error));
             Assert.False(new HeaderMaskProfile { Type = "raw", Length = 3, DataBase64 = "***" }.Validate(out error));
             Assert.False(new HeaderMaskProfile { Type = "raw", Length = 0, DataBase64 = "AQID" }.Validate(out error));
-        }
-
-        [Fact]
-        public void GameMemoryCapture_FindsManagedKeyArray_ByPadding_AndPlainBundleHeader()
-        {
-            var random = new Random(11);
-            byte[] key = new byte[32];
-            random.NextBytes(key);
-            byte[] plain = BuildLz4Bundle("CAB-scan", 2400, 5);
-            byte[] first = EncryptWithKey(new byte[2000], key, random);
-            byte[] second = EncryptWithKey(new byte[5000], key, random);
-            string folder = CreateTempDirectory();
-            try
-            {
-                string firstPath = Path.Combine(folder, "a.enc");
-                string secondPath = Path.Combine(folder, "b.enc");
-                File.WriteAllBytes(firstPath, first);
-                File.WriteAllBytes(secondPath, second);
-                List<byte[]> tails = GameMemoryCapture.LoadTails(new[] { firstPath, secondPath });
-                Assert.Equal(2, tails.Count);
-                Assert.Equal(2, GameMemoryCapture.CountTailMatches(key, tails));
-                Assert.Equal(0, GameMemoryCapture.CountTailMatches(new byte[32], tails));
-                Assert.True(GameMemoryCapture.IsKeyAccepted(2, 2));
-                Assert.False(GameMemoryCapture.IsKeyAccepted(1, 2));
-                Assert.True(GameMemoryCapture.IsKeyAccepted(1, 1));
-
-                var decoy = new byte[32];
-                random.NextBytes(decoy);
-                byte[] image = BuildMemoryImage(new[] { key, new byte[16], new byte[24], decoy }, MakeDump(plain, plain.Length));
-                var keys = new Dictionary<string, byte[]>();
-                var dumps = new Dictionary<string, PlaintextBundleDump>();
-                GameMemoryCapture.ScanBuffer(image, tails, 65536, keys, dumps);
-                Assert.Single(keys);
-                Assert.Equal(key, keys[Convert.ToHexString(key)]);
-                PlaintextBundleDump dump = Assert.Single(dumps.Values);
-                Assert.Equal(plain.Length, dump.DeclaredSize);
-                Assert.Equal(Revision, dump.Revision);
-                Assert.Equal(plain, dump.Data.AsSpan(0, plain.Length).ToArray());
-
-                GameMemoryCapture.ScanBuffer(new byte[8192], tails, 65536, keys, dumps);
-                Assert.Single(keys);
-                Assert.Single(dumps);
-            }
-            finally
-            {
-                TryDeleteDirectory(folder);
-            }
-        }
-
-        [Fact]
-        public void FixedIvCapture_RecoversKeyIvAndMask_ThenDecryptsThroughThePipeline()
-        {
-            var random = new Random(21);
-            byte[] key = new byte[32];
-            byte[] iv = new byte[16];
-            byte[] mask = new byte[256];
-            random.NextBytes(key);
-            random.NextBytes(iv);
-            random.NextBytes(mask);
-
-            byte[] smallPlain = BuildLz4Bundle("CAB-small", 1600, 6);
-            byte[] bigPlain = BuildLz4Bundle("CAB-big", 20000, 7);
-            string root = CreateTempDirectory();
-            string bundleDir = CreateGameLayout(root);
-            string? profileId = null;
-            try
-            {
-                string smallPath = Path.Combine(bundleDir, "small_0000000000000000000000000000.bundle.enc");
-                string bigPath = Path.Combine(bundleDir, "big_1111111111111111111111111111.bundle.enc");
-                File.WriteAllBytes(smallPath, Encrypt(smallPlain, key, iv, mask, false));
-                File.WriteAllBytes(bigPath, Encrypt(bigPlain, key, iv, mask, false));
-                string[] files = { smallPath, bigPath };
-
-                var dumps = new List<PlaintextBundleDump>
-                {
-                    Wrap(MakeDump(bigPlain, 8184)),
-                    Wrap(MakeDump(smallPlain, smallPlain.Length)),
-                };
-
-                Assert.True(RuntimeCipherRecovery.TryRecover(key, files, dumps, out CapturedCipher? cipher));
-                Assert.NotNull(cipher);
-                Assert.False(cipher!.IvFromStreamPrefix);
-                Assert.Equal(256, cipher.Mask.Length);
-                Assert.Equal(new byte[16], cipher.Mask.Take(16).ToArray());
-                Assert.Equal(mask.Skip(16).ToArray(), cipher.Mask.Skip(16).ToArray());
-                Assert.Equal(Xor(iv, mask.Take(16).ToArray()), cipher.FixedIv);
-                Assert.True(RuntimeCipherRecovery.IsMaskConfirmed(cipher));
-                Assert.Equal(8184 - 256, cipher.VerifiedBytes);
-                Assert.Equal(2, RuntimeCipherRecovery.ValidateOnFiles(cipher, files, out int checkedCount));
-                Assert.Equal(2, checkedCount);
-
-                Assert.False(RuntimeCipherRecovery.TryRecover(new byte[32], files, dumps, out _));
-
-                GameCaptureTarget? target = GameCaptureTarget.TryResolve(smallPath);
-                Assert.NotNull(target);
-                Assert.Equal(Path.Combine(root, GameName, GameName + ".exe"), target!.ExecutablePath);
-                Assert.Equal(bigPath, target.SampleFiles[0]);
-                Assert.Equal("Sample Game", target.GameName);
-
-                DecryptionProfile profile = GameKeyCapture.BuildProfile(target, cipher);
-                Assert.True(profile.Validate(out string? error), error);
-                Assert.Equal("*.enc", profile.FileNamePattern);
-                Assert.Equal("*/Sample Game/Sample Game_Data/StreamingAssets/EncryptedBundles/*", profile.PathPattern);
-                Assert.Equal("raw", profile.HeaderMask!.Type);
-                Assert.Equal(256, profile.HeaderMask.Length);
-
-                DecryptionHelper.RegisterProfile(profile);
-                profileId = profile.Id;
-                AssertDecrypted(smallPath, smallPlain);
-                AssertDecrypted(bigPath, bigPlain);
-
-                string otherDir = Path.Combine(root, "Other Game", "Other Game_Data");
-                Directory.CreateDirectory(otherDir);
-                File.WriteAllBytes(Path.Combine(root, "Other Game", "Other Game.exe"), new byte[] { 1 });
-                string foreignPath = Path.Combine(otherDir, "big_1111111111111111111111111111.bundle.enc");
-                File.WriteAllBytes(foreignPath, File.ReadAllBytes(bigPath));
-                using (var stream = File.OpenRead(foreignPath))
-                {
-                    using Stream? decoded = DecryptionHelper.CheckAndDecryptStream(stream, foreignPath, out string? providerId, out _);
-                    Assert.NotEqual("DeclarativeProfile", providerId);
-                }
-            }
-            finally
-            {
-                if (profileId != null)
-                {
-                    DecryptionHelper.RemoveProfile(profileId);
-                }
-
-                TryDeleteDirectory(root);
-            }
-        }
-
-        [Fact]
-        public void IvPrefixCapture_RecoversLargeMask_AndFullyMaskedShortFileLoads()
-        {
-            var random = new Random(31);
-            byte[] key = new byte[32];
-            byte[] iv = new byte[16];
-            byte[] mask = new byte[4096];
-            random.NextBytes(key);
-            random.NextBytes(iv);
-            random.NextBytes(mask);
-
-            byte[] bigPlain = BuildLz4Bundle("CAB-wide", 40000, 8);
-            byte[] smallPlain = BuildBundleWithPartialTailBlock(2800);
-            string root = CreateTempDirectory();
-            string bundleDir = CreateGameLayout(root);
-            string? profileId = null;
-            try
-            {
-                string bigPath = Path.Combine(bundleDir, "wide.enc");
-                string smallPath = Path.Combine(bundleDir, "narrow.enc");
-                File.WriteAllBytes(bigPath, Encrypt(bigPlain, key, iv, mask, true));
-                File.WriteAllBytes(smallPath, Encrypt(smallPlain, key, iv, mask, true));
-                string[] files = { smallPath, bigPath };
-                PlaintextBundleDump bigDump = Wrap(MakeDump(bigPlain, 32760));
-                PlaintextBundleDump smallDump = Wrap(MakeDump(smallPlain, smallPlain.Length));
-                var dumps = new List<PlaintextBundleDump> { bigDump, smallDump };
-
-                Assert.True(RuntimeCipherRecovery.TryRecover(key, files, dumps, out CapturedCipher? cipher));
-                Assert.NotNull(cipher);
-                Assert.True(cipher!.IvFromStreamPrefix);
-                Assert.Equal(4096, cipher.Mask.Length);
-                Assert.Equal(mask, cipher.Mask);
-                Assert.Equal(32760 - 4096, cipher.VerifiedBytes);
-                Assert.True(RuntimeCipherRecovery.IsMaskConfirmed(cipher));
-                Assert.Equal(2, RuntimeCipherRecovery.ValidateOnFiles(cipher, files, out int checkedCount));
-                Assert.Equal(2, checkedCount);
-
-                Assert.False(RuntimeCipherRecovery.TryRecover(key, new[] { smallPath }, new[] { smallDump }, out _));
-
-                DecryptionProfile profile = GameKeyCapture.BuildProfile(GameCaptureTarget.TryResolve(bigPath)!, cipher);
-                Assert.True(profile.Validate(out string? error), error);
-                Assert.True(profile.IvFromStreamPrefix);
-                Assert.Equal("raw", profile.HeaderMask!.Type);
-                DecryptionHelper.RegisterProfile(profile);
-                profileId = profile.Id;
-                AssertDecrypted(bigPath, bigPlain);
-                AssertDecrypted(smallPath, smallPlain);
-            }
-            finally
-            {
-                if (profileId != null)
-                {
-                    DecryptionHelper.RemoveProfile(profileId);
-                }
-
-                TryDeleteDirectory(root);
-            }
         }
 
         [Fact]
@@ -318,6 +375,31 @@ namespace AssetStudio.Tests
             }
         }
 
+        private static string[] WriteCbcFiles(string folder, byte[] key, Random random)
+        {
+            var files = new List<string>();
+            for (int i = 0; i < 2; i++)
+            {
+                var iv = new byte[16];
+                random.NextBytes(iv);
+                var plain = new byte[2000 * (i + 1)];
+                random.NextBytes(plain);
+                string path = Path.Combine(folder, $"pack_{i}.enc");
+                File.WriteAllBytes(path, EncryptAes(plain, key, iv, Array.Empty<byte>(), CipherMode.CBC, true, false));
+                files.Add(path);
+            }
+
+            return files.ToArray();
+        }
+
+        private static (List<CapturedKey> Keys, List<PlaintextBundleDump> Dumps) Scan(byte[] image, KeyValidationContext context)
+        {
+            var keys = new Dictionary<string, CapturedKey>(StringComparer.Ordinal);
+            var dumps = new Dictionary<string, PlaintextBundleDump>(StringComparer.Ordinal);
+            GameMemoryCapture.ScanBuffer(image, context, 65536, keys, dumps);
+            return (keys.Values.ToList(), dumps.Values.ToList());
+        }
+
         private static void AssertDecrypted(string path, byte[] expected)
         {
             using var stream = File.OpenRead(path);
@@ -329,11 +411,16 @@ namespace AssetStudio.Tests
             Assert.Equal(expected, copy.ToArray());
         }
 
-        private static PlaintextBundleDump Wrap(byte[] data)
+        private static string RandomText(int length, Random random)
         {
-            PlaintextBundleDump? dump = PlaintextBundleDump.FromMemory(data);
-            Assert.NotNull(dump);
-            return dump!;
+            const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            var chars = new char[length];
+            for (int i = 0; i < chars.Length; i++)
+            {
+                chars[i] = alphabet[random.Next(alphabet.Length)];
+            }
+
+            return new string(chars);
         }
 
         private static byte[] MakeDump(byte[] plain, int faithfulBytes)
@@ -343,41 +430,24 @@ namespace AssetStudio.Tests
             return dump;
         }
 
-        private static byte[] BuildMemoryImage(byte[][] arrays, byte[] dump)
+        private static byte[] Encrypt(string scenario, byte[] plain, byte[] key, byte[] iv, byte[] mask)
         {
-            var image = new byte[1 << 17];
-            new Random(17).NextBytes(image);
-            int cursor = 64;
-            foreach (byte[] item in arrays)
+            return scenario switch
             {
-                BinaryPrimitives.WriteInt64LittleEndian(image.AsSpan(cursor, 8), 0x00007FF123450000L);
-                Array.Clear(image, cursor + 8, 16);
-                BinaryPrimitives.WriteInt64LittleEndian(image.AsSpan(cursor + 24, 8), item.Length);
-                item.CopyTo(image, cursor + 32);
-                cursor += 256;
-            }
-
-            dump.CopyTo(image, 32768);
-            return image;
+                "cbc-fixed-iv" => EncryptAes(plain, key, iv.AsSpan(0, 16).ToArray(), mask, CipherMode.CBC, true, false),
+                "cbc-iv-prefix" => EncryptAes(plain, key, iv.AsSpan(0, 16).ToArray(), mask, CipherMode.CBC, true, true),
+                "cbc-no-padding" => EncryptAes(plain, key, iv.AsSpan(0, 16).ToArray(), mask, CipherMode.CBC, false, false),
+                "ecb-pkcs7" => EncryptAes(plain, key, iv.AsSpan(0, 16).ToArray(), mask, CipherMode.ECB, true, false),
+                "ecb-no-padding" => EncryptAes(plain, key, iv.AsSpan(0, 16).ToArray(), mask, CipherMode.ECB, false, false),
+                "rijndael256-cbc" => EncryptRijndael(plain, key, iv, mask),
+                _ => EncryptCtr(plain, key, iv.AsSpan(0, 16).ToArray(), mask, scenario == "ctr-little-endian" ? 1u : 0u, scenario == "ctr-little-endian"),
+            };
         }
 
-        private static byte[] EncryptWithKey(byte[] plain, byte[] key, Random random)
-        {
-            using var aes = Aes.Create();
-            aes.Key = key;
-            aes.Mode = CipherMode.CBC;
-            aes.Padding = PaddingMode.PKCS7;
-            var iv = new byte[16];
-            random.NextBytes(iv);
-            aes.IV = iv;
-            using var encryptor = aes.CreateEncryptor();
-            return encryptor.TransformFinalBlock(plain, 0, plain.Length);
-        }
-
-        private static byte[] Encrypt(byte[] plain, byte[] key, byte[] iv, byte[] mask, bool ivPrefix)
+        private static byte[] EncryptAes(byte[] plain, byte[] key, byte[] iv, byte[] mask, CipherMode mode, bool padding, bool ivPrefix)
         {
             int masked = Math.Min(mask.Length, plain.Length);
-            byte[] padded = Pad(plain, 16);
+            byte[] padded = padding ? Pad(plain, 16) : (byte[])plain.Clone();
             for (int i = 0; i < masked; i++)
             {
                 padded[i] ^= mask[i];
@@ -385,21 +455,90 @@ namespace AssetStudio.Tests
 
             using var aes = Aes.Create();
             aes.Key = key;
-            aes.IV = iv;
-            aes.Mode = CipherMode.CBC;
+            aes.Mode = mode;
             aes.Padding = PaddingMode.None;
+            aes.IV = iv;
             using var encryptor = aes.CreateEncryptor();
             byte[] cipher = encryptor.TransformFinalBlock(padded, 0, padded.Length);
             return ivPrefix ? iv.Concat(cipher).ToArray() : cipher;
         }
 
-        private static byte[] Pad(byte[] data, int blockSize)
+        private static byte[] EncryptCtr(byte[] plain, byte[] key, byte[] iv, byte[] mask, uint counterStart, bool littleEndian)
         {
-            int pad = blockSize - data.Length % blockSize;
-            var padded = new byte[data.Length + pad];
-            data.CopyTo(padded, 0);
-            Array.Fill(padded, (byte)pad, data.Length, pad);
-            return padded;
+            var output = new byte[plain.Length];
+            using var aes = Aes.Create();
+            aes.Key = key;
+            aes.Mode = CipherMode.ECB;
+            aes.Padding = PaddingMode.None;
+            Span<byte> counter = stackalloc byte[16];
+            Span<byte> stream = stackalloc byte[16];
+            for (int offset = 0; offset < plain.Length; offset += 16)
+            {
+                AddCounter(iv, (ulong)(offset / 16) + counterStart, littleEndian, counter);
+                aes.EncryptEcb(counter, stream, PaddingMode.None);
+                for (int i = 0; i < 16 && offset + i < plain.Length; i++)
+                {
+                    byte masked = (byte)(plain[offset + i] ^ (offset + i < mask.Length ? mask[offset + i] : 0));
+                    output[offset + i] = (byte)(masked ^ stream[i]);
+                }
+            }
+
+            return iv.Concat(output).ToArray();
+        }
+
+        private static byte[] EncryptRijndael(byte[] plain, byte[] key, byte[] iv, byte[] mask)
+        {
+            int pad = 32 - plain.Length % 32;
+            var padded = new byte[plain.Length + pad];
+            plain.CopyTo(padded, 0);
+            Array.Fill(padded, (byte)pad, plain.Length, pad);
+            for (int i = 0; i < Math.Min(mask.Length, plain.Length); i++)
+            {
+                padded[i] ^= mask[i];
+            }
+
+            var cipher = new RijndaelBlockCipher(key, 256);
+            var output = new byte[padded.Length];
+            byte[] previous = iv;
+            var block = new byte[32];
+            var encrypted = new byte[32];
+            for (int offset = 0; offset < padded.Length; offset += 32)
+            {
+                for (int i = 0; i < 32; i++)
+                {
+                    block[i] = (byte)(padded[offset + i] ^ previous[i]);
+                }
+
+                cipher.EncryptBlock(block, encrypted);
+                encrypted.CopyTo(output, offset);
+                previous = encrypted;
+            }
+
+            return output;
+        }
+
+        private static void AddCounter(byte[] iv, ulong addition, bool littleEndian, Span<byte> target)
+        {
+            iv.CopyTo(target);
+            ulong carry = addition;
+            if (littleEndian)
+            {
+                for (int i = 0; i < 16 && carry != 0; i++)
+                {
+                    ulong sum = target[i] + (carry & 0xFFUL);
+                    target[i] = (byte)sum;
+                    carry = (carry >> 8) + (sum >> 8);
+                }
+            }
+            else
+            {
+                for (int i = 15; i >= 0 && carry != 0; i--)
+                {
+                    ulong sum = target[i] + (carry & 0xFFUL);
+                    target[i] = (byte)sum;
+                    carry = (carry >> 8) + (sum >> 8);
+                }
+            }
         }
 
         private static byte[] Xor(byte[] a, byte[] b)
@@ -413,6 +552,61 @@ namespace AssetStudio.Tests
             return result;
         }
 
+        private static byte[] Pad(byte[] data, int blockSize)
+        {
+            int pad = blockSize - data.Length % blockSize;
+            var padded = new byte[data.Length + pad];
+            data.CopyTo(padded, 0);
+            Array.Fill(padded, (byte)pad, data.Length, pad);
+            return padded;
+        }
+
+        private sealed class ManagedImage
+        {
+            private const int DumpBase = 1 << 17;
+            private readonly byte[] data = new byte[1 << 18];
+            private int cursor = 64;
+            private int dumps;
+
+            public ManagedImage(Random random) => random.NextBytes(data);
+
+            public ManagedImage AddArray(byte[] bytes)
+            {
+                cursor = (cursor + 7) & ~7;
+                BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(cursor, 8), 0x00007FF123450000L);
+                Array.Clear(data, cursor + 8, 16);
+                BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(cursor + 24, 8), bytes.Length);
+                bytes.CopyTo(data, cursor + 32);
+                cursor += 48 + bytes.Length;
+                return this;
+            }
+
+            public ManagedImage AddString(string text)
+            {
+                cursor = (cursor + 7) & ~7;
+                BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(cursor, 8), 0x00007FF123450000L);
+                Array.Clear(data, cursor + 8, 8);
+                BinaryPrimitives.WriteInt32LittleEndian(data.AsSpan(cursor + 16, 4), text.Length);
+                for (int i = 0; i < text.Length; i++)
+                {
+                    data[cursor + 20 + i * 2] = (byte)text[i];
+                    data[cursor + 21 + i * 2] = 0;
+                }
+
+                cursor += 36 + text.Length * 2;
+                return this;
+            }
+
+            public ManagedImage AddDump(byte[] dump)
+            {
+                Assert.True(dumps < 2);
+                dump.CopyTo(data, DumpBase + dumps++ * dump.Length);
+                return this;
+            }
+
+            public byte[] ToArray() => data;
+        }
+
         private static string CreateGameLayout(string root)
         {
             string gameDirectory = Path.Combine(root, GameName);
@@ -422,18 +616,18 @@ namespace AssetStudio.Tests
             return bundleDirectory;
         }
 
-        private static byte[] BuildBundleWithPartialTailBlock(int startLength)
+        private static byte[] BuildBundle(int startLength, int alignment, int seed)
         {
-            for (int length = startLength; length < startLength + 128; length++)
+            for (int length = startLength; length < startLength + 64; length++)
             {
-                byte[] bundle = BuildLz4Bundle("CAB-narrow", length, 9);
-                if (bundle.Length % 64 == 40)
+                byte[] bundle = BuildLz4Bundle("CAB-" + seed, length, seed);
+                if (alignment == 1 || bundle.Length % alignment == 0)
                 {
                     return bundle;
                 }
             }
 
-            throw new InvalidOperationException("No bundle with a partial 32-byte tail block was found.");
+            throw new InvalidOperationException("No bundle with the requested alignment was found.");
         }
 
         private static byte[] BuildLz4Bundle(string cabName, int payloadLength, int seed)
