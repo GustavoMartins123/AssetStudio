@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.IO.Enumeration;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
@@ -205,6 +206,11 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _validationError = string.Empty;
         private string _statusMessage = string.Empty;
         private string _pluginsSummaryText = string.Empty;
+        private readonly GameCaptureTarget? _captureTarget;
+        private bool _isCapturing;
+        private string _captureStatusText = string.Empty;
+        private string _captureAntiCheatText = string.Empty;
+        private double _captureProgressPercent;
 
         public DecryptionKeyDialogViewModel(
             DecryptionDialogContext context,
@@ -254,6 +260,8 @@ namespace AssetStudio.Avalonia.ViewModels
                 }
             }
 
+            _captureTarget = ResolveCaptureTarget();
+
             NewProfileCommand = new RelayCommand(ResetEditorForm);
             LoadSelectedProfileCommand = new RelayCommand(LoadSelectedProfileIntoEditor, () => SelectedProfile != null);
             SaveProfileCommand = new RelayCommand(ExecuteSaveProfile);
@@ -264,8 +272,10 @@ namespace AssetStudio.Avalonia.ViewModels
             OpenProfilesFolderCommand = new AsyncRelayCommand(ExecuteOpenProfilesFolderAsync);
             OpenPluginsFolderCommand = new AsyncRelayCommand(ExecuteOpenPluginsFolderAsync);
             ReloadPluginsCommand = new RelayCommand(ExecuteReloadPlugins);
-            ApplyAndReanalyzeCommand = new RelayCommand(ExecuteApplyAndReanalyze);
-            SecondaryCloseCommand = new RelayCommand(ExecuteSecondaryClose);
+            ApplyAndReanalyzeCommand = new RelayCommand(ExecuteApplyAndReanalyze, () => !IsCapturing);
+            SecondaryCloseCommand = new RelayCommand(ExecuteSecondaryClose, () => !IsCapturing);
+            CaptureFromGameCommand = new AsyncRelayCommand(ExecuteCaptureFromGameAsync, () => !IsCapturing && _captureTarget != null, onException: ex => ValidationError = ex.Message);
+            CancelCaptureCommand = new RelayCommand(() => CaptureFromGameCommand.Cancel(), () => IsCapturing);
 
             PopulateDetectedAlgorithmCandidates(defaultPattern);
             if (DetectedAlgorithms.Count > 0)
@@ -634,6 +644,138 @@ namespace AssetStudio.Avalonia.ViewModels
         public RelayCommand ReloadPluginsCommand { get; }
         public RelayCommand ApplyAndReanalyzeCommand { get; }
         public RelayCommand SecondaryCloseCommand { get; }
+        public AsyncRelayCommand CaptureFromGameCommand { get; }
+        public RelayCommand CancelCaptureCommand { get; }
+
+        public bool ShowGameCaptureSection => _captureTarget != null;
+
+        public string CaptureGameSummaryText => _captureTarget == null
+            ? string.Empty
+            : $"Detected game: {_captureTarget.GameName}. AssetStudio launches it, reads the key while it starts up, and closes it again. The game folder is never modified.";
+
+        public bool IsCapturing
+        {
+            get => _isCapturing;
+            private set
+            {
+                if (SetProperty(ref _isCapturing, value))
+                {
+                    OnPropertyChanged(nameof(HasCaptureStatusText));
+                    OnPropertyChanged(nameof(HasCaptureAntiCheatText));
+                    ApplyAndReanalyzeCommand.NotifyCanExecuteChanged();
+                    SecondaryCloseCommand.NotifyCanExecuteChanged();
+                    CaptureFromGameCommand.NotifyCanExecuteChanged();
+                    CancelCaptureCommand.NotifyCanExecuteChanged();
+                }
+            }
+        }
+
+        public string CaptureStatusText
+        {
+            get => _captureStatusText;
+            private set
+            {
+                if (SetProperty(ref _captureStatusText, value ?? string.Empty))
+                {
+                    OnPropertyChanged(nameof(HasCaptureStatusText));
+                }
+            }
+        }
+
+        public bool HasCaptureStatusText => !string.IsNullOrWhiteSpace(_captureStatusText);
+
+        public string CaptureAntiCheatText
+        {
+            get => _captureAntiCheatText;
+            private set
+            {
+                if (SetProperty(ref _captureAntiCheatText, value ?? string.Empty))
+                {
+                    OnPropertyChanged(nameof(HasCaptureAntiCheatText));
+                }
+            }
+        }
+
+        public bool HasCaptureAntiCheatText => !string.IsNullOrWhiteSpace(_captureAntiCheatText);
+
+        public double CaptureProgressPercent
+        {
+            get => _captureProgressPercent;
+            private set => SetProperty(ref _captureProgressPercent, value);
+        }
+
+        private GameCaptureTarget? ResolveCaptureTarget()
+        {
+            foreach (StreamEncryptionBarrier barrier in _context.DetectedBarriers ?? Array.Empty<StreamEncryptionBarrier>())
+            {
+                GameCaptureTarget? target = GameCaptureTarget.TryResolve(barrier.FilePath);
+                if (target != null)
+                {
+                    return target;
+                }
+            }
+
+            return null;
+        }
+
+        private async Task ExecuteCaptureFromGameAsync(CancellationToken cancellationToken)
+        {
+            if (_captureTarget == null || IsCapturing)
+            {
+                return;
+            }
+
+            ClearFeedback();
+            CaptureAntiCheatText = string.Empty;
+            CaptureStatusText = "Preparing…";
+            CaptureProgressPercent = 0;
+            IsCapturing = true;
+            try
+            {
+                var progress = new Progress<GameCaptureProgress>(UpdateCaptureProgress);
+                GameCaptureResult result = await GameKeyCapture.RunAsync(_captureTarget, progress, cancellationToken: cancellationToken);
+                CaptureProgressPercent = result.Status == GameCaptureStatus.Succeeded ? 100 : CaptureProgressPercent;
+                if (result.Status == GameCaptureStatus.Succeeded && result.Profile != null)
+                {
+                    CaptureStatusText = string.Empty;
+                    try
+                    {
+                        DecryptionHelper.SaveProfileToUserDirectory(result.Profile, _userProfilesDirectoryOverride);
+                        _profilesModified = true;
+                        RefreshProfilesAndPluginsList();
+                        StatusMessage = $"Captured the key from {_captureTarget.GameName} and saved profile '{result.Profile.Id}' ({result.ValidatedFiles} of {result.CheckedFiles} files validated).";
+                    }
+                    catch (Exception ex)
+                    {
+                        ValidationError = $"The key was captured but the profile could not be saved: {ex.Message}";
+                    }
+                }
+                else if (result.Status == GameCaptureStatus.AntiCheatDetected)
+                {
+                    CaptureAntiCheatText = result.Message;
+                    CaptureStatusText = "Capture aborted: the game is protected by anti-cheat.";
+                }
+                else
+                {
+                    CaptureStatusText = result.Message;
+                }
+            }
+            finally
+            {
+                IsCapturing = false;
+            }
+        }
+
+        private void UpdateCaptureProgress(GameCaptureProgress value)
+        {
+            if (!IsCapturing)
+            {
+                return;
+            }
+
+            CaptureStatusText = value.Message;
+            CaptureProgressPercent = value.Percent;
+        }
 
         public bool HasPendingEditorInput()
         {

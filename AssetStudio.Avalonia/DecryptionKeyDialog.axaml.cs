@@ -34,6 +34,18 @@ public sealed partial class DecryptionKeyDialog : Window
         base.OnClosed(e);
     }
 
+    protected override void OnClosing(WindowClosingEventArgs e)
+    {
+        if (ViewModel.IsCapturing)
+        {
+            e.Cancel = true;
+            ViewModel.CancelCaptureCommand.Execute(null);
+            return;
+        }
+
+        base.OnClosing(e);
+    }
+
     private void OnRequestClose(DecryptionKeyDialogResult result)
     {
         Close(result);

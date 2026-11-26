@@ -190,6 +190,9 @@ namespace AssetStudio
         [JsonPropertyName("blockLength")]
         public int BlockLength { get; set; } = 32;
 
+        [JsonPropertyName("dataBase64")]
+        public string? DataBase64 { get; set; }
+
         public HeaderMaskProfile Clone() => (HeaderMaskProfile)MemberwiseClone();
 
         public bool Validate(out string? error)
@@ -218,6 +221,20 @@ namespace AssetStudio
                     return false;
                 }
             }
+            else if (kind == "raw")
+            {
+                if (!TryGetRawData(out byte[]? data, out string? dataError))
+                {
+                    error = dataError;
+                    return false;
+                }
+
+                if (Length != data!.Length)
+                {
+                    error = "Raw header mask length must match the decoded dataBase64 size.";
+                    return false;
+                }
+            }
             else
             {
                 error = $"Unsupported header mask type '{Type}'.";
@@ -242,10 +259,51 @@ namespace AssetStudio
             }
 
             int length = (int)Math.Min(Length, cipherLength);
+            string kind = Type.Trim().ToLowerInvariant();
+            if (kind == "raw")
+            {
+                if (!TryGetRawData(out byte[]? raw, out _) || raw == null)
+                {
+                    return false;
+                }
+
+                mask = raw.AsSpan(0, Math.Min(raw.Length, length)).ToArray();
+                return true;
+            }
+
             TryParseSeed(out uint seed, out _);
-            mask = Type.Trim().ToLowerInvariant() == "xorshift32"
+            mask = kind == "xorshift32"
                 ? HeaderMasks.XorShift32(seed, length, LeftShift1, RightShift, LeftShift2, ByteShift)
                 : HeaderMasks.HmacSha256Counter(key, length, BlockLength);
+            return true;
+        }
+
+        private bool TryGetRawData(out byte[]? data, out string? error)
+        {
+            data = null;
+            error = null;
+            if (string.IsNullOrWhiteSpace(DataBase64))
+            {
+                error = "Raw header mask requires dataBase64.";
+                return false;
+            }
+
+            try
+            {
+                data = Convert.FromBase64String(DataBase64);
+            }
+            catch (FormatException)
+            {
+                error = "Raw header mask dataBase64 is not valid Base64.";
+                return false;
+            }
+
+            if (data.Length == 0)
+            {
+                error = "Raw header mask data must not be empty.";
+                return false;
+            }
+
             return true;
         }
 
