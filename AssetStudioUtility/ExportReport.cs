@@ -56,7 +56,7 @@ namespace AssetStudio
 
     public sealed class ExportBuildIdentity
     {
-        public string Version { get; init; } = "0.20.0";
+        public string Version { get; init; } = "0.20.1";
         public string CommitHash { get; init; } = string.Empty;
         public string BuildChannel { get; init; } = "dev";
         public int CommitsAhead { get; init; }
@@ -139,7 +139,7 @@ namespace AssetStudio
                     : $"{assemblyVersion.Major}.{assemblyVersion.Minor}.{Math.Max(0, assemblyVersion.Build)}";
             }
 
-            return "0.20.0";
+            return "0.20.1";
         }
     }
 
