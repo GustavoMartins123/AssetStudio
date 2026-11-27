@@ -423,7 +423,7 @@ namespace AssetStudio.Tests
             return new string(chars);
         }
 
-        private static byte[] MakeDump(byte[] plain, int faithfulBytes)
+        internal static byte[] MakeDump(byte[] plain, int faithfulBytes)
         {
             var dump = new byte[65536];
             Array.Copy(plain, 0, dump, 0, Math.Min(plain.Length, faithfulBytes));
@@ -444,7 +444,7 @@ namespace AssetStudio.Tests
             };
         }
 
-        private static byte[] EncryptAes(byte[] plain, byte[] key, byte[] iv, byte[] mask, CipherMode mode, bool padding, bool ivPrefix)
+        internal static byte[] EncryptAes(byte[] plain, byte[] key, byte[] iv, byte[] mask, CipherMode mode, bool padding, bool ivPrefix)
         {
             int masked = Math.Min(mask.Length, plain.Length);
             byte[] padded = padding ? Pad(plain, 16) : (byte[])plain.Clone();
@@ -552,7 +552,7 @@ namespace AssetStudio.Tests
             return result;
         }
 
-        private static byte[] Pad(byte[] data, int blockSize)
+        internal static byte[] Pad(byte[] data, int blockSize)
         {
             int pad = blockSize - data.Length % blockSize;
             var padded = new byte[data.Length + pad];
@@ -561,14 +561,14 @@ namespace AssetStudio.Tests
             return padded;
         }
 
-        private sealed class ManagedImage
+        internal sealed class ManagedImage
         {
-            private const int DumpBase = 1 << 17;
+            internal const int DumpBase = 1 << 17;
             private readonly byte[] data = new byte[1 << 18];
             private int cursor = 64;
             private int dumps;
 
-            public ManagedImage(Random random) => random.NextBytes(data);
+            internal ManagedImage(Random random) => random.NextBytes(data);
 
             public ManagedImage AddArray(byte[] bytes)
             {
@@ -607,7 +607,7 @@ namespace AssetStudio.Tests
             public byte[] ToArray() => data;
         }
 
-        private static string CreateGameLayout(string root)
+        internal static string CreateGameLayout(string root)
         {
             string gameDirectory = Path.Combine(root, GameName);
             string bundleDirectory = Path.Combine(gameDirectory, GameName + "_Data", "StreamingAssets", "EncryptedBundles");
@@ -616,7 +616,7 @@ namespace AssetStudio.Tests
             return bundleDirectory;
         }
 
-        private static byte[] BuildBundle(int startLength, int alignment, int seed)
+        internal static byte[] BuildBundle(int startLength, int alignment, int seed)
         {
             for (int length = startLength; length < startLength + 64; length++)
             {
@@ -630,7 +630,7 @@ namespace AssetStudio.Tests
             throw new InvalidOperationException("No bundle with the requested alignment was found.");
         }
 
-        private static byte[] BuildLz4Bundle(string cabName, int payloadLength, int seed)
+        internal static byte[] BuildLz4Bundle(string cabName, int payloadLength, int seed)
         {
             var payload = new byte[payloadLength];
             new Random(seed).NextBytes(payload);
@@ -638,7 +638,11 @@ namespace AssetStudio.Tests
             BinaryPrimitives.WriteUInt32BigEndian(payload.AsSpan(20, 4), 128u);
             BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(24, 8), payload.Length);
             BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(32, 8), 48L);
+            return BuildLz4Bundle(cabName, payload);
+        }
 
+        internal static byte[] BuildLz4Bundle(string cabName, byte[] payload)
+        {
             var chunks = new List<byte[]>();
             for (int offset = 0; offset < payload.Length; offset += 1024)
             {
@@ -700,28 +704,28 @@ namespace AssetStudio.Tests
             return output.ToArray();
         }
 
-        private static void WriteUInt32BE(Stream stream, uint value)
+        internal static void WriteUInt32BE(Stream stream, uint value)
         {
             var bytes = new byte[4];
             BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
             stream.Write(bytes, 0, bytes.Length);
         }
 
-        private static void WriteInt64BE(Stream stream, long value)
+        internal static void WriteInt64BE(Stream stream, long value)
         {
             var bytes = new byte[8];
             BinaryPrimitives.WriteInt64BigEndian(bytes, value);
             stream.Write(bytes, 0, bytes.Length);
         }
 
-        private static string CreateTempDirectory()
+        internal static string CreateTempDirectory()
         {
             string path = Path.Combine(Path.GetTempPath(), "AssetStudioRuntimeCaptureTests-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(path);
             return path;
         }
 
-        private static void TryDeleteDirectory(string path)
+        internal static void TryDeleteDirectory(string path)
         {
             try
             {

@@ -755,7 +755,7 @@ namespace AssetStudio.Tests
             return ms.ToArray();
         }
 
-        private static byte[] BuildTextAssetBinary(string name, string text)
+        internal static byte[] BuildTextAssetBinary(string name, string text)
         {
             using var ms = new MemoryStream();
             using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
@@ -871,7 +871,7 @@ namespace AssetStudio.Tests
             File.WriteAllBytes(bundlePath, bundleBytes);
         }
 
-        private static byte[] BuildSerializedFileWithObjects(
+        internal static byte[] BuildSerializedFileWithObjects(
             string unityVersion,
             (long PathId, int ClassId, byte[] Data, bool IncludeTextAssetTypeTree)[] entries)
         {

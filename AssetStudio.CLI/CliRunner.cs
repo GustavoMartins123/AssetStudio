@@ -84,12 +84,25 @@ namespace AssetStudio.CLI
                 return ExitSuccess;
             }
 
+            if (string.Equals(command, "capture-keys", StringComparison.OrdinalIgnoreCase))
+            {
+                return CliKeyCapture.Run(subArgs, stdout, stderr);
+            }
+
+            if (!CliDecryption.TryExtractOptions(subArgs, stderr, out string[] remaining, out DecryptionOptions decryptionOptions))
+            {
+                return ExitInvalidArguments;
+            }
+
+            subArgs = CliCaching.RemoveOption(remaining, out bool useDecompressionCache);
+            CliDecryption.Load(decryptionOptions, subArgs);
+
             return command.ToLowerInvariant() switch
             {
                 "scan" => RunScan(subArgs, stdout, stderr),
-                "list" => RunList(subArgs, stdout, stderr),
-                "inspect" => RunInspect(subArgs, stdout, stderr),
-                "export" => RunExport(subArgs, stdout, stderr),
+                "list" => RunList(subArgs, stdout, stderr, useDecompressionCache),
+                "inspect" => RunInspect(subArgs, stdout, stderr, useDecompressionCache),
+                "export" => RunExport(subArgs, stdout, stderr, useDecompressionCache),
                 _ => InvalidArg(stderr, $"Unknown command '{command}'.")
             };
         }
@@ -273,7 +286,7 @@ namespace AssetStudio.CLI
             return new ProjectScanResult(Path.GetDirectoryName(fullPath) ?? fullPath, new[] { scanned });
         }
 
-        private static int RunList(string[] args, TextWriter stdout, TextWriter stderr)
+        private static int RunList(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache)
         {
             string? targetPath = null;
             ClassIDType? typeFilter = null;
@@ -334,7 +347,7 @@ namespace AssetStudio.CLI
 
             try
             {
-                using var assetsManager = CreateHeadlessAssetsManager();
+                using var assetsManager = CreateHeadlessAssetsManager(useDecompressionCache, targetPath, stderr);
                 LoadPath(assetsManager, targetPath);
 
                 var rows = assetsManager.ProjectIndex.GetHandles()
@@ -403,7 +416,7 @@ namespace AssetStudio.CLI
             }
         }
 
-        private static int RunInspect(string[] args, TextWriter stdout, TextWriter stderr)
+        private static int RunInspect(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache)
         {
             string? targetPath = null;
             long? pathId = null;
@@ -469,7 +482,7 @@ namespace AssetStudio.CLI
 
             try
             {
-                using var assetsManager = CreateHeadlessAssetsManager();
+                using var assetsManager = CreateHeadlessAssetsManager(useDecompressionCache, targetPath, stderr);
                 LoadPath(assetsManager, targetPath);
 
                 var matches = assetsManager.ProjectIndex.GetHandles()
@@ -539,7 +552,7 @@ namespace AssetStudio.CLI
             }
         }
 
-        private static int RunExport(string[] args, TextWriter stdout, TextWriter stderr)
+        private static int RunExport(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache)
         {
             string? targetPath = null;
             string? outputDir = null;
@@ -658,7 +671,7 @@ namespace AssetStudio.CLI
             try
             {
                 string fullOutputRoot = Path.GetFullPath(outputDir);
-                using var assetsManager = CreateHeadlessAssetsManager();
+                using var assetsManager = CreateHeadlessAssetsManager(useDecompressionCache, targetPath, stderr);
                 LoadPath(assetsManager, targetPath);
 
                 var handles = assetsManager.ProjectIndex.GetHandles()
@@ -1069,14 +1082,15 @@ namespace AssetStudio.CLI
             return idx;
         }
 
-        private static AssetsManager CreateHeadlessAssetsManager()
+        private static AssetsManager CreateHeadlessAssetsManager(bool useDecompressionCache, string targetPath, TextWriter stderr)
         {
-            return new AssetsManager
+            var assetsManager = new AssetsManager
             {
                 LazyLoading = true,
                 AutoLoadCatalogDependencies = false,
                 AutoLoadExternalDependencies = false
             };
+            return useDecompressionCache ? CliCaching.Attach(assetsManager, targetPath, stderr) : assetsManager;
         }
 
         private static void LoadPath(AssetsManager assetsManager, string targetPath)
@@ -1242,6 +1256,13 @@ namespace AssetStudio.CLI
             writer.WriteLine("  AssetStudio.CLI inspect <path> --path-id <id> [--file <name>] [--format text|json]");
             writer.WriteLine("  AssetStudio.CLI export <path> --output <dir> [--type <type>[,<type>...]|all] [--image-format png|webp|tga|jpeg|bmp] [--model-format glb|gltf|fbx] [--assemblies <Managed folder>] [--dry-run]");
             writer.WriteLine($"      export types: {CliAssetExporter.SupportedTypeList} (default: Texture2D, Texture2DArray, TextAsset, Mesh)");
+            writer.WriteLine("  AssetStudio.CLI capture-keys <path> [--exe <game executable>] [--timeout <seconds>] [--format text|json]");
+            writer.WriteLine();
+            writer.WriteLine("Decryption profiles: scan/list/inspect/export load the profiles and plugins of the user folder by default;");
+            writer.WriteLine("  --profiles <json file|directory>  load additional profiles (repeatable)");
+            writer.WriteLine($"  --no-local-profiles               skip the user and application profile folders (user folder override: {DecryptionHelper.UserDataDirectoryVariable})");
+            writer.WriteLine("Decompression cache: list/inspect/export keep decompressed bundles in the same disk cache the GUI uses;");
+            writer.WriteLine($"  {CliCaching.DisableOption}  always decompress from scratch (cache folder override: {CliCaching.CacheDirectoryVariable})");
         }
     }
 }

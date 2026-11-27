@@ -68,7 +68,7 @@ namespace AssetStudio
             DeclaredSize = declaredSize;
             Revision = revision;
             Address = address;
-            Id = declaredSize + "-" + Convert.ToHexString(SHA256.HashData(data.AsSpan(0, Math.Min(512, data.Length))));
+            Id = declaredSize + "-" + Convert.ToHexString(SHA256.HashData(data.AsSpan(0, IdentityBytes)));
         }
 
         public byte[] Data { get; }
@@ -76,6 +76,8 @@ namespace AssetStudio
         public string Revision { get; }
         public long Address { get; }
         public string Id { get; }
+
+        internal const int IdentityBytes = 16;
 
         public static PlaintextBundleDump? FromMemory(byte[] data, long address = 0)
         {
@@ -356,58 +358,62 @@ namespace AssetStudio
             }
         }
 
-        public static GameMemoryScanResult ScanProcess(int processId, KeyValidationContext context, int maxDumpBytes = DefaultDumpBytes, CancellationToken cancellationToken = default)
+        public static GameMemoryScanResult ScanProcess(
+            int processId,
+            KeyValidationContext context,
+            int maxDumpBytes = DefaultDumpBytes,
+            CancellationToken cancellationToken = default,
+            long minimumAddress = 0,
+            long maximumAddress = long.MaxValue)
         {
             ArgumentNullException.ThrowIfNull(context);
-            if (!OperatingSystem.IsWindows())
+            if (!ProcessMemoryReader.IsSupported)
             {
-                throw new PlatformNotSupportedException("Capturing keys from a running game is only available on Windows.");
+                throw new PlatformNotSupportedException("Capturing keys from a running game is only available on Windows and Linux.");
             }
 
             var keys = new ConcurrentDictionary<string, CapturedKey>();
             var dumps = new ConcurrentDictionary<string, PlaintextBundleDump>();
-            IntPtr process = ProcessMemoryReader.Open(processId, out int errorCode);
-            if (process == IntPtr.Zero)
+            using ProcessMemoryHandle? process = ProcessMemoryReader.Open(processId, out int errorCode);
+            if (process == null)
             {
                 throw new GameMemoryAccessException(errorCode);
             }
 
-            try
+            var chunks = ProcessMemoryReader.EnumerateReadableChunks(process, ChunkSize);
+            var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 2), CancellationToken = cancellationToken };
+            Parallel.ForEach(chunks, options, chunk =>
             {
-                var chunks = ProcessMemoryReader.EnumerateReadableChunks(process, ChunkSize);
-                var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 2), CancellationToken = cancellationToken };
-                Parallel.ForEach(chunks, options, chunk =>
+                if (chunk.Address + chunk.Size <= minimumAddress || chunk.Address >= maximumAddress)
                 {
-                    int length = (int)Math.Min(chunk.Size + OverlapBytes, chunk.RegionEnd - chunk.Address);
-                    byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
-                    try
+                    return;
+                }
+
+                int length = (int)Math.Min(chunk.Size + OverlapBytes, chunk.RegionEnd - chunk.Address);
+                byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+                try
+                {
+                    if (ProcessMemoryReader.TryRead(process, chunk.Address, buffer, length))
                     {
-                        if (ProcessMemoryReader.TryRead(process, chunk.Address, buffer, length))
+                        ScanBuffer(buffer.AsSpan(0, length), context, maxDumpBytes, keys, dumps, chunk.Address);
+                    }
+                    else
+                    {
+                        for (long offset = 0; offset < chunk.Size; offset += 65536)
                         {
-                            ScanBuffer(buffer.AsSpan(0, length), context, maxDumpBytes, keys, dumps, chunk.Address);
-                        }
-                        else
-                        {
-                            for (long offset = 0; offset < chunk.Size; offset += 65536)
+                            int piece = (int)Math.Min(65536, chunk.Size - offset);
+                            if (ProcessMemoryReader.TryRead(process, chunk.Address + offset, buffer, piece))
                             {
-                                int piece = (int)Math.Min(65536, chunk.Size - offset);
-                                if (ProcessMemoryReader.TryRead(process, chunk.Address + offset, buffer, piece))
-                                {
-                                    ScanBuffer(buffer.AsSpan(0, piece), context, maxDumpBytes, keys, dumps, chunk.Address + offset);
-                                }
+                                ScanBuffer(buffer.AsSpan(0, piece), context, maxDumpBytes, keys, dumps, chunk.Address + offset);
                             }
                         }
                     }
-                    finally
-                    {
-                        ArrayPool<byte>.Shared.Return(buffer);
-                    }
-                });
-            }
-            finally
-            {
-                ProcessMemoryReader.Close(process);
-            }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            });
 
             return new GameMemoryScanResult(
                 keys.Values.OrderBy(static key => key.Key.Length).ThenBy(static key => key.Id, StringComparer.Ordinal).ToArray(),
@@ -900,6 +906,11 @@ namespace AssetStudio
                 }
 
                 int available = Math.Min(maxDumpBytes, data.Length - at);
+                if (available < PlaintextBundleDump.IdentityBytes)
+                {
+                    continue;
+                }
+
                 var dump = new PlaintextBundleDump(data.Slice(at, available).ToArray(), declaredSize, revision, address + at);
                 if (!dumps.TryGetValue(dump.Id, out PlaintextBundleDump? existing) || existing.Data.Length < dump.Data.Length)
                 {

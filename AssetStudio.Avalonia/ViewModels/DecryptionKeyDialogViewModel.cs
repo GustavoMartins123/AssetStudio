@@ -206,7 +206,8 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _validationError = string.Empty;
         private string _statusMessage = string.Empty;
         private string _pluginsSummaryText = string.Empty;
-        private readonly GameCaptureTarget? _captureTarget;
+        private readonly string? _captureSourceFile;
+        private GameCaptureTarget? _captureTarget;
         private bool _isCapturing;
         private string _captureStatusText = string.Empty;
         private string _captureAntiCheatText = string.Empty;
@@ -260,7 +261,10 @@ namespace AssetStudio.Avalonia.ViewModels
                 }
             }
 
-            _captureTarget = ResolveCaptureTarget();
+            _captureSourceFile = (_context.DetectedBarriers ?? Array.Empty<StreamEncryptionBarrier>())
+                .Select(static barrier => barrier.FilePath)
+                .FirstOrDefault(static path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));
+            _captureTarget = _captureSourceFile == null ? null : GameCaptureTarget.TryResolve(_captureSourceFile);
 
             NewProfileCommand = new RelayCommand(ResetEditorForm);
             LoadSelectedProfileCommand = new RelayCommand(LoadSelectedProfileIntoEditor, () => SelectedProfile != null);
@@ -276,6 +280,7 @@ namespace AssetStudio.Avalonia.ViewModels
             SecondaryCloseCommand = new RelayCommand(ExecuteSecondaryClose, () => !IsCapturing);
             CaptureFromGameCommand = new AsyncRelayCommand(ExecuteCaptureFromGameAsync, () => !IsCapturing && _captureTarget != null, onException: ex => ValidationError = ex.Message);
             CancelCaptureCommand = new RelayCommand(() => CaptureFromGameCommand.Cancel(), () => IsCapturing);
+            ChooseCaptureExecutableCommand = new AsyncRelayCommand(ExecuteChooseCaptureExecutableAsync, () => !IsCapturing && _captureSourceFile != null, onException: ex => ValidationError = ex.Message);
 
             PopulateDetectedAlgorithmCandidates(defaultPattern);
             if (DetectedAlgorithms.Count > 0)
@@ -646,12 +651,15 @@ namespace AssetStudio.Avalonia.ViewModels
         public RelayCommand SecondaryCloseCommand { get; }
         public AsyncRelayCommand CaptureFromGameCommand { get; }
         public RelayCommand CancelCaptureCommand { get; }
+        public AsyncRelayCommand ChooseCaptureExecutableCommand { get; }
 
-        public bool ShowGameCaptureSection => _captureTarget != null;
+        public bool ShowGameCaptureSection => _captureSourceFile != null;
 
-        public string CaptureGameSummaryText => _captureTarget == null
-            ? string.Empty
-            : $"Detected game: {_captureTarget.GameName}. AssetStudio launches it, reads the key while it starts up, and closes it again. The game folder is never modified.";
+        public bool HasCaptureTarget => _captureTarget != null;
+
+        public string CaptureGameSummaryText => _captureTarget != null
+            ? $"Detected game: {_captureTarget.GameName}. AssetStudio launches it, reads the key while it starts up, and closes it again. The game folder is never modified."
+            : "No game was found next to the encrypted files. Choose the game executable: AssetStudio launches it, reads the key while it starts up, and closes it again. The game folder is never modified.";
 
         public bool IsCapturing
         {
@@ -666,6 +674,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     SecondaryCloseCommand.NotifyCanExecuteChanged();
                     CaptureFromGameCommand.NotifyCanExecuteChanged();
                     CancelCaptureCommand.NotifyCanExecuteChanged();
+                    ChooseCaptureExecutableCommand.NotifyCanExecuteChanged();
                 }
             }
         }
@@ -704,18 +713,38 @@ namespace AssetStudio.Avalonia.ViewModels
             private set => SetProperty(ref _captureProgressPercent, value);
         }
 
-        private GameCaptureTarget? ResolveCaptureTarget()
+        public void SetCaptureExecutable(string? executablePath)
         {
-            foreach (StreamEncryptionBarrier barrier in _context.DetectedBarriers ?? Array.Empty<StreamEncryptionBarrier>())
+            ClearFeedback();
+            GameCaptureTarget? target = _captureSourceFile == null ? null : GameCaptureTarget.FromExecutable(executablePath, _captureSourceFile);
+            if (target == null)
             {
-                GameCaptureTarget? target = GameCaptureTarget.TryResolve(barrier.FilePath);
-                if (target != null)
-                {
-                    return target;
-                }
+                ValidationError = executablePath == null
+                    ? "No executable was selected."
+                    : "The selected file cannot be used as the game executable for these encrypted files.";
+                return;
             }
 
-            return null;
+            _captureTarget = target;
+            OnPropertyChanged(nameof(HasCaptureTarget));
+            OnPropertyChanged(nameof(CaptureGameSummaryText));
+            CaptureFromGameCommand.NotifyCanExecuteChanged();
+        }
+
+        private async Task ExecuteChooseCaptureExecutableAsync(CancellationToken cancellationToken)
+        {
+            if (_dialogService == null || IsCapturing)
+            {
+                return;
+            }
+
+            IReadOnlyList<string> files = await _dialogService.PickOpenFilesAsync(new FilePickerRequest(
+                title: "Choose the game executable",
+                allowMultiple: false,
+                suggestedStartDirectory: Path.GetDirectoryName(_captureSourceFile),
+                fileTypeFilters: OperatingSystem.IsWindows() ? new[] { new FileTypeFilterSpec("Game executable", new[] { "*.exe" }) } : null));
+            cancellationToken.ThrowIfCancellationRequested();
+            SetCaptureExecutable(files.Count > 0 ? files[0] : null);
         }
 
         private async Task ExecuteCaptureFromGameAsync(CancellationToken cancellationToken)
@@ -740,7 +769,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     CaptureStatusText = string.Empty;
                     try
                     {
-                        DecryptionHelper.SaveProfileToUserDirectory(result.Profile, _userProfilesDirectoryOverride);
+                        GameKeyCapture.SaveProfile(result.Profile, _userProfilesDirectoryOverride);
                         _profilesModified = true;
                         RefreshProfilesAndPluginsList();
                         StatusMessage = $"Captured the key from {_captureTarget.GameName} and saved profile '{result.Profile.Id}' ({result.ValidatedFiles} of {result.CheckedFiles} files validated).";

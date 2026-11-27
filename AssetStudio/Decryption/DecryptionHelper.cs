@@ -22,6 +22,8 @@ namespace AssetStudio
 
     public static class DecryptionHelper
     {
+        public const string UserDataDirectoryVariable = "ASSETSTUDIO_DATA_DIR";
+
         private static readonly JsonSerializerOptions ProfileJsonOptions = new JsonSerializerOptions
         {
             WriteIndented = true,
@@ -53,17 +55,18 @@ namespace AssetStudio
         public static ReadOnlySpan<byte> EncryptionMagicBytes => encryptionMagic;
 
         public static string GetUserDecryptionProfilesDirectory()
-            => Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "AssetStudio",
-                "DecryptionProfiles");
+            => Path.Combine(GetUserDataDirectory(), "DecryptionProfiles");
 
         public static string GetUserDecryptionPluginsDirectory()
-            => Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "AssetStudio",
-                "Plugins",
-                "Decryption");
+            => Path.Combine(GetUserDataDirectory(), "Plugins", "Decryption");
+
+        private static string GetUserDataDirectory()
+        {
+            string? overrideDirectory = Environment.GetEnvironmentVariable(UserDataDirectoryVariable);
+            return string.IsNullOrWhiteSpace(overrideDirectory)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio")
+                : overrideDirectory;
+        }
 
         public static string GetAppDecryptionPluginsDirectory()
             => Path.Combine(AppContext.BaseDirectory, "Plugins", "Decryption");
