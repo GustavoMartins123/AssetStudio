@@ -368,6 +368,18 @@ namespace AssetStudio.Tests
                 var plainViewModel = new DecryptionKeyDialogViewModel(bare, userProfilesDirectoryOverride: root);
                 Assert.False(plainViewModel.ShowGameCaptureSection);
                 Assert.False(plainViewModel.CaptureFromGameCommand.CanExecute(null));
+
+                // When encrypted files were reported (e.g., partial load banner or cached session) without
+                // pre-populated barrier objects, the GUI still resolves the game executable from ProjectRoot
+                // just like CLI capture-keys <folder>.
+                var rootOnlyContext = new DecryptionDialogContext(false, root, 3, 1, 75.0, Array.Empty<StreamEncryptionBarrier>());
+                var rootOnlyViewModel = new DecryptionKeyDialogViewModel(rootOnlyContext, userProfilesDirectoryOverride: root);
+                Assert.Equal(GameKeyCapture.IsSupported, rootOnlyViewModel.ShowGameCaptureSection);
+                if (GameKeyCapture.IsSupported)
+                {
+                    Assert.Contains(GameName, rootOnlyViewModel.CaptureGameSummaryText, StringComparison.Ordinal);
+                    Assert.True(rootOnlyViewModel.CaptureFromGameCommand.CanExecute(null));
+                }
             }
             finally
             {

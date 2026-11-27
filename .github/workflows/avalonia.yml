@@ -35,7 +35,7 @@ jobs:
       # intentionally omitted from Git and fetched on demand by scripts/publish-linux.sh
       # during Linux release packaging; the managed + native decoder CI build works without them.
       - name: Validate Linux packaging scripts
-        run: bash -n scripts/publish-linux.sh scripts/package-linux.sh
+        run: bash -n scripts/publish-linux.sh scripts/package-linux.sh scripts/smoke-test-cli.sh
 
       - name: Restore Avalonia
         run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj --locked-mode
@@ -82,3 +82,23 @@ jobs:
             echo "Expected native texture decoder was not copied to '$publish_dir/x64/libTexture2DDecoderNative.so'." >&2
             exit 1
           fi
+
+      - name: Publish and smoke test AssetStudio.CLI (linux-x64)
+        shell: bash
+        env:
+          RestoreLockedMode: 'true'
+        run: |
+          set -euo pipefail
+          dotnet restore AssetStudio.CLI/AssetStudio.CLI.csproj -p:RuntimeIdentifier=linux-x64 --locked-mode
+          cli_dir="AssetStudio.CLI/bin/Release/net10.0/linux-x64/publish"
+          dotnet publish AssetStudio.CLI/AssetStudio.CLI.csproj -c Release -p:RuntimeIdentifier=linux-x64 --self-contained true --no-restore -o "$cli_dir"
+          mkdir -p "$cli_dir/x64"
+          cp Texture2DDecoderNative/build/libTexture2DDecoderNative.so "$cli_dir/x64/"
+          bash scripts/smoke-test-cli.sh "$cli_dir/AssetStudio.CLI"
+
+      - name: Upload AssetStudio.CLI (linux-x64) Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AssetStudio.CLI-linux-x64
+          path: AssetStudio.CLI/bin/Release/net10.0/linux-x64/publish
+          if-no-files-found: error

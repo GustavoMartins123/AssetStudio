@@ -77,3 +77,24 @@ jobs:
           name: AssetStudio.Avalonia-win-x64
           path: AssetStudio.Avalonia/bin/Release/net10.0/win-x64/publish
           if-no-files-found: error
+
+      - name: Publish and smoke test AssetStudio.CLI (win-x64)
+        shell: pwsh
+        env:
+          RestoreLockedMode: 'true'
+        run: |
+          $ErrorActionPreference = "Stop"
+          dotnet restore AssetStudio.CLI/AssetStudio.CLI.csproj -p:RuntimeIdentifier=win-x64 --locked-mode
+          $cliDir = "AssetStudio.CLI/bin/Release/net10.0/win-x64/publish"
+          dotnet publish AssetStudio.CLI/AssetStudio.CLI.csproj -c Release -p:RuntimeIdentifier=win-x64 --self-contained true --no-restore -o $cliDir
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish AssetStudio.CLI failed with exit code $LASTEXITCODE." }
+          New-Item -ItemType Directory -Force -Path "$cliDir/x64" | Out-Null
+          Copy-Item -LiteralPath "Texture2DDecoderNative/bin/x64/Release/Texture2DDecoderNative.dll" -Destination "$cliDir/x64/"
+          pwsh -File scripts/smoke-test-cli.ps1 -CliExecutable (Join-Path $cliDir "AssetStudio.CLI.exe")
+
+      - name: Upload AssetStudio.CLI (win-x64) Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AssetStudio.CLI-win-x64
+          path: AssetStudio.CLI/bin/Release/net10.0/win-x64/publish
+          if-no-files-found: error

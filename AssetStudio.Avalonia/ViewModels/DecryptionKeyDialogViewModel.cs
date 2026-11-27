@@ -206,7 +206,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _validationError = string.Empty;
         private string _statusMessage = string.Empty;
         private string _pluginsSummaryText = string.Empty;
-        private readonly string? _captureSourceFile;
+        private string? _captureSourceFile;
         private GameCaptureTarget? _captureTarget;
         private bool _isCapturing;
         private string _captureStatusText = string.Empty;
@@ -264,6 +264,14 @@ namespace AssetStudio.Avalonia.ViewModels
             _captureSourceFile = (_context.DetectedBarriers ?? Array.Empty<StreamEncryptionBarrier>())
                 .Select(static barrier => barrier.FilePath)
                 .FirstOrDefault(static path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));
+            if (_captureSourceFile == null
+                && _context.EncryptedFileCount > 0
+                && !string.IsNullOrWhiteSpace(_context.ProjectRoot)
+                && Directory.Exists(_context.ProjectRoot))
+            {
+                _captureSourceFile = TryFindEncryptedSampleFileInDirectory(_context.ProjectRoot);
+            }
+
             _captureTarget = _captureSourceFile == null ? null : GameCaptureTarget.TryResolve(_captureSourceFile);
 
             NewProfileCommand = new RelayCommand(ResetEditorForm);
@@ -278,9 +286,9 @@ namespace AssetStudio.Avalonia.ViewModels
             ReloadPluginsCommand = new RelayCommand(ExecuteReloadPlugins);
             ApplyAndReanalyzeCommand = new RelayCommand(ExecuteApplyAndReanalyze, () => !IsCapturing);
             SecondaryCloseCommand = new RelayCommand(ExecuteSecondaryClose, () => !IsCapturing);
-            CaptureFromGameCommand = new AsyncRelayCommand(ExecuteCaptureFromGameAsync, () => !IsCapturing && _captureTarget != null, onException: ex => ValidationError = ex.Message);
+            CaptureFromGameCommand = new AsyncRelayCommand(ExecuteCaptureFromGameAsync, () => GameKeyCapture.IsSupported && !IsCapturing && _captureTarget != null, onException: ex => ValidationError = ex.Message);
             CancelCaptureCommand = new RelayCommand(() => CaptureFromGameCommand.Cancel(), () => IsCapturing);
-            ChooseCaptureExecutableCommand = new AsyncRelayCommand(ExecuteChooseCaptureExecutableAsync, () => !IsCapturing && _captureSourceFile != null, onException: ex => ValidationError = ex.Message);
+            ChooseCaptureExecutableCommand = new AsyncRelayCommand(ExecuteChooseCaptureExecutableAsync, () => GameKeyCapture.IsSupported && !IsCapturing && (_captureSourceFile != null || _context.EncryptedFileCount > 0), onException: ex => ValidationError = ex.Message);
 
             PopulateDetectedAlgorithmCandidates(defaultPattern);
             if (DetectedAlgorithms.Count > 0)
@@ -653,7 +661,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public RelayCommand CancelCaptureCommand { get; }
         public AsyncRelayCommand ChooseCaptureExecutableCommand { get; }
 
-        public bool ShowGameCaptureSection => _captureSourceFile != null;
+        public bool ShowGameCaptureSection => GameKeyCapture.IsSupported && (_captureSourceFile != null || _context.EncryptedFileCount > 0);
 
         public bool HasCaptureTarget => _captureTarget != null;
 
@@ -716,7 +724,21 @@ namespace AssetStudio.Avalonia.ViewModels
         public void SetCaptureExecutable(string? executablePath)
         {
             ClearFeedback();
-            GameCaptureTarget? target = _captureSourceFile == null ? null : GameCaptureTarget.FromExecutable(executablePath, _captureSourceFile);
+            var sampleFile = _captureSourceFile;
+            if (sampleFile == null && !string.IsNullOrWhiteSpace(executablePath) && File.Exists(executablePath))
+            {
+                var exeDir = Path.GetDirectoryName(Path.GetFullPath(executablePath));
+                if (!string.IsNullOrWhiteSpace(exeDir) && Directory.Exists(exeDir))
+                {
+                    sampleFile = TryFindEncryptedSampleFileInDirectory(exeDir);
+                    if (sampleFile != null)
+                    {
+                        _captureSourceFile = sampleFile;
+                    }
+                }
+            }
+
+            GameCaptureTarget? target = sampleFile == null ? null : GameCaptureTarget.FromExecutable(executablePath, sampleFile);
             if (target == null)
             {
                 ValidationError = executablePath == null
@@ -729,6 +751,71 @@ namespace AssetStudio.Avalonia.ViewModels
             OnPropertyChanged(nameof(HasCaptureTarget));
             OnPropertyChanged(nameof(CaptureGameSummaryText));
             CaptureFromGameCommand.NotifyCanExecuteChanged();
+        }
+
+        private static string? TryFindEncryptedSampleFileInDirectory(string rootDirectory)
+        {
+            const int maxScannedFiles = 2048;
+            var scanned = 0;
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(rootDirectory, "*", new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    IgnoreInaccessible = true
+                }))
+                {
+                    if (++scanned > maxScannedFiles)
+                    {
+                        break;
+                    }
+
+                    if (LooksLikeEncryptedBundleCandidate(file))
+                    {
+                        return file;
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                return null;
+            }
+
+            return null;
+        }
+
+        private static bool LooksLikeEncryptedBundleCandidate(string path)
+        {
+            try
+            {
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                long length = stream.Length;
+                if (length < 64 || length % 16 != 0)
+                {
+                    return false;
+                }
+
+                Span<byte> header = stackalloc byte[512];
+                int read = 0;
+                while (read < header.Length)
+                {
+                    int count = stream.Read(header.Slice(read));
+                    if (count <= 0)
+                    {
+                        break;
+                    }
+
+                    read += count;
+                }
+
+                ReadOnlySpan<byte> probe = header.Slice(0, read);
+                return !UnityHeaderProbe.TryParseUnityBundleHeader(probe, 0, length, out _, out _, out _, out _)
+                    && !UnityHeaderProbe.IsSerializedFileHeader(probe, length);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
         }
 
         private async Task ExecuteChooseCaptureExecutableAsync(CancellationToken cancellationToken)

@@ -201,7 +201,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           dotnet restore AssetStudio.CLI/AssetStudio.CLI.csproj -p:RuntimeIdentifier=win-x64 --locked-mode
           $cliDir = "dist-cli/AssetStudio.CLI-win-x64"
-          dotnet publish AssetStudio.CLI/AssetStudio.CLI.csproj -c Release -p:RuntimeIdentifier=win-x64 --self-contained true --no-restore -o $cliDir
+          dotnet publish AssetStudio.CLI/AssetStudio.CLI.csproj -c Release -p:RuntimeIdentifier=win-x64 -p:ReleaseVersion="$($env:RELEASE_VERSION)" --self-contained true --no-restore -o $cliDir
           if ($LASTEXITCODE -ne 0) { throw "dotnet publish AssetStudio.CLI failed with exit code $LASTEXITCODE." }
           New-Item -ItemType Directory -Force -Path "$cliDir/x64" | Out-Null
           Copy-Item -LiteralPath "Texture2DDecoderNative/bin/x64/Release/Texture2DDecoderNative.dll" -Destination "$cliDir/x64/"
@@ -442,7 +442,7 @@ jobs:
           set -euo pipefail
           dotnet restore AssetStudio.CLI/AssetStudio.CLI.csproj -p:RuntimeIdentifier=linux-x64 --locked-mode
           cli_dir="dist-cli/AssetStudio.CLI-linux-x64"
-          dotnet publish AssetStudio.CLI/AssetStudio.CLI.csproj -c Release -p:RuntimeIdentifier=linux-x64 --self-contained true --no-restore -o "$cli_dir"
+          dotnet publish AssetStudio.CLI/AssetStudio.CLI.csproj -c Release -p:RuntimeIdentifier=linux-x64 -p:ReleaseVersion="${RELEASE_VERSION}" --self-contained true --no-restore -o "$cli_dir"
           mkdir -p "$cli_dir/x64"
           cp Texture2DDecoderNative/build/libTexture2DDecoderNative.so "$cli_dir/x64/"
           find "$cli_dir" -name '*.pdb' -delete
@@ -493,6 +493,7 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: release-*-x64
           path: release-assets
           merge-multiple: true
 
