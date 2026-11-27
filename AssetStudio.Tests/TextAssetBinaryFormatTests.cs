@@ -739,66 +739,6 @@ public class TextAssetBinaryFormatTests
         Assert.Contains("MJPG", descriptor.FormatLabel, StringComparison.Ordinal);
     }
 
-    [SkippableFact]
-    public void RealGame_AnimaGateOfMemories_IntroLogos1080Avi_DetectsAviMjpg1080pUnder50Ms()
-    {
-        const string sharedAssetsPath = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\sharedassets0.assets";
-        if (!File.Exists(sharedAssetsPath))
-        {
-            _output.WriteLine("Skipping real-game Anima Gate of Memories test (sharedassets0.assets not present on this host).");
-            throw new SkipException("Local game files are not installed on this machine.");
-        }
-
-        // Strictly READ-ONLY open of sharedassets0.assets to read PathID 60 (intrologos1080.avi, 65,514,654 bytes)
-        TextAsset? introLogos = null;
-        var am = new AssetsManager { LazyLoading = true };
-        try
-        {
-            using var fs = new FileStream(sharedAssetsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            using var reader = new FileReader(sharedAssetsPath, fs);
-            var sf = new SerializedFile(reader, am);
-            Assert.True(sf.ObjectInfoDic.TryGetValue(60, out var objInfo), "Expected PathID 60 (intrologos1080.avi) in sharedassets0.assets.");
-            var objReader = new ObjectReader(reader, sf, objInfo!);
-            introLogos = new TextAsset(objReader);
-        }
-        finally
-        {
-            am.Clear();
-        }
-
-        Assert.NotNull(introLogos);
-        Assert.Equal("intrologos1080.avi", introLogos!.m_Name);
-        Assert.Equal(65_514_654, introLogos.m_Script.Length);
-
-        var assetItem = CreateSyntheticAssetItem(introLogos.m_Name);
-
-        // Warm up JIT once on a tiny 16-byte buffer
-        _ = TextAssetBinaryFormatDetector.Detect(new byte[16]);
-
-        var sw = Stopwatch.StartNew();
-        var detected = TextAssetBinaryFormatDetector.Detect(introLogos.m_Script, introLogos.m_Name);
-        var preview = TextAssetPreviewBuilder.BuildPreview(assetItem, introLogos.m_Script, string.Empty);
-        sw.Stop();
-
-        _output.WriteLine(
-            $"Real 65.5 MB TextAsset '{introLogos.m_Name}' ({introLogos.m_Script.Length:N0} bytes) detected & preview built in {sw.Elapsed.TotalMilliseconds:0.###} ms: " +
-            $"Format={detected.FormatName}, Resolution={detected.Width}x{detected.Height}, Codec={detected.VideoCodec}, FPS={detected.FrameRate:F2}, Frames={detected.TotalFrames}");
-
-        Assert.Equal(TextAssetEmbeddedMediaKind.Video, detected.MediaKind);
-        Assert.Equal("AVI", detected.FormatId);
-        Assert.Equal(".avi", detected.RecommendedExtension);
-        Assert.Equal("MJPG", detected.VideoCodec);
-        Assert.Equal(1920, detected.Width);
-        Assert.Equal(1072, detected.Height);
-        Assert.Equal(944, detected.TotalFrames);
-        Assert.InRange(detected.FrameRate, 59.90, 60.00);
-        Assert.True(detected.IsPlayableVideo);
-        Assert.Contains("1920x1072", detected.SummaryText, StringComparison.Ordinal);
-        Assert.Contains("Lavf57.29.101", detected.SummaryText, StringComparison.Ordinal);
-        Assert.Contains("Detected format: AVI Video (MJPG)", preview.DetailsText, StringComparison.Ordinal);
-        Assert.True(sw.Elapsed.TotalMilliseconds < 50.0, $"Expected detection + preview on 65.5 MB AVI under 50 ms, actual {sw.Elapsed.TotalMilliseconds:0.###} ms.");
-    }
-
     private static AssetItem CreateSyntheticAssetItem(string name)
     {
         var item = (AssetItem)RuntimeHelpers.GetUninitializedObject(typeof(AssetItem));

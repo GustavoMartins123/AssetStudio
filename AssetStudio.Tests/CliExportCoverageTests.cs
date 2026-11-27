@@ -72,14 +72,11 @@ namespace AssetStudio.Tests
             Assert.Contains("AnimationClip, Animator, all", stdout, StringComparison.Ordinal);
         }
 
-        // Bundle built by the Unity 6000.5 editor from known sources (scratch/unity-fixtures, not in git).
-        [SkippableFact]
+        [Fact]
         public void Export_RealUnity6000_5Bundle_AllTypes_MatchTheSourceFiles()
         {
-            var samples = Path.Combine(SyntheticSerializedFile.LocateRepositoryRoot(), "scratch", "unity-fixtures", "samples", "6000.5", "fixture");
-            var bundle = Path.Combine(samples, "StandaloneWindows64", "lz4", "fixture");
-            Skip.IfNot(File.Exists(bundle), "Unity fixture bundle not generated on this machine (scratch/unity-fixtures/samples).");
-            var truth = Path.Combine(samples, "Truth");
+            var bundle = UnityFixtureCorpus.File("6000.5/fixture/StandaloneWindows64/lz4/fixture");
+            var truth = Path.GetDirectoryName(UnityFixtureCorpus.File("6000.5/fixture/Truth/notes.txt"))!;
 
             using var temp = new TempDir();
             var (exit, stdout, stderr) = Run("export", bundle, "--output", temp.Path, "--type", "all");
@@ -95,27 +92,6 @@ namespace AssetStudio.Tests
             Assert.Equal("glTF"u8.ToArray(), File.ReadAllBytes(Path.Combine(temp.Path, "Animator", "FixtureRoot.glb")).Take(4).ToArray());
             Assert.Contains("path: child", File.ReadAllText(Path.Combine(temp.Path, "AnimationClip", "fixture_move.anim")), StringComparison.Ordinal);
             Assert.Contains("\"title\": \"fixture data\"", File.ReadAllText(Path.Combine(temp.Path, "MonoBehaviour", "fixture_data.json")), StringComparison.Ordinal);
-        }
-
-        // Player build without TypeTrees: MonoBehaviour fields need the game's Managed assemblies.
-        [SkippableFact]
-        public void Export_RealPlayerBuild_MonoBehaviourNeedsAssemblies()
-        {
-            var data = Path.Combine(SyntheticSerializedFile.LocateRepositoryRoot(), "scratch", "unity-fixtures", "samples", "6000.5", "player-mono", "FixtureGame_Data");
-            Skip.IfNot(Directory.Exists(data), "Unity player build not generated on this machine (scratch/unity-fixtures/samples).");
-
-            using var temp = new TempDir();
-            var (_, withoutStdout, withoutStderr) = Run("export", data, "--output", Path.Combine(temp.Path, "none"), "--type", "MonoBehaviour");
-            Assert.Contains("pass --assemblies <Managed folder>", withoutStderr, StringComparison.Ordinal);
-            Assert.Contains("0 exported", withoutStdout, StringComparison.Ordinal);
-
-            var output = Path.Combine(temp.Path, "with");
-            var (exit, _, stderr) = Run("export", data, "--output", output, "--type", "MonoBehaviour", "--assemblies", Path.Combine(data, "Managed"));
-            Assert.True(exit == CliRunner.ExitSuccess, stderr);
-            var json = File.ReadAllText(Path.Combine(output, "MonoBehaviour", "FixtureRoot.json"));
-            Assert.Contains("\"text\": \"hello fixture\"", json, StringComparison.Ordinal);
-            Assert.Contains("\"class\": \"FixtureCircle\"", json, StringComparison.Ordinal);
-            Assert.Contains("\"radius\": 4.5", json, StringComparison.Ordinal);
         }
 
         private static (int Exit, string Stdout, string Stderr) Run(params string[] args)

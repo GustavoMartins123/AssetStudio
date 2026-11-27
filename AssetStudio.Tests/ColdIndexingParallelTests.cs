@@ -19,9 +19,6 @@ namespace AssetStudio.Tests
 {
     public class ColdIndexingParallelTests
     {
-        private const string OthercideBundlesDir =
-            @"H:\SteamLibrary\steamapps\common\Othercide\Othercide_Data\StreamingAssets\aa\Windows\StandaloneWindows64";
-
         private readonly ITestOutputHelper _output;
 
         public ColdIndexingParallelTests(ITestOutputHelper output)
@@ -315,94 +312,6 @@ namespace AssetStudio.Tests
                 $"matTexs={parallelRelations.MaterialTextures.Count}, groups={parallelRelations.ModelGroups.Count}, " +
                 $"rigHashes={parallelRelations.RigBoneHashes.Count}, clipHashes={parallelRelations.ClipBoneHashes.Count} | " +
                 $"seq={seqSw.Elapsed.TotalMilliseconds:0.##} ms, par={parSw.Elapsed.TotalMilliseconds:0.##} ms");
-        }
-
-        [SkippableFact]
-        public void OthercideRealBundles_ParallelMultiFileSemanticExtraction_MatchesSequentialParityAndMeasuresSpeedup()
-        {
-            if (!Directory.Exists(OthercideBundlesDir))
-            {
-                _output.WriteLine($"Othercide directory not present at '{OthercideBundlesDir}'; skipping guarded read-only benchmark.");
-                throw new SkipException("Local game files are not installed on this machine.");
-            }
-
-            var sampleBundles = Directory.GetFiles(OthercideBundlesDir, "*.bundle", SearchOption.TopDirectoryOnly)
-                .Select(f => new FileInfo(f))
-                .Where(fi => fi.Length >= 512 * 1024 && fi.Length <= 15 * 1024 * 1024)
-                .OrderByDescending(fi => fi.Length)
-                .Take(20)
-                .Select(fi => fi.FullName)
-                .ToArray();
-
-            if (sampleBundles.Length == 0)
-            {
-                return;
-            }
-
-            using var assetsManager = new AssetsManager
-            {
-                LazyLoading = false,
-                ProjectRoot = OthercideBundlesDir
-            };
-
-            try
-            {
-                var loadSw = Stopwatch.StartNew();
-                assetsManager.LoadFiles(sampleBundles);
-                loadSw.Stop();
-
-                var loadedFiles = assetsManager.assetsFileList.Where(f => f != null).ToList();
-                Assert.NotEmpty(loadedFiles);
-
-                // Warm up JIT once on first file
-                var warmup = new SemanticAssetRelations();
-                MainWindow.BuildSemanticRelationsForFilesBackground(new[] { loadedFiles[0] }, warmup, maxDegreeOfParallelism: 1);
-
-                // 1. Legacy sequential single-file-at-a-time extraction loop (how BuildLazySemanticRelationsForSourcesAsync ran before)
-                var sequentialRelations = new SemanticAssetRelations();
-                var seqSw = Stopwatch.StartNew();
-                for (int i = 0; i < loadedFiles.Count; i++)
-                {
-                    var singleFileRelations = new SemanticAssetRelations();
-                    MainWindow.BuildSemanticRelationsForFilesBackground(new[] { loadedFiles[i] }, singleFileRelations, maxDegreeOfParallelism: 1);
-                    sequentialRelations.Merge(singleFileRelations);
-                }
-                seqSw.Stop();
-
-                // 2. Parallel multi-file batch extraction across CPU cores
-                var parallelRelations = new SemanticAssetRelations();
-                var parSw = Stopwatch.StartNew();
-                MainWindow.BuildSemanticRelationsForFilesBackground(loadedFiles, parallelRelations);
-                parSw.Stop();
-
-                AssertSemanticRelationsIdentical(sequentialRelations, parallelRelations);
-
-                var speedup = parSw.Elapsed.TotalMilliseconds > 0
-                    ? seqSw.Elapsed.TotalMilliseconds / parSw.Elapsed.TotalMilliseconds
-                    : 1.0;
-
-                _output.WriteLine(
-                    string.Format(
-                        CultureInfo.InvariantCulture,
-                        "Othercide read-only benchmark ({0} bundles, {1} SerializedFiles, load={2:F1} ms): sequential={3:F2} ms vs parallel={4:F2} ms ({5:F2}x speedup) | edges={6}, meshMats={7}, matTexs={8}, groups={9}, animTargets={10}, rigHashes={11}, clipHashes={12}",
-                        sampleBundles.Length,
-                        loadedFiles.Count,
-                        loadSw.Elapsed.TotalMilliseconds,
-                        seqSw.Elapsed.TotalMilliseconds,
-                        parSw.Elapsed.TotalMilliseconds,
-                        speedup,
-                        parallelRelations.AssetEdges.Count,
-                        parallelRelations.MeshMaterials.Count,
-                        parallelRelations.MaterialTextures.Count,
-                        parallelRelations.ModelGroups.Count,
-                        parallelRelations.AnimationClipTargets.Count,
-                        parallelRelations.RigBoneHashes.Count,
-                        parallelRelations.ClipBoneHashes.Count));
-            }
-            finally
-            {
-                assetsManager.Clear();
-            }
         }
 
         private static SerializedFile CreateRichSyntheticSerializedFile(AssetsManager assetsManager, int fileIndex)

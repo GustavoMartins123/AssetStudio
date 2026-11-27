@@ -535,63 +535,6 @@ namespace AssetStudio.Tests
             }
         }
 
-        [SkippableFact]
-        public void RealGameBundle_Othercide_IfAvailable_ParallelAndSequentialMatchByteForByte()
-        {
-            const string othercideRoot = @"H:\SteamLibrary\steamapps\common\Othercide";
-            if (!Directory.Exists(othercideRoot))
-            {
-                throw new SkipException("Local game files are not installed on this machine.");
-            }
-
-            string? targetBundle = Directory
-                .EnumerateFiles(othercideRoot, "*.bundle", SearchOption.AllDirectories)
-                .OrderByDescending(f => new FileInfo(f).Length)
-                .FirstOrDefault(f => new FileInfo(f).Length <= 64L * 1024 * 1024)
-                ?? Directory.EnumerateFiles(othercideRoot, "*.bundle", SearchOption.AllDirectories).FirstOrDefault();
-
-            if (string.IsNullOrEmpty(targetBundle) || !File.Exists(targetBundle))
-            {
-                throw new SkipException("Local game files are not installed on this machine.");
-            }
-
-            byte[][] parallelPayloads;
-            string[] parallelPaths;
-            var swParallel = Stopwatch.StartNew();
-            using (var fsParallel = new FileStream(targetBundle, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var readerParallel = new FileReader(targetBundle, fsParallel))
-            using (var bundleParallel = new BundleFile(readerParallel, decompressionCache: null, allowParallelDecompression: true))
-            {
-                swParallel.Stop();
-                parallelPaths = bundleParallel.fileList.Select(f => f.path).ToArray();
-                parallelPayloads = ReadAllNodePayloads(bundleParallel.fileList);
-            }
-
-            byte[][] sequentialPayloads;
-            string[] sequentialPaths;
-            var swSequential = Stopwatch.StartNew();
-            using (var fsSequential = new FileStream(targetBundle, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var readerSequential = new FileReader(targetBundle, fsSequential))
-            using (var bundleSequential = new BundleFile(readerSequential, decompressionCache: null, allowParallelDecompression: false))
-            {
-                swSequential.Stop();
-                sequentialPaths = bundleSequential.fileList.Select(f => f.path).ToArray();
-                sequentialPayloads = ReadAllNodePayloads(bundleSequential.fileList);
-            }
-
-            Assert.Equal(sequentialPaths, parallelPaths);
-            Assert.Equal(sequentialPayloads.Length, parallelPayloads.Length);
-            for (int i = 0; i < sequentialPayloads.Length; i++)
-            {
-                Assert.Equal(sequentialPayloads[i], parallelPayloads[i]);
-            }
-
-            output.WriteLine(
-                $"Othercide bundle '{Path.GetFileName(targetBundle)}' ({new FileInfo(targetBundle).Length:N0} bytes): " +
-                $"Sequential={swSequential.Elapsed.TotalMilliseconds:F2} ms, Parallel={swParallel.Elapsed.TotalMilliseconds:F2} ms " +
-                $"({swSequential.Elapsed.TotalMilliseconds / Math.Max(0.01, swParallel.Elapsed.TotalMilliseconds):F2}x)");
-        }
-
         [Fact]
         public void ParallelDecompression_And_FastHash64_BenchmarkSpeedup()
         {

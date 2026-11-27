@@ -13,9 +13,6 @@ namespace AssetStudio.Tests
 {
     public class ConnectionsStagingTests
     {
-        private const string OthercideBundlesDir =
-            @"H:\SteamLibrary\steamapps\common\Othercide\Othercide_Data\StreamingAssets\aa\Windows\StandaloneWindows64";
-
         private static readonly string[] LiveSemanticTables =
         {
             "SourceFiles",
@@ -356,21 +353,6 @@ namespace AssetStudio.Tests
             var tempRoot = CreateTempDirectory("connections_staging_othercide");
             try
             {
-                if (Directory.Exists(OthercideBundlesDir))
-                {
-                    var bundleFiles = Directory.GetFiles(OthercideBundlesDir, "*.bundle", SearchOption.TopDirectoryOnly)
-                        .OrderBy(f => new FileInfo(f).Length)
-                        .Take(10)
-                        .ToList();
-
-                    if (bundleFiles.Count > 0)
-                    {
-                        VerifyRealBundlesParityAndFlatBuffers(tempRoot, OthercideBundlesDir, bundleFiles);
-                    }
-                }
-
-                // Always verify synthetic multi-batch fallback parity and read-pool disposal as well
-                // so local runs and CI runners without Othercide exercise the exact same code paths.
                 const int fallbackGroups = 40;
                 var stagedRoot = Path.Combine(tempRoot, "FallbackStaged");
                 var baselineRoot = Path.Combine(tempRoot, "FallbackBaseline");
@@ -401,122 +383,6 @@ namespace AssetStudio.Tests
                 SqliteConnection.ClearAllPools();
                 TryDeleteDirectory(tempRoot);
                 Assert.False(Directory.Exists(tempRoot));
-            }
-        }
-
-        private static void VerifyRealBundlesParityAndFlatBuffers(
-            string tempRoot,
-            string readOnlyProjectFolder,
-            IReadOnlyList<string> sampleBundlePaths)
-        {
-            var stagedCacheDir = Path.Combine(tempRoot, "StagedIndexCache");
-            var baselineCacheDir = Path.Combine(tempRoot, "BaselineIndexCache");
-            using var stagedCache = new SQLiteProjectIndexCache(stagedCacheDir);
-            using var baselineCache = new SQLiteProjectIndexCache(baselineCacheDir);
-
-            var scanResult = ProjectScanner.ScanFolder(readOnlyProjectFolder);
-            var signature = stagedCache.GetFolderSignature(scanResult);
-
-            var assetsManager = new AssetsManager
-            {
-                LazyLoading = false,
-                ProjectRoot = readOnlyProjectFolder
-            };
-
-            try
-            {
-                assetsManager.LoadFiles(sampleBundlePaths.ToArray());
-
-                var handles = new List<AssetHandle>();
-                foreach (var serializedFile in assetsManager.assetsFileList)
-                {
-                    if (serializedFile == null)
-                    {
-                        continue;
-                    }
-
-                    foreach (var obj in serializedFile.Objects)
-                    {
-                        if (obj == null)
-                        {
-                            continue;
-                        }
-
-                        var uniqueId = AssetHandle.BuildUniqueID(serializedFile, obj.m_PathID);
-                        var name = obj switch
-                        {
-                            NamedObject named when !string.IsNullOrEmpty(named.m_Name) => named.m_Name,
-                            GameObject go when !string.IsNullOrEmpty(go.m_Name) => go.m_Name,
-                            _ => obj.type.ToString()
-                        };
-
-                        var handle = new AssetHandle
-                        {
-                            UniqueID = uniqueId,
-                            Name = name,
-                            Type = obj.type,
-                            Container = string.Empty,
-                            OriginalPath = serializedFile.originalPath ?? string.Empty,
-                            SerializedFileName = serializedFile.fileName ?? string.Empty,
-                            PathID = obj.m_PathID,
-                            ByteStart = 0L,
-                            ByteSize = obj.byteSize,
-                            SourceFile = serializedFile,
-                            RealObject = obj
-                        };
-                        handles.Add(handle);
-                        assetsManager.ProjectIndex.AddHandle(handle);
-                    }
-                }
-
-                Assert.NotEmpty(handles);
-                Assert.True(stagedCache.SaveIndexCache(readOnlyProjectFolder, signature, scanResult, "2019.4.1f1", handles, preserveSemanticRelations: false));
-                Assert.True(baselineCache.SaveIndexCache(readOnlyProjectFolder, signature, scanResult, "2019.4.1f1", handles, preserveSemanticRelations: false));
-
-                var baselineMerged = new SemanticAssetRelations();
-                var streamingBuffer = new SemanticAssetRelations();
-
-                using (var session = stagedCache.BeginSemanticStagingSession(readOnlyProjectFolder, signature))
-                {
-                    foreach (var serializedFile in assetsManager.assetsFileList)
-                    {
-                        if (serializedFile == null)
-                        {
-                            continue;
-                        }
-
-                        var fileRelations = new SemanticAssetRelations();
-                        MainWindow.BuildSemanticRelationsForFilesBackground(new[] { serializedFile }, fileRelations);
-
-                        baselineMerged.Merge(fileRelations);
-                        streamingBuffer.Merge(fileRelations);
-
-                        if (MainWindow.CountBufferedSemanticRelationRows(streamingBuffer) > 0)
-                        {
-                            session.FlushBatch(streamingBuffer, clearBatch: true);
-                            // Verify streaming buffer was immediately emptied after flush (bounded RAM).
-                            Assert.Equal(0, MainWindow.CountBufferedSemanticRelationRows(streamingBuffer));
-                        }
-                    }
-
-                    if (!baselineMerged.HasRelations && baselineMerged.SourceFiles.Count == 0)
-                    {
-                        return;
-                    }
-
-                    Assert.True(session.Commit());
-                }
-
-                Assert.True(baselineCache.SaveSemanticRelations(readOnlyProjectFolder, signature, baselineMerged, replaceExisting: true));
-
-                using var stagedConn = stagedCache.CreateReadConnection(readOnlyProjectFolder);
-                using var baselineConn = baselineCache.CreateReadConnection(readOnlyProjectFolder);
-                Assert.Empty(GetStageTableNames(stagedConn));
-                AssertSemanticTablesMatchIdentically(stagedConn, baselineConn);
-            }
-            finally
-            {
-                assetsManager.Clear();
             }
         }
 

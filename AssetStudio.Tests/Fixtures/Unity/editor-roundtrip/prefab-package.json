@@ -1,0 +1,16 @@
+{
+  "Assets/Materials.meta": "d81c55196590de1de607e644b7c6dbc0 dbbd5dea0bc591c09664a7b6a1f275e2dce38c53830439081934c6250f65f394",
+  "Assets/Materials/Mat_Roundtrip_Urp.mat": "b507b4db090d4cb3363bc99ddc87c197 915fed03545ce18f2b9c88053370a83e7a719d1b1083bb5ba7c47a1cca66c35f",
+  "Assets/Materials/Mat_Roundtrip_Urp.mat.meta": "b507b4db090d4cb3363bc99ddc87c197 ae6590f83c92c7a852e49806d7eea62a5368e262d7070498325132366d60a0dd",
+  "Assets/Meshes.meta": "91f3f4263c48e2b7e2a13b4d112bdfca 477b9895a454c9253f5f8ce5045332bf160eb8f87e2971643af13b55dcecb50c",
+  "Assets/Meshes/SK_Roundtrip_Knight.fbx": "7c3ced9d71ff3b5184a4d2632378f768 7075f495b7a0df67606a28a73a798ae9bac4075cb4601ebdfba78bb5def3b18c",
+  "Assets/Meshes/SK_Roundtrip_Knight.fbx.meta": "7c3ced9d71ff3b5184a4d2632378f768 aacacac0d3ba4292a6e1fb01c3e00a03aa9db67acb06ace489570e512d99652e",
+  "Assets/Prefabs.meta": "9f1ba6036962d1cacc405bc8aa80f068 5c7c1ed6ad37b08c4bf30c76b34100f2790abc1c14e421acf6f749862a1a2776",
+  "Assets/Prefabs/KnightRigRoot.prefab": "4eb6d39639c5358e1a8db485ee2056e4 43ad98d68f514b96a7a4b31aa301ba4be6f2393bd0fc56cf45a1a16c2f8250ca",
+  "Assets/Prefabs/KnightRigRoot.prefab.meta": "4eb6d39639c5358e1a8db485ee2056e4 649551f6e71f331890917506c60ae77f907fbfce0d30c926de376ccc5127be3a",
+  "Assets/Textures.meta": "73b67fc576507eed44ea1ea7d2b7a2f4 6c0321f8880bdd3480b3763344c0b3e5142dd7a111925cde33b52ea2c2deecee",
+  "Assets/Textures/T_Roundtrip_Albedo.png": "40753544013b4656c04d0b07d407461f png 4x4 03e4fbc27f8551f65a26758cce6b400a2e221e4787ebb40b675ae0ced0b780a3",
+  "Assets/Textures/T_Roundtrip_Albedo.png.meta": "40753544013b4656c04d0b07d407461f 7303a6bfcd15c1d6dcac8f1342dd38c2035744f9a8646f34360100af42fd675c",
+  "Assets/Textures/T_Roundtrip_Normal.png": "a9a83e2cae81007984d3355bc50e6d1d png 4x4 5ce3aa8aceac9b1c3ce8da447d2554ca42e30f77bc4e4b4345374688bf24e528",
+  "Assets/Textures/T_Roundtrip_Normal.png.meta": "a9a83e2cae81007984d3355bc50e6d1d 6f48f32ff09b7ba999ea2f6017a80ddc1c07264b1a23a6b41c8ecfcd067f5549"
+}

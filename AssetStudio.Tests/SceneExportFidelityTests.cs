@@ -770,13 +770,13 @@ namespace AssetStudio.Tests
         // 7. Headless Blender 5.x Roundtrip: KHR_node_visibility + Water PBR + Unlit
         // =====================================================================
 
-        [SkippableFact]
+        [Fact]
         public void BlenderHeadlessRoundtrip_KhrNodeVisibilityWaterTransmissionIorAndUnlit_ImportCleanly()
         {
             var blenderExe = TryLocateBlenderExecutable();
             if (blenderExe == null)
             {
-                throw new SkipException("Blender was not found (set ASSETSTUDIO_BLENDER_EXE or put blender on PATH).");
+                Assert.Fail("Blender was not found (set ASSETSTUDIO_BLENDER_EXE or put blender on PATH).");
             }
 
             var tempRoot = CreateTempDirectory("scene_fidelity_blender");
@@ -1031,23 +1031,6 @@ with open(report_path, "w", encoding="utf-8") as f:
                     catch
                     {
                     }
-                }
-            }
-
-            string[] wellKnownPaths =
-            {
-                @"H:\SteamLibrary\steamapps\common\Blender\blender.exe",
-                @"D:\SteamLibrary\steamapps\common\Blender\blender.exe",
-                @"C:\Program Files\Blender Foundation\Blender 5.3\blender.exe",
-                @"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe",
-                @"C:\Program Files\Blender Foundation\Blender 4.3\blender.exe",
-                @"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe"
-            };
-            foreach (var candidate in wellKnownPaths)
-            {
-                if (File.Exists(candidate))
-                {
-                    return candidate;
                 }
             }
 

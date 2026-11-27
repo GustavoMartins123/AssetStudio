@@ -258,54 +258,6 @@ namespace AssetStudio.Tests
             Assert.Equal(1, subtreeCalls);
         }
 
-        [SkippableFact]
-        public void SceneGlbExportService_OptionalLocalSceneFile_ExportsValidInstancedGlbWhenConfigured()
-        {
-            var levelPath = Environment.GetEnvironmentVariable("ASSETSTUDIO_TEST_SCENE_FILE");
-            if (string.IsNullOrWhiteSpace(levelPath) || !File.Exists(levelPath))
-            {
-                _output.WriteLine("Skipping optional external scene file test (ASSETSTUDIO_TEST_SCENE_FILE not set).");
-                throw new SkipException("Set ASSETSTUDIO_TEST_SCENE_FILE to an existing scene file to run this test.");
-            }
-
-            var tempDir = CreateTempDirectory();
-            try
-            {
-                using var am = new AssetsManager();
-                am.AutoLoadExternalDependencies = false;
-                am.LoadFiles(levelPath);
-                Assert.NotEmpty(am.assetsFileList);
-
-                var roots = SceneGlbExportService.CollectRootGameObjectsFromSerializedFile(am.assetsFileList[0]);
-                Assert.NotEmpty(roots);
-
-                var outGlb = Path.Combine(tempDir, "scene_export.glb");
-                var service = new SceneGlbExportService();
-                var result = service.ExportScene(
-                    roots,
-                    new SceneGlbExportOptions
-                    {
-                        OutputPath = outGlb,
-                        SceneName = Path.GetFileNameWithoutExtension(levelPath),
-                        IncludeInactive = true,
-                        IncludeAnimations = false,
-                        EnableInstancing = true
-                    });
-
-                Assert.True(result.Success, result.ErrorMessage);
-                Assert.True(File.Exists(outGlb));
-                Assert.True(result.Stats.TotalNodes >= roots.Count);
-
-                using var doc = ParseGlbJson(outGlb);
-                Assert.Equal("2.0", doc.RootElement.GetProperty("asset").GetProperty("version").GetString());
-                _output.WriteLine(result.SummaryMessage);
-            }
-            finally
-            {
-                TryDeleteDirectory(tempDir);
-            }
-        }
-
         [Fact]
         public void SceneGlbExportService_EmptyInputsAndHelperMethods_HandleEdgeCasesCleanly()
         {

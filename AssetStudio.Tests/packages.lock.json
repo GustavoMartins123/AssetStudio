@@ -29,16 +29,6 @@
         "resolved": "2.8.2",
         "contentHash": "vm1tbfXhFmjFMUmS4M0J0ASXz3/U5XvXBa6DOQUL3fEz4Vt6YPhv+ESCarx6M6D+9kJkJYZKCNvJMas1+nVfmQ=="
       },
-      "Xunit.SkippableFact": {
-        "type": "Direct",
-        "requested": "[1.5.23, )",
-        "resolved": "1.5.23",
-        "contentHash": "JlKobLTlsGcuJ8OtoodxL63bUagHSVBnF+oQ2GgnkwNqK+XYjeYyhQasULi5Ebx1MNDGNbOMplQYr89mR+nItQ==",
-        "dependencies": {
-          "Validation": "2.5.51",
-          "xunit.extensibility.execution": "2.4.0"
-        }
-      },
       "Avalonia.Angle.Windows.Natives": {
         "type": "Transitive",
         "resolved": "2.1.25547.20250602",
@@ -349,11 +339,6 @@
         "type": "Transitive",
         "resolved": "0.92.0",
         "contentHash": "h7IMakm0PF2jxiagoysoAjrzzLQ0UBdnSXQL5kb17YW0Fvyo12Tg96A99QkzwktWRrd7H+Uw9EzjasNLUfGYlA=="
-      },
-      "Validation": {
-        "type": "Transitive",
-        "resolved": "2.5.51",
-        "contentHash": "g/Aug7PVWaenlJ0QUyt/mEetngkQNsMCuNeRVXbcJED1nZS7JcK+GTU4kz3jcQ7bFuKfi8PF4ExXH7XSFNuSLQ=="
       },
       "xunit.abstractions": {
         "type": "Transitive",

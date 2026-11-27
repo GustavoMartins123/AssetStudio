@@ -19,9 +19,6 @@ namespace AssetStudio.Tests
 {
     public class AnimationRelationAndAsyncPreviewTests
     {
-        private const string OthercideBundlesDir =
-            @"H:\SteamLibrary\steamapps\common\Othercide\Othercide_Data\StreamingAssets\aa\Windows\StandaloneWindows64";
-
         private readonly ITestOutputHelper _output;
 
         public AnimationRelationAndAsyncPreviewTests(ITestOutputHelper output)
@@ -645,51 +642,11 @@ namespace AssetStudio.Tests
                 var avgQueryMs = querySw.Elapsed.TotalMilliseconds / querySampleCount;
                 _output.WriteLine($"500-rig / 5,000-clip staging+promotion time: {buildSw.Elapsed.TotalMilliseconds.ToString("0.0", CultureInfo.InvariantCulture)} ms | Avg LoadAnimationClipTargets latency: {avgQueryMs.ToString("0.0000", CultureInfo.InvariantCulture)} ms ({querySw.Elapsed.TotalMilliseconds.ToString("0.00", CultureInfo.InvariantCulture)} ms for {querySampleCount} queries)");
                 Assert.True(avgQueryMs < 1.0, $"Expected average query latency < 1.0 ms, actual {avgQueryMs:0.0000} ms");
-
-                if (Directory.Exists(OthercideBundlesDir))
-                {
-                    VerifyReadOnlyOthercideAnimationIndexing(tempRoot, OthercideBundlesDir);
-                }
             }
             finally
             {
                 SqliteConnection.ClearAllPools();
                 TryDeleteDirectory(tempRoot);
-            }
-        }
-
-        private void VerifyReadOnlyOthercideAnimationIndexing(string tempRoot, string readOnlyBundlesDir)
-        {
-            var sampleBundles = Directory.GetFiles(readOnlyBundlesDir, "*.bundle", SearchOption.TopDirectoryOnly)
-                .OrderBy(f => new FileInfo(f).Length)
-                .Take(12)
-                .ToArray();
-            if (sampleBundles.Length == 0)
-            {
-                return;
-            }
-
-            var cacheDir = Path.Combine(tempRoot, "OthercideAnimCache");
-            using var cache = new SQLiteProjectIndexCache(cacheDir);
-            var scanResult = ProjectScanner.ScanFolder(readOnlyBundlesDir);
-            var signature = cache.GetFolderSignature(scanResult);
-
-            var assetsManager = new AssetsManager
-            {
-                LazyLoading = false,
-                ProjectRoot = readOnlyBundlesDir
-            };
-
-            try
-            {
-                assetsManager.LoadFiles(sampleBundles);
-                var relations = new SemanticAssetRelations();
-                MainWindow.BuildSemanticRelationsForFilesBackground(assetsManager.assetsFileList, relations);
-                _output.WriteLine($"Othercide sample (12 bundles): edges={relations.AssetEdges.Count}, animTargets={relations.AnimationClipTargets.Count}, rigBoneHashes={relations.RigBoneHashes.Count}, clipBoneHashes={relations.ClipBoneHashes.Count}");
-            }
-            finally
-            {
-                assetsManager.Clear();
             }
         }
 

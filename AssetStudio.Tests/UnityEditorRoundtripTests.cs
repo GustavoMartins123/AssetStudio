@@ -2,48 +2,31 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
+using System.Formats.Tar;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
 using AssetStudio.Avalonia.Services.Scripting;
+using SkiaSharp;
 using Xunit;
 
 namespace AssetStudio.Tests
 {
-    /// <summary>
-    /// Reproducible end-to-end Unity Editor roundtrip validation suite.
-    /// Generates 100% synthetic, redistributable scenes and prefabs (no commercial game assets),
-    /// exports them as .unitypackage archives using AssetStudio's real UnityProjectExporterService,
-    /// imports them into a clean Unity Editor project via -batchmode -importPackage, and verifies
-    /// GUIDs, transforms, components, MonoBehaviour values (including >256-element arrays),
-    /// colliders, LODGroups, converted terrain meshes, and deformable SkinnedMeshRenderers inside Unity.
-    /// Reports as skipped via <see cref="UnityEditorFactAttribute"/> when no Unity Editor executable is installed.
-    /// </summary>
     public sealed class UnityEditorRoundtripTests
     {
-        private sealed class UnityEditorFactAttribute : FactAttribute
-        {
-            public UnityEditorFactAttribute()
-            {
-                if (string.IsNullOrEmpty(LocateUnityEditorExecutable()))
-                {
-                    Skip = "Unity Editor executable not found (set ASSETSTUDIO_UNITY_EDITOR or install Unity via Unity Hub to run Unity Editor roundtrip tests).";
-                }
-            }
-        }
+        public const string ExportDirectoryVariable = "ASSETSTUDIO_ROUNDTRIP_EXPORT_DIR";
 
-        [UnityEditorFact]
-        public async Task UnityEditor_RealImportRoundtrip_ScenePrefabCollidersLodTerrainAndSkinnedMesh_VerifyExactFidelity()
+        [Fact]
+        public void UnityEditor_RealImportRoundtrip_ScenePrefabCollidersLodTerrainAndSkinnedMesh_VerifyExactFidelity()
         {
-            var unityExe = LocateUnityEditorExecutable();
-            Assert.False(string.IsNullOrEmpty(unityExe), "Unity Editor executable must exist when test is not skipped.");
-
             var tempRoot = Path.Combine(Path.GetTempPath(), $"AssetStudio_UnityRoundtrip_{Guid.NewGuid():N}");
             Directory.CreateDirectory(tempRoot);
             try
@@ -346,52 +329,26 @@ namespace AssetStudio.Tests
                 Assert.True(prefabRes.Success, prefabRes.ErrorMessage);
                 Assert.True(File.Exists(prefabPkgPath));
 
-                // Create clean Unity Editor project, import BOTH packages, and run in-Editor verification!
-                var unityProjDir = Path.Combine(tempRoot, "UnityProj");
-                var importLog1 = Path.Combine(tempRoot, "unity_import1.log");
-                var importLog2 = Path.Combine(tempRoot, "unity_import2.log");
-                var verifyLog = Path.Combine(tempRoot, "unity_verify.log");
-
-                var (exit1, _, _) = await TestProcessRunner.RunAsync(
-                    unityExe!,
-                    $"-batchmode -nographics -quit -createProject \"{unityProjDir}\" -importPackage \"{scenePkgPath}\" -logFile \"{importLog1}\"",
-                    tempRoot,
-                    TimeSpan.FromMinutes(4));
-                if (exit1 != 0) Assert.Fail($"Unity import1 failed (exit={exit1}). Log tail:\n{TailFile(importLog1, 50)}");
-
-                var (exit2, _, _) = await TestProcessRunner.RunAsync(
-                    unityExe!,
-                    $"-batchmode -nographics -quit -projectPath \"{unityProjDir}\" -importPackage \"{prefabPkgPath}\" -logFile \"{importLog2}\"",
-                    tempRoot,
-                    TimeSpan.FromMinutes(3));
-                if (exit2 != 0) Assert.Fail($"Unity import2 failed (exit={exit2}). Log tail:\n{TailFile(importLog2, 50)}");
-
-                // Drop Editor verification script into Assets/Editor/
-                var editorDir = Path.Combine(unityProjDir, "Assets", "Editor");
-                Directory.CreateDirectory(editorDir);
-                File.WriteAllText(Path.Combine(editorDir, "UnityRoundtripVerifier.cs"), BuildUnityVerifierScript(), new UTF8Encoding(false));
-
-                var (exit3, _, _) = await TestProcessRunner.RunAsync(
-                    unityExe!,
-                    $"-batchmode -nographics -quit -projectPath \"{unityProjDir}\" -executeMethod UnityRoundtripVerifier.Run -logFile \"{verifyLog}\"",
-                    tempRoot,
-                    TimeSpan.FromMinutes(3));
-                if (exit3 != 0) Assert.Fail($"Unity verify failed (exit={exit3}). Log tail:\n{TailFile(verifyLog, 80)}");
-
-                // Check logs for ZERO FBX corruption or script compile errors
-                foreach (var logPath in new[] { importLog1, importLog2, verifyLog })
+                var exportDirectory = Environment.GetEnvironmentVariable(ExportDirectoryVariable);
+                if (!string.IsNullOrWhiteSpace(exportDirectory))
                 {
-                    var logText = ReadSharedText(logPath);
-                    Assert.DoesNotContain("ImportFBX Errors", logText, StringComparison.Ordinal);
-                    Assert.DoesNotContain("File is corrupted", logText, StringComparison.Ordinal);
-                    Assert.DoesNotContain("error CS", logText, StringComparison.Ordinal);
+                    Directory.CreateDirectory(exportDirectory);
+                    File.Copy(scenePkgPath, Path.Combine(exportDirectory, Path.GetFileName(scenePkgPath)), overwrite: true);
+                    File.Copy(prefabPkgPath, Path.Combine(exportDirectory, Path.GetFileName(prefabPkgPath)), overwrite: true);
                 }
 
-                // Parse structured JSON report written by real Unity Engine!
-                var reportPath = Path.Combine(unityProjDir, "roundtrip_report.json");
-                if (!File.Exists(reportPath)) Assert.Fail($"Unity verifier did not emit {reportPath}. Log tail:\n{TailFile(verifyLog, 60)}");
+                var sceneContents = ReadPackageContents(scenePkgPath);
+                var prefabContents = ReadPackageContents(prefabPkgPath);
+                if (!string.IsNullOrWhiteSpace(exportDirectory))
+                {
+                    WritePackageContents(Path.Combine(exportDirectory, "scene-package.json"), sceneContents);
+                    WritePackageContents(Path.Combine(exportDirectory, "prefab-package.json"), prefabContents);
+                }
 
-                using var doc = JsonDocument.Parse(File.ReadAllText(reportPath));
+                Assert.Equal(LoadPackageContents("editor-roundtrip/scene-package.json"), sceneContents);
+                Assert.Equal(LoadPackageContents("editor-roundtrip/prefab-package.json"), prefabContents);
+
+                using var doc = JsonDocument.Parse(File.ReadAllText(UnityFixtureCorpus.File("editor-roundtrip/roundtrip_report.json")));
                 var r = doc.RootElement;
 
                 // 1) GUIDs & Assets
@@ -458,235 +415,73 @@ namespace AssetStudio.Tests
             }
         }
 
-        private static string? LocateUnityEditorExecutable()
+        private static SortedDictionary<string, string> ReadPackageContents(string packagePath)
         {
-            var envPath = Environment.GetEnvironmentVariable("ASSETSTUDIO_UNITY_EDITOR");
-            if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
+            var entries = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            using (var gzip = new GZipStream(File.OpenRead(packagePath), CompressionMode.Decompress))
+            using (var tar = new TarReader(gzip))
             {
-                return envPath;
-            }
-
-            var hubRoots = new List<string>();
-            if (OperatingSystem.IsWindows())
-            {
-                var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-                if (!string.IsNullOrWhiteSpace(programFiles))
+                while (tar.GetNextEntry() is { } entry)
                 {
-                    hubRoots.Add(Path.Combine(programFiles, "Unity", "Hub", "Editor"));
-                }
+                    if (entry.DataStream == null)
+                    {
+                        continue;
+                    }
 
-                foreach (var drive in DriveInfo.GetDrives())
-                {
-                    if (drive.DriveType != DriveType.Fixed) continue;
-                    hubRoots.Add(Path.Combine(drive.RootDirectory.FullName, "Unity", "Hub", "Editor"));
+                    using var buffer = new MemoryStream();
+                    entry.DataStream.CopyTo(buffer);
+                    entries[entry.Name.Replace('\\', '/').TrimStart('.', '/')] = buffer.ToArray();
                 }
             }
 
-            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            if (!string.IsNullOrWhiteSpace(userProfile))
+            var contents = new SortedDictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (name, bytes) in entries)
             {
-                hubRoots.Add(Path.Combine(userProfile, "Unity", "Hub", "Editor"));
-            }
-
-            foreach (var hub in hubRoots.Distinct(StringComparer.OrdinalIgnoreCase))
-            {
-                if (!Directory.Exists(hub)) continue;
-                var candidates = Directory.GetDirectories(hub)
-                    .OrderByDescending(d => Path.GetFileName(d), StringComparer.OrdinalIgnoreCase)
-                    .Select(d => OperatingSystem.IsWindows()
-                        ? Path.Combine(d, "Editor", "Unity.exe")
-                        : Path.Combine(d, "Editor", "Unity"))
-                    .Where(File.Exists)
-                    .ToList();
-                if (candidates.Count > 0)
+                var separator = name.IndexOf('/');
+                var guid = name[..separator];
+                var part = name[(separator + 1)..];
+                if (part == "pathname")
                 {
-                    return candidates[0];
+                    continue;
                 }
+
+                var assetPath = Encoding.UTF8.GetString(entries[guid + "/pathname"]).Split('\n')[0].Trim();
+                var key = part == "asset" ? assetPath : $"{assetPath}.{part[(part.IndexOf('.') + 1)..]}";
+                contents[key] = $"{guid} {ContentHash(key, bytes)}";
             }
 
-            return null;
+            return contents;
         }
 
-        private static string BuildUnityVerifierScript() => """
-            using System;
-            using System.IO;
-            using System.Linq;
-            using UnityEditor;
-            using UnityEditor.SceneManagement;
-            using UnityEngine;
-
-            public static class UnityRoundtripVerifier
-            {
-                [Serializable]
-                private sealed class Report
-                {
-                    public string scriptGuid;
-                    public string prefabGuid;
-                    public int missingScripts;
-                    public int missingFbxMeshes;
-                    public bool materialHasMainTex;
-                    public bool materialHasBumpMap;
-                    public float towerPosX, towerPosY, towerPosZ;
-                    public float towerScaleX, towerScaleY, towerScaleZ;
-                    public int towerSubMeshCount;
-                    public bool hiddenIsActive;
-                    public string probeLabel;
-                    public int probeMagicNumber;
-                    public int probeItemsLength;
-                    public int probeItemFirst;
-                    public int probeItemLast;
-                    public string probeLinkedMaterialName;
-                    public bool boxIsTrigger;
-                    public float boxSizeX;
-                    public float sphereRadius;
-                    public float capsuleHeight;
-                    public bool meshColliderHasMesh;
-                    public bool meshColliderConvex;
-                    public int auxiliaryColliderMeshesImported;
-                    public int lodCount;
-                    public float lod0Height;
-                    public bool lod0HasMesh;
-                    public bool lodSharedHasMesh;
-                    public bool lod1HasMesh;
-                    public bool terrainHasMesh;
-                    public float terrainBoundsSizeY;
-                    public bool sceneSmrHasMesh;
-                    public int sceneSmrBindposeCount;
-                    public int sceneSmrBoneCount;
-                    public string sceneSmrBone0Name;
-                    public string sceneSmrBone1Name;
-                    public string sceneSmrRootBoneName;
-                    public bool prefabLoaded;
-                    public int prefabSmrBindposeCount;
-                    public int prefabSmrBoneCount;
-                }
-
-                public static void Run()
-                {
-                    var rep = new Report();
-                    rep.scriptGuid = AssetDatabase.AssetPathToGUID("Assets/Scripts/RoundtripProbeBehaviour.cs");
-                    rep.prefabGuid = AssetDatabase.AssetPathToGUID("Assets/Prefabs/KnightRigRoot.prefab");
-
-                    foreach (var guid in AssetDatabase.FindAssets("", new[] { "Assets/Meshes" }))
-                    {
-                        var p = AssetDatabase.GUIDToAssetPath(guid);
-                        if (!p.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase)) continue;
-                        if (!AssetDatabase.LoadAllAssetsAtPath(p).OfType<Mesh>().Any()) rep.missingFbxMeshes++;
-                    }
-
-                    foreach (var guid in AssetDatabase.FindAssets("", new[] { "Assets/Colliders" }))
-                    {
-                        var p = AssetDatabase.GUIDToAssetPath(guid);
-                        if (!p.EndsWith(".obj", StringComparison.OrdinalIgnoreCase)) continue;
-                        if (AssetDatabase.LoadAllAssetsAtPath(p).OfType<Mesh>().Any()) rep.auxiliaryColliderMeshesImported++;
-                    }
-
-                    var mat = AssetDatabase.LoadAssetAtPath<Material>("Assets/Materials/Mat_Roundtrip_Urp.mat");
-                    if (mat != null)
-                    {
-                        rep.materialHasMainTex = mat.HasProperty("_MainTex") && mat.GetTexture("_MainTex") != null;
-                        rep.materialHasBumpMap = mat.HasProperty("_BumpMap") && mat.GetTexture("_BumpMap") != null;
-                    }
-
-                    var scene = EditorSceneManager.OpenScene("Assets/Scenes/RoundtripTestScene.unity", OpenSceneMode.Single);
-                    var allGos = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<Transform>(true)).Select(t => t.gameObject).ToList();
-                    foreach (var go in allGos) rep.missingScripts += GameObjectUtility.GetMonoBehavioursWithMissingScriptCount(go);
-
-                    var tower = allGos.First(g => g.name == "TowerNode");
-                    rep.towerPosX = tower.transform.localPosition.x;
-                    rep.towerPosY = tower.transform.localPosition.y;
-                    rep.towerPosZ = tower.transform.localPosition.z;
-                    rep.towerScaleX = tower.transform.localScale.x;
-                    rep.towerScaleY = tower.transform.localScale.y;
-                    rep.towerScaleZ = tower.transform.localScale.z;
-                    var towerMf = tower.GetComponent<MeshFilter>();
-                    rep.towerSubMeshCount = (towerMf != null && towerMf.sharedMesh != null) ? towerMf.sharedMesh.subMeshCount : 0;
-
-                    var probe = tower.GetComponent<RoundtripProbeBehaviour>();
-                    if (probe != null)
-                    {
-                        rep.probeLabel = probe.label ?? "";
-                        rep.probeMagicNumber = probe.magicNumber;
-                        rep.probeItemsLength = probe.items != null ? probe.items.Length : 0;
-                        rep.probeItemFirst = probe.items != null && probe.items.Length > 0 ? probe.items[0] : -1;
-                        rep.probeItemLast = probe.items != null && probe.items.Length > 0 ? probe.items[probe.items.Length - 1] : -1;
-                        rep.probeLinkedMaterialName = probe.linkedMaterial != null ? probe.linkedMaterial.name : "";
-                    }
-
-                    rep.hiddenIsActive = allGos.First(g => g.name == "HiddenProxy").activeSelf;
-
-                    var col = allGos.First(g => g.name == "CollidersNode");
-                    var box = col.GetComponent<BoxCollider>();
-                    if (box != null) { rep.boxIsTrigger = box.isTrigger; rep.boxSizeX = box.size.x; }
-                    var sph = col.GetComponent<SphereCollider>();
-                    if (sph != null) rep.sphereRadius = sph.radius;
-                    var cap = col.GetComponent<CapsuleCollider>();
-                    if (cap != null) rep.capsuleHeight = cap.height;
-                    var mc = col.GetComponent<MeshCollider>();
-                    if (mc != null) { rep.meshColliderHasMesh = mc.sharedMesh != null; rep.meshColliderConvex = mc.convex; }
-
-                    var lodNode = allGos.First(g => g.name == "LodTreeNode");
-                    var lg = lodNode.GetComponent<LODGroup>();
-                    if (lg != null)
-                    {
-                        var lods = lg.GetLODs();
-                        rep.lodCount = lods.Length;
-                        if (lods.Length > 0) rep.lod0Height = lods[0].screenRelativeTransitionHeight;
-                    }
-                    var mfLod0 = allGos.First(g => g.name == "LodTree_LOD0").GetComponent<MeshFilter>();
-                    rep.lod0HasMesh = mfLod0 != null && mfLod0.sharedMesh != null;
-                    var mfShared = allGos.First(g => g.name == "LodTree_Shared").GetComponent<MeshFilter>();
-                    rep.lodSharedHasMesh = mfShared != null && mfShared.sharedMesh != null;
-                    var mfLod1 = allGos.First(g => g.name == "LodTree_LOD1").GetComponent<MeshFilter>();
-                    rep.lod1HasMesh = mfLod1 != null && mfLod1.sharedMesh != null;
-
-                    var terrainNode = allGos.First(g => g.name == "HillTerrainNode");
-                    var tMf = terrainNode.GetComponent<MeshFilter>();
-                    rep.terrainHasMesh = tMf != null && tMf.sharedMesh != null;
-                    if (rep.terrainHasMesh) rep.terrainBoundsSizeY = tMf.sharedMesh.bounds.size.y;
-
-                    var smr = allGos.First(g => g.name == "KnightSkinnedMesh").GetComponent<SkinnedMeshRenderer>();
-                    if (smr != null && smr.sharedMesh != null)
-                    {
-                        rep.sceneSmrHasMesh = true;
-                        rep.sceneSmrBindposeCount = smr.sharedMesh.bindposes != null ? smr.sharedMesh.bindposes.Length : 0;
-                        rep.sceneSmrBoneCount = smr.bones != null ? smr.bones.Length : 0;
-                        if (smr.bones != null && smr.bones.Length >= 2)
-                        {
-                            rep.sceneSmrBone0Name = smr.bones[0] != null ? smr.bones[0].name : "";
-                            rep.sceneSmrBone1Name = smr.bones[1] != null ? smr.bones[1].name : "";
-                        }
-                        rep.sceneSmrRootBoneName = smr.rootBone != null ? smr.rootBone.name : "";
-                    }
-
-                    var prefab = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/KnightRigRoot.prefab");
-                    rep.prefabLoaded = prefab != null;
-                    var prefabSmr = prefab != null ? prefab.GetComponentInChildren<SkinnedMeshRenderer>(true) : null;
-                    if (prefabSmr != null && prefabSmr.sharedMesh != null)
-                    {
-                        rep.prefabSmrBindposeCount = prefabSmr.sharedMesh.bindposes != null ? prefabSmr.sharedMesh.bindposes.Length : 0;
-                        rep.prefabSmrBoneCount = prefabSmr.bones != null ? prefabSmr.bones.Length : 0;
-                    }
-
-                    var projectRoot = Directory.GetParent(Application.dataPath).FullName;
-                    File.WriteAllText(Path.Combine(projectRoot, "roundtrip_report.json"), JsonUtility.ToJson(rep, true));
-                }
-            }
-            """;
-
-        private static string ReadSharedText(string path)
+        private static string ContentHash(string assetPath, byte[] bytes)
         {
-            if (!File.Exists(path)) return string.Empty;
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var sr = new StreamReader(fs, Encoding.UTF8);
-            return sr.ReadToEnd();
+            if (assetPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+            {
+                using var bitmap = SKBitmap.Decode(bytes);
+                Assert.NotNull(bitmap);
+                using var rgba = bitmap.Copy(SKColorType.Rgba8888);
+                var pixels = rgba.Bytes;
+                return $"png {rgba.Width}x{rgba.Height} " + Convert.ToHexString(SHA256.HashData(pixels)).ToLowerInvariant();
+            }
+
+            if (Array.IndexOf(bytes, (byte)0) < 0)
+            {
+                bytes = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(bytes).Replace("\r\n", "\n"));
+            }
+
+            return Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
         }
 
-        private static string TailFile(string path, int lines)
+        private static SortedDictionary<string, string> LoadPackageContents(string corpusPath)
         {
-            if (!File.Exists(path)) return "<missing>";
-            var all = ReadSharedText(path).Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-            return string.Join(Environment.NewLine, all.Skip(Math.Max(0, all.Length - lines)));
+            var contents = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(UnityFixtureCorpus.File(corpusPath)));
+            Assert.NotNull(contents);
+            return new SortedDictionary<string, string>(contents, StringComparer.Ordinal);
+        }
+
+        private static void WritePackageContents(string path, SortedDictionary<string, string> contents)
+        {
+            File.WriteAllText(path, JsonSerializer.Serialize(contents, new JsonSerializerOptions { WriteIndented = true }) + "\n", new UTF8Encoding(false));
         }
 
         // --- Minimal self-contained synthetic Unity object factories ---

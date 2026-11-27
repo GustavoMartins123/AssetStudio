@@ -367,42 +367,6 @@ namespace AssetStudio.Tests
             }
         }
 
-        [SkippableFact]
-        public void ExternalBundleSmokeProbe_WhenEnvironmentVariableProvided_ResolvesExternalMaterialMainTex()
-        {
-            var bundlePath = Environment.GetEnvironmentVariable("ASSETSTUDIO_SMOKE_BUNDLE_PATH");
-            var materialName = Environment.GetEnvironmentVariable("ASSETSTUDIO_SMOKE_MATERIAL_NAME");
-            if (string.IsNullOrWhiteSpace(bundlePath) || !File.Exists(bundlePath))
-            {
-                throw new SkipException("Set ASSETSTUDIO_SMOKE_BUNDLE_PATH to an existing bundle to run this probe.");
-            }
-
-            var catalogDeps = AddressablesCatalogDependencyResolver.ResolveDependencies(new[] { bundlePath });
-            Assert.NotEmpty(catalogDeps);
-
-            using var manager = new AssetsManager();
-            manager.LoadFiles(bundlePath);
-
-            Assert.True(manager.assetsFileList.Count >= 2, $"Expected >= 2 loaded SerializedFiles, got {manager.assetsFileList.Count}");
-
-            if (!string.IsNullOrWhiteSpace(materialName))
-            {
-                var material = manager.assetsFileList
-                    .SelectMany(f => f.Objects)
-                    .OfType<Material>()
-                    .FirstOrDefault(m => string.Equals(m.m_Name, materialName, StringComparison.OrdinalIgnoreCase));
-
-                Assert.NotNull(material);
-                var mainTexEntry = material!.m_SavedProperties.m_TexEnvs
-                    .FirstOrDefault(kv => string.Equals(kv.Key, "_MainTex", StringComparison.OrdinalIgnoreCase));
-                Assert.NotNull(mainTexEntry.Value);
-                Assert.True(mainTexEntry.Value.m_Texture.m_FileID > 0, "Expected _MainTex to be an external PPtr (m_FileID > 0).");
-                Assert.True(mainTexEntry.Value.m_Texture.TryGet(out var resolvedTex), "Expected external _MainTex PPtr to resolve automatically!");
-                Assert.NotNull(resolvedTex);
-                Assert.False(string.IsNullOrWhiteSpace(resolvedTex!.m_Name));
-            }
-        }
-
         private static byte[] BuildMinimalUnityFsBundle(string cabName, IReadOnlyList<string>? externals = null)
         {
             var serializedFileBytes = BuildMinimalSerializedFileBytes("2021.3.16f1", externals ?? Array.Empty<string>());

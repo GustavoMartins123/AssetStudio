@@ -181,20 +181,15 @@ namespace AssetStudio.Tests
             Assert.Equal("Identical bytes", same.Detail);
         }
 
-        // A player build made by the Unity 6000.5 editor (scratch/unity-fixtures, not in git): changing one byte of a
-        // texture inside sharedassets0.assets.resS leaves the Texture2D object bytes untouched, so only the streamed
-        // data comparison can see it.
-        [SkippableFact]
+        [Fact]
         public void FullContent_RealPlayerBuild_TextureChangedOnlyInResS_IsModified()
         {
-            var samples = Path.Combine(SyntheticSerializedFile.LocateRepositoryRoot(), "scratch", "unity-fixtures", "samples", "6000.5", "player-mono", "FixtureGame_Data");
-            Skip.IfNot(File.Exists(Path.Combine(samples, "sharedassets0.assets.resS")), "Unity player build not generated on this machine (scratch/unity-fixtures/samples).");
-
             using var dirs = new TempBuilds();
             foreach (var name in new[] { "sharedassets0.assets", "sharedassets0.assets.resS", "sharedassets0.resource" })
             {
-                File.Copy(Path.Combine(samples, name), Path.Combine(dirs.BaselineDir, name));
-                File.Copy(Path.Combine(samples, name), Path.Combine(dirs.TargetDir, name));
+                var source = UnityFixtureCorpus.File("6000.5/player-mono/" + name);
+                File.Copy(source, Path.Combine(dirs.BaselineDir, name));
+                File.Copy(source, Path.Combine(dirs.TargetDir, name));
             }
 
             var baseline = LoadSnapshots(Path.Combine(dirs.BaselineDir, "sharedassets0.assets"), out var streamedTexture);
@@ -220,13 +215,11 @@ namespace AssetStudio.Tests
         }
 
         // The same Unity 6000.5 bundle built with LZ4 and with LZMA: the files differ byte for byte, the assets do not.
-        [SkippableFact]
+        [Fact]
         public void FullContent_RealBundles_SameContentDifferentCompression_AllAssetsIdentical()
         {
-            var samples = Path.Combine(SyntheticSerializedFile.LocateRepositoryRoot(), "scratch", "unity-fixtures", "samples", "6000.5", "fixture", "StandaloneWindows64");
-            var lz4 = Path.Combine(samples, "lz4", "fixture");
-            var lzma = Path.Combine(samples, "lzma", "fixture");
-            Skip.IfNot(File.Exists(lz4) && File.Exists(lzma), "Unity LZ4/LZMA fixture bundles not generated on this machine (scratch/unity-fixtures/samples).");
+            var lz4 = UnityFixtureCorpus.File("6000.5/fixture/StandaloneWindows64/lz4/fixture");
+            var lzma = UnityFixtureCorpus.File("6000.5/fixture/StandaloneWindows64/lzma/fixture");
 
             using var dirs = new TempBuilds();
             File.Copy(lz4, Path.Combine(dirs.BaselineDir, "fixture"));

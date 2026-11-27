@@ -1,0 +1,59 @@
+name: Set up Blender
+description: Installs the official Blender release and exports ASSETSTUDIO_BLENDER_EXE for the Blender roundtrip tests.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Blender
+      id: blender-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/blender
+        key: blender-5.3.0-${{ runner.os }}-x64
+
+    - name: Download Blender (Windows)
+      if: runner.os == 'Windows' && steps.blender-cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $zip = Join-Path $env:RUNNER_TEMP "blender-5.3.0-windows-x64.zip"
+        Invoke-WebRequest -Uri "https://download.blender.org/release/Blender5.3/blender-5.3.0-windows-x64.zip" -OutFile $zip
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+        if ($hash -ne "3ac567a63d59d9934f7b9213bfb27ba05760e1fb366f8f55c381573ec3eabfa8") { throw "Blender download hash $hash does not match." }
+        $target = Join-Path $env:RUNNER_TEMP "blender"
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        tar -xf $zip -C $target
+        if ($LASTEXITCODE -ne 0) { throw "Extracting Blender failed with exit code $LASTEXITCODE." }
+        Remove-Item -LiteralPath $zip
+
+    - name: Download Blender (Linux)
+      if: runner.os == 'Linux' && steps.blender-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        archive="$RUNNER_TEMP/blender-5.3.0-linux-x64.tar.xz"
+        curl -fsSL -o "$archive" "https://download.blender.org/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz"
+        echo "dacb8264197a3f7fda6001285a5a506fc97ee943881261c2c3bd63c882f22e05  $archive" | sha256sum -c -
+        mkdir -p "$RUNNER_TEMP/blender"
+        tar -xJf "$archive" -C "$RUNNER_TEMP/blender"
+        rm "$archive"
+
+    - name: Install Blender runtime libraries (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libice6 libgl1 libegl1
+
+    - name: Locate Blender
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $name = if ($IsWindows) { "blender.exe" } else { "blender" }
+        $exe = Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP "blender") -Recurse -File -Filter $name |
+            Sort-Object { $_.FullName.Length } |
+            Select-Object -First 1
+        if ($null -eq $exe) { throw "$name was not found after installing Blender." }
+        & $exe.FullName --version
+        if ($LASTEXITCODE -ne 0) { throw "blender --version failed with exit code $LASTEXITCODE." }
+        "ASSETSTUDIO_BLENDER_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append

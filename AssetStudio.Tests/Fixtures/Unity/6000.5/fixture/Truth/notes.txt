@@ -1,0 +1,2 @@
+Fixture text asset
+Linha 2 com acentuação: ção é ü
