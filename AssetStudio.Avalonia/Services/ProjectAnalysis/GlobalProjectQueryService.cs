@@ -11,6 +11,56 @@ using AssetStudio.Avalonia.Services.Scripting;
 
 namespace AssetStudio.Avalonia.Services.ProjectAnalysis
 {
+    public enum GlobalSearchIndexSource
+    {
+        None = 0,
+        ProjectIndex = 1,
+        SqliteCacheHydrated = 2,
+        LoadedAssetsFiles = 3
+    }
+
+    public enum GlobalSearchCoverageStatus
+    {
+        Empty = 0,
+        CompleteMetadataOnly = 1,
+        CompleteWithTextContent = 2,
+        PartialResultLimit = 3,
+        PartialTextContentLimits = 4,
+        Cancelled = 5
+    }
+
+    public sealed class GlobalSearchCoverage
+    {
+        public static readonly GlobalSearchCoverage Empty = new();
+
+        public GlobalSearchIndexSource IndexSource { get; init; } = GlobalSearchIndexSource.None;
+        public GlobalSearchCoverageStatus Status { get; init; } = GlobalSearchCoverageStatus.Empty;
+        public int IndexedAssetsCount { get; init; }
+        public int LoadedAssetsCount { get; init; }
+        public int AssetsScannedCount { get; init; }
+        public bool TextAssetContentSearchEnabled { get; init; }
+        public int TextAssetsEligibleCount { get; init; }
+        public int TextAssetsExaminedCount { get; init; }
+        public int TextAssetsSkippedBySizeCapCount { get; init; }
+        public int TextAssetsSkippedByCountCapCount { get; init; }
+        public int TextAssetsUnavailableCount { get; init; }
+        public bool ResultLimitReached { get; init; }
+        public bool TextAssetCountLimitReached { get; init; }
+        public bool WasCancelled { get; init; }
+        public IReadOnlyList<string> ExaminedScopes { get; init; } = Array.Empty<string>();
+        public IReadOnlyList<string> NotExaminedScopes { get; init; } = Array.Empty<string>();
+        public string BadgeText { get; init; } = string.Empty;
+        public string DetailsText { get; init; } = string.Empty;
+
+        public bool IsPartial =>
+            WasCancelled
+            || ResultLimitReached
+            || TextAssetCountLimitReached
+            || TextAssetsSkippedBySizeCapCount > 0
+            || TextAssetsSkippedByCountCapCount > 0
+            || TextAssetsUnavailableCount > 0;
+    }
+
     public sealed class GlobalSearchQuery
     {
         public const int DefaultMaxResults = 500;
@@ -24,6 +74,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
         public int MaxResults { get; init; } = DefaultMaxResults;
         public int MaxTextAssetsScanned { get; init; } = DefaultMaxTextAssetsScanned;
         public long MaxTextAssetBytes { get; init; } = DefaultMaxTextAssetBytes;
+        public bool ReturnPartialOnCancellation { get; init; }
     }
 
     public sealed class GlobalSearchHit
@@ -57,9 +108,11 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
         public int TextAssetsScanned { get; init; }
         public int TextAssetsSkippedBySizeCap { get; init; }
         public bool IsTruncated { get; init; }
+        public bool WasCancelled { get; init; }
         public long ElapsedMs { get; init; }
         public string? ErrorMessage { get; init; }
         public string Summary { get; init; } = "Enter a query to search project assets.";
+        public GlobalSearchCoverage Coverage { get; init; } = GlobalSearchCoverage.Empty;
     }
 
     public static class GlobalProjectQueryService
@@ -160,9 +213,13 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             }
 
             // Ensure we have a ProjectIndex to scan; if none was passed, try AssetsManager or SQLite cache.
+            var indexSource = GlobalSearchIndexSource.None;
             var effectiveIndex = projectIndex ?? assetsManager?.ProjectIndex;
-            if ((effectiveIndex == null || effectiveIndex.Count == 0)
-                && sqliteCache != null
+            if (effectiveIndex != null && effectiveIndex.Count > 0)
+            {
+                indexSource = GlobalSearchIndexSource.ProjectIndex;
+            }
+            else if (sqliteCache != null
                 && !string.IsNullOrWhiteSpace(folderPath)
                 && !string.IsNullOrWhiteSpace(signature))
             {
@@ -170,67 +227,124 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                 if (sqliteCache.LoadIndexCacheIntoProjectIndex(folderPath, signature, hydrated, out _))
                 {
                     effectiveIndex = hydrated;
+                    indexSource = GlobalSearchIndexSource.SqliteCacheHydrated;
                 }
             }
+
+            var loadedAssetsCount = CountLoadedAssets(assetsManager);
+            var indexedAssetsCount = effectiveIndex?.Count ?? 0;
 
             var hits = new List<GlobalSearchHit>(Math.Min(64, maxResults));
             var hitUniqueIds = new HashSet<string>(StringComparer.Ordinal);
             var totalScanned = 0;
+            var textEligible = 0;
             var textScanned = 0;
             var textSkippedByCap = 0;
-            var isTruncated = false;
+            var textSkippedByCountCap = 0;
+            var textUnavailable = 0;
+            var resultLimitReached = false;
+            var textCountLimitReached = false;
+            var wasCancelled = false;
 
-            if (effectiveIndex != null && effectiveIndex.Count > 0)
+            try
             {
-                ScanArena(
-                    effectiveIndex,
-                    assetsManager,
-                    parsed,
-                    query,
-                    maxResults,
-                    maxTextCount,
-                    maxTextBytes,
-                    textContentOverride,
-                    hits,
-                    hitUniqueIds,
-                    ref totalScanned,
-                    ref textScanned,
-                    ref textSkippedByCap,
-                    ref isTruncated,
-                    ct);
+                if (effectiveIndex != null && effectiveIndex.Count > 0)
+                {
+                    ScanArena(
+                        effectiveIndex,
+                        assetsManager,
+                        parsed,
+                        query,
+                        maxResults,
+                        maxTextCount,
+                        maxTextBytes,
+                        textContentOverride,
+                        hits,
+                        hitUniqueIds,
+                        ref totalScanned,
+                        ref textEligible,
+                        ref textScanned,
+                        ref textSkippedByCap,
+                        ref textSkippedByCountCap,
+                        ref textUnavailable,
+                        ref resultLimitReached,
+                        ref textCountLimitReached,
+                        ct);
+                }
+                else if (assetsManager != null && assetsManager.assetsFileList.Count > 0)
+                {
+                    indexSource = GlobalSearchIndexSource.LoadedAssetsFiles;
+                    ScanLoadedAssetsFiles(
+                        assetsManager,
+                        parsed,
+                        query,
+                        maxResults,
+                        maxTextCount,
+                        maxTextBytes,
+                        hits,
+                        hitUniqueIds,
+                        ref totalScanned,
+                        ref textEligible,
+                        ref textScanned,
+                        ref textSkippedByCap,
+                        ref textSkippedByCountCap,
+                        ref resultLimitReached,
+                        ref textCountLimitReached,
+                        ct);
+                }
             }
-            else if (assetsManager != null && assetsManager.assetsFileList.Count > 0)
+            catch (OperationCanceledException) when (query.ReturnPartialOnCancellation)
             {
-                ScanLoadedAssetsFiles(
-                    assetsManager,
-                    parsed,
-                    query,
-                    maxResults,
-                    maxTextCount,
-                    maxTextBytes,
-                    hits,
-                    hitUniqueIds,
-                    ref totalScanned,
-                    ref textScanned,
-                    ref textSkippedByCap,
-                    ref isTruncated,
-                    ct);
+                wasCancelled = true;
             }
 
             sw.Stop();
 
-            var summaryParts = new List<string>(4)
+            var isTruncated = resultLimitReached || textCountLimitReached;
+            var coverage = BuildCoverage(
+                indexSource,
+                indexedAssetsCount,
+                loadedAssetsCount,
+                totalScanned,
+                query.SearchTextAssetContents,
+                maxResults,
+                maxTextCount,
+                maxTextBytes,
+                textEligible,
+                textScanned,
+                textSkippedByCap,
+                textSkippedByCountCap,
+                textUnavailable,
+                resultLimitReached,
+                textCountLimitReached,
+                wasCancelled);
+
+            var summaryParts = new List<string>(4);
+            if (wasCancelled)
             {
-                isTruncated
+                summaryParts.Add($"Search cancelled after scanning {totalScanned:N0} asset(s) ({hits.Count:N0} partial match(es) in {sw.ElapsedMilliseconds:N0} ms)");
+            }
+            else
+            {
+                summaryParts.Add(isTruncated
                     ? $"Showing {hits.Count:N0} matches (truncated at limit {maxResults:N0}; scanned {totalScanned:N0} assets in {sw.ElapsedMilliseconds:N0} ms)"
-                    : $"Found {hits.Count:N0} match(es) across {totalScanned:N0} asset(s) in {sw.ElapsedMilliseconds:N0} ms"
-            };
+                    : $"Found {hits.Count:N0} match(es) across {totalScanned:N0} asset(s) in {sw.ElapsedMilliseconds:N0} ms");
+            }
+
             if (query.SearchTextAssetContents)
             {
-                summaryParts.Add($"TextAssets scanned: {textScanned:N0}");
+                summaryParts.Add($"TextAssets examined: {textScanned:N0}");
                 if (textSkippedByCap > 0)
                 {
                     summaryParts.Add($"skipped > {FormatByteLimit(maxTextBytes)}: {textSkippedByCap:N0}");
+                }
+                if (textSkippedByCountCap > 0)
+                {
+                    summaryParts.Add($"not examined (count cap {maxTextCount:N0}): {textSkippedByCountCap:N0}");
+                }
+                if (textUnavailable > 0)
+                {
+                    summaryParts.Add($"unloaded/unavailable: {textUnavailable:N0}");
                 }
             }
 
@@ -241,8 +355,170 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                 TextAssetsScanned = textScanned,
                 TextAssetsSkippedBySizeCap = textSkippedByCap,
                 IsTruncated = isTruncated,
+                WasCancelled = wasCancelled,
                 ElapsedMs = sw.ElapsedMilliseconds,
-                Summary = string.Join(" • ", summaryParts)
+                Summary = string.Join(" • ", summaryParts),
+                Coverage = coverage
+            };
+        }
+
+        private static int CountLoadedAssets(AssetsManager? assetsManager)
+        {
+            if (assetsManager?.assetsFileList == null)
+            {
+                return 0;
+            }
+
+            var total = 0;
+            for (var i = 0; i < assetsManager.assetsFileList.Count; i++)
+            {
+                var sf = assetsManager.assetsFileList[i];
+                if (sf?.Objects != null)
+                {
+                    total += sf.Objects.Count;
+                }
+            }
+
+            return total;
+        }
+
+        private static GlobalSearchCoverage BuildCoverage(
+            GlobalSearchIndexSource indexSource,
+            int indexedAssetsCount,
+            int loadedAssetsCount,
+            int totalScanned,
+            bool searchTextAssetContents,
+            int maxResults,
+            int maxTextCount,
+            long maxTextBytes,
+            int textEligible,
+            int textScanned,
+            int textSkippedBySizeCap,
+            int textSkippedByCountCap,
+            int textUnavailable,
+            bool resultLimitReached,
+            bool textCountLimitReached,
+            bool wasCancelled)
+        {
+            var status = wasCancelled
+                ? GlobalSearchCoverageStatus.Cancelled
+                : resultLimitReached
+                    ? GlobalSearchCoverageStatus.PartialResultLimit
+                    : (textCountLimitReached || textSkippedBySizeCap > 0 || textSkippedByCountCap > 0 || textUnavailable > 0)
+                        ? GlobalSearchCoverageStatus.PartialTextContentLimits
+                        : indexSource == GlobalSearchIndexSource.None
+                            ? GlobalSearchCoverageStatus.Empty
+                            : searchTextAssetContents
+                                ? GlobalSearchCoverageStatus.CompleteWithTextContent
+                                : GlobalSearchCoverageStatus.CompleteMetadataOnly;
+
+            var sourceLabel = indexSource switch
+            {
+                GlobalSearchIndexSource.ProjectIndex => $"Indexed metadata ({indexedAssetsCount:N0} indexed, {loadedAssetsCount:N0} loaded in memory)",
+                GlobalSearchIndexSource.SqliteCacheHydrated => $"SQLite index cache ({indexedAssetsCount:N0} indexed, {loadedAssetsCount:N0} loaded in memory)",
+                GlobalSearchIndexSource.LoadedAssetsFiles => $"Loaded files only ({loadedAssetsCount:N0} loaded; no project index)",
+                _ => "No project index or loaded files"
+            };
+
+            var examined = new List<string>(3);
+            if (indexSource != GlobalSearchIndexSource.None)
+            {
+                examined.Add($"{sourceLabel} — scanned {totalScanned:N0} asset(s) (name, container, path, type, PathID, GUID)");
+            }
+            if (searchTextAssetContents)
+            {
+                examined.Add($"TextAsset UTF-8 bodies: {textScanned:N0} of {textEligible:N0} eligible examined (cap <= {FormatByteLimit(maxTextBytes)}, max {maxTextCount:N0} files)");
+            }
+
+            var notExamined = new List<string>(5);
+            if (wasCancelled)
+            {
+                var remaining = Math.Max(0, Math.Max(indexedAssetsCount, loadedAssetsCount) - totalScanned);
+                notExamined.Add($"Remaining project assets after cancellation (~{remaining:N0})");
+            }
+            if (resultLimitReached)
+            {
+                notExamined.Add($"Additional matches beyond result cap ({maxResults:N0})");
+            }
+            if (!searchTextAssetContents)
+            {
+                notExamined.Add("TextAsset contents (enable 'Search TextAsset contents' to scan bodies)");
+            }
+            else
+            {
+                if (textSkippedBySizeCap > 0)
+                {
+                    notExamined.Add($"{textSkippedBySizeCap:N0} TextAsset(s) exceeding {FormatByteLimit(maxTextBytes)} size cap");
+                }
+                if (textSkippedByCountCap > 0)
+                {
+                    notExamined.Add($"{textSkippedByCountCap:N0} TextAsset(s) beyond {maxTextCount:N0}-file content cap");
+                }
+                if (textUnavailable > 0)
+                {
+                    notExamined.Add($"{textUnavailable:N0} TextAsset(s) whose source files were unavailable on disk");
+                }
+            }
+            notExamined.Add("MonoBehaviour serialized fields");
+            notExamined.Add("Decompiled C# script bodies (use Script tab)");
+
+            var badgeParts = new List<string>(4);
+            var scopeStateLabel = status switch
+            {
+                GlobalSearchCoverageStatus.Cancelled => "Cancelled (Partial)",
+                GlobalSearchCoverageStatus.PartialResultLimit => $"Partial (result cap {maxResults:N0})",
+                GlobalSearchCoverageStatus.PartialTextContentLimits => "Partial (TextAsset limits)",
+                GlobalSearchCoverageStatus.CompleteWithTextContent => "Complete (Metadata + TextAsset)",
+                GlobalSearchCoverageStatus.CompleteMetadataOnly => "Metadata Only",
+                _ => "No Scope"
+            };
+            badgeParts.Add($"Coverage: {scopeStateLabel}");
+            if (indexedAssetsCount > 0)
+            {
+                badgeParts.Add($"Indexed: {indexedAssetsCount:N0}");
+            }
+            if (loadedAssetsCount > 0 || indexedAssetsCount == 0)
+            {
+                badgeParts.Add($"Loaded: {loadedAssetsCount:N0}");
+            }
+            if (searchTextAssetContents)
+            {
+                badgeParts.Add($"TextAssets examined: {textScanned:N0}/{textEligible:N0}");
+            }
+
+            var detailsSb = new StringBuilder();
+            detailsSb.AppendLine($"Status: {scopeStateLabel}");
+            detailsSb.AppendLine("Examined:");
+            foreach (var item in examined)
+            {
+                detailsSb.AppendLine($"  • {item}");
+            }
+            detailsSb.AppendLine("Not examined:");
+            foreach (var item in notExamined)
+            {
+                detailsSb.AppendLine($"  • {item}");
+            }
+
+            return new GlobalSearchCoverage
+            {
+                IndexSource = indexSource,
+                Status = status,
+                IndexedAssetsCount = indexedAssetsCount,
+                LoadedAssetsCount = loadedAssetsCount,
+                AssetsScannedCount = totalScanned,
+                TextAssetContentSearchEnabled = searchTextAssetContents,
+                TextAssetsEligibleCount = textEligible,
+                TextAssetsExaminedCount = textScanned,
+                TextAssetsSkippedBySizeCapCount = textSkippedBySizeCap,
+                TextAssetsSkippedByCountCapCount = textSkippedByCountCap,
+                TextAssetsUnavailableCount = textUnavailable,
+                ResultLimitReached = resultLimitReached,
+                TextAssetCountLimitReached = textCountLimitReached,
+                WasCancelled = wasCancelled,
+                ExaminedScopes = examined,
+                NotExaminedScopes = notExamined,
+                BadgeText = string.Join(" • ", badgeParts),
+                DetailsText = detailsSb.ToString().TrimEnd()
             };
         }
 
@@ -258,9 +534,13 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             List<GlobalSearchHit> hits,
             HashSet<string> hitUniqueIds,
             ref int totalScanned,
+            ref int textEligible,
             ref int textScanned,
             ref int textSkippedByCap,
-            ref bool isTruncated,
+            ref int textSkippedByCountCap,
+            ref int textUnavailable,
+            ref bool resultLimitReached,
+            ref bool textCountLimitReached,
             CancellationToken ct)
         {
             var arena = projectIndex.Arena;
@@ -323,7 +603,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                 {
                     if (hits.Count >= maxResults)
                     {
-                        isTruncated = true;
+                        resultLimitReached = true;
                         break;
                     }
 
@@ -365,80 +645,86 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             }
 
             // Pass 2: Bounded TextAsset content search (never OOMs, strictly capped by size and count).
-            if (candidateTextIndices != null && candidateTextIndices.Count > 0 && hits.Count < maxResults)
+            if (candidateTextIndices != null && candidateTextIndices.Count > 0)
             {
-                var attemptedLazyLoadPaths = new HashSet<string>(
-                    OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
-
-                for (var c = 0; c < candidateTextIndices.Count; c++)
+                textEligible = candidateTextIndices.Count;
+                if (hits.Count < maxResults)
                 {
-                    ct.ThrowIfCancellationRequested();
+                    var attemptedLazyLoadPaths = new HashSet<string>(
+                        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 
-                    if (hits.Count >= maxResults)
+                    for (var c = 0; c < candidateTextIndices.Count; c++)
                     {
-                        isTruncated = true;
-                        break;
-                    }
+                        ct.ThrowIfCancellationRequested();
 
-                    if (textScanned >= maxTextCount)
-                    {
-                        isTruncated = true;
-                        break;
-                    }
+                        if (hits.Count >= maxResults)
+                        {
+                            resultLimitReached = true;
+                            break;
+                        }
 
-                    var idx = candidateTextIndices[c];
-                    var byteSize = arena.GetByteSize(idx);
-                    if (byteSize > maxTextBytes)
-                    {
-                        textSkippedByCap++;
-                        continue;
-                    }
+                        if (textScanned >= maxTextCount)
+                        {
+                            textCountLimitReached = true;
+                            textSkippedByCountCap = candidateTextIndices.Count - c;
+                            break;
+                        }
 
-                    var bytes = TryReadTextAssetBytesFromArena(projectIndex, idx, assetsManager, textContentOverride, attemptedLazyLoadPaths);
-                    if (bytes == null)
-                    {
-                        continue;
-                    }
+                        var idx = candidateTextIndices[c];
+                        var byteSize = arena.GetByteSize(idx);
+                        if (byteSize > maxTextBytes)
+                        {
+                            textSkippedByCap++;
+                            continue;
+                        }
 
-                    if (bytes.LongLength > maxTextBytes)
-                    {
-                        textSkippedByCap++;
-                        continue;
-                    }
+                        var bytes = TryReadTextAssetBytesFromArena(projectIndex, idx, assetsManager, textContentOverride, attemptedLazyLoadPaths);
+                        if (bytes == null)
+                        {
+                            textUnavailable++;
+                            continue;
+                        }
 
-                    textScanned++;
-                    if (bytes.Length == 0)
-                    {
-                        continue;
-                    }
+                        if (bytes.LongLength > maxTextBytes)
+                        {
+                            textSkippedByCap++;
+                            continue;
+                        }
 
-                    if (TryMatchTextContent(bytes, parsed, out var byteOffset, out var snippet))
-                    {
-                        var uid = arena.GetUniqueId(idx);
-                        if (!hitUniqueIds.Add(uid))
+                        textScanned++;
+                        if (bytes.Length == 0)
                         {
                             continue;
                         }
 
-                        var origin = arena.GetOrigin(idx);
-                        var name = arena.GetName(idx);
-                        var pathId = arena.GetPathId(idx);
-                        var typeName = AssetItem.GetCachedTypeString(ClassIDType.TextAsset);
-                        hits.Add(new GlobalSearchHit
+                        if (TryMatchTextContent(bytes, parsed, out var byteOffset, out var snippet))
                         {
-                            AssetUniqueId = uid,
-                            Name = string.IsNullOrWhiteSpace(name) ? $"TextAsset ({pathId})" : name,
-                            AssetType = ClassIDType.TextAsset,
-                            TypeName = typeName,
-                            Container = arena.GetContainer(idx),
-                            SerializedFileName = origin.SerializedFileName,
-                            OriginalPath = origin.OriginalPath,
-                            PathId = pathId,
-                            ByteSize = byteSize > 0 ? byteSize : bytes.LongLength,
-                            MatchReason = "TextAsset Content",
-                            Detail = snippet,
-                            MatchByteOffset = byteOffset
-                        });
+                            var uid = arena.GetUniqueId(idx);
+                            if (!hitUniqueIds.Add(uid))
+                            {
+                                continue;
+                            }
+
+                            var origin = arena.GetOrigin(idx);
+                            var name = arena.GetName(idx);
+                            var pathId = arena.GetPathId(idx);
+                            var typeName = AssetItem.GetCachedTypeString(ClassIDType.TextAsset);
+                            hits.Add(new GlobalSearchHit
+                            {
+                                AssetUniqueId = uid,
+                                Name = string.IsNullOrWhiteSpace(name) ? $"TextAsset ({pathId})" : name,
+                                AssetType = ClassIDType.TextAsset,
+                                TypeName = typeName,
+                                Container = arena.GetContainer(idx),
+                                SerializedFileName = origin.SerializedFileName,
+                                OriginalPath = origin.OriginalPath,
+                                PathId = pathId,
+                                ByteSize = byteSize > 0 ? byteSize : bytes.LongLength,
+                                MatchReason = "TextAsset Content",
+                                Detail = snippet,
+                                MatchByteOffset = byteOffset
+                            });
+                        }
                     }
                 }
             }
@@ -454,9 +740,12 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
             List<GlobalSearchHit> hits,
             HashSet<string> hitUniqueIds,
             ref int totalScanned,
+            ref int textEligible,
             ref int textScanned,
             ref int textSkippedByCap,
-            ref bool isTruncated,
+            ref int textSkippedByCountCap,
+            ref bool resultLimitReached,
+            ref bool textCountLimitReached,
             CancellationToken ct)
         {
             var canSearchTextContent = query.SearchTextAssetContents
@@ -517,7 +806,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                     {
                         if (hits.Count >= maxResults)
                         {
-                            isTruncated = true;
+                            resultLimitReached = true;
                             return;
                         }
 
@@ -542,6 +831,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                     }
                     else if (canSearchTextContent && obj is TextAsset textAsset && parsed.IncludeGuids.Count == 0)
                     {
+                        textEligible++;
                         var bytes = textAsset.m_Script;
                         if (bytes == null) continue;
                         if (bytes.LongLength > maxTextBytes)
@@ -552,7 +842,8 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
 
                         if (textScanned >= maxTextCount)
                         {
-                            isTruncated = true;
+                            textCountLimitReached = true;
+                            textSkippedByCountCap++;
                             continue;
                         }
 
@@ -561,7 +852,7 @@ namespace AssetStudio.Avalonia.Services.ProjectAnalysis
                         {
                             if (hits.Count >= maxResults)
                             {
-                                isTruncated = true;
+                                resultLimitReached = true;
                                 return;
                             }
 

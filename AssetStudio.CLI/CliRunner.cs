@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace AssetStudio.CLI
 {
@@ -14,6 +15,8 @@ namespace AssetStudio.CLI
         public const int ExitSuccess = 0;
         public const int ExitRuntimeError = 1;
         public const int ExitInvalidArguments = 2;
+        public const int ExitPartialFailure = 3;
+        public const int ExitCancelled = 130;
 
         internal static readonly JsonSerializerOptions JsonIndentedOptions = new JsonSerializerOptions
         {
@@ -59,6 +62,9 @@ namespace AssetStudio.CLI
             int? SliceIndex);
 
         public static int Run(string[] args, TextWriter stdout, TextWriter stderr)
+            => Run(args, stdout, stderr, CancellationToken.None);
+
+        public static int Run(string[] args, TextWriter stdout, TextWriter stderr, CancellationToken cancellationToken)
         {
             if (stdout == null) throw new ArgumentNullException(nameof(stdout));
             if (stderr == null) throw new ArgumentNullException(nameof(stderr));
@@ -106,15 +112,15 @@ namespace AssetStudio.CLI
 
             return command.ToLowerInvariant() switch
             {
-                "scan" => RunScan(subArgs, stdout, stderr),
-                "list" => RunList(subArgs, stdout, stderr, useDecompressionCache),
-                "inspect" => RunInspect(subArgs, stdout, stderr, useDecompressionCache),
-                "export" => RunExport(subArgs, stdout, stderr, useDecompressionCache),
+                "scan" => RunScan(subArgs, stdout, stderr, cancellationToken),
+                "list" => RunList(subArgs, stdout, stderr, useDecompressionCache, cancellationToken),
+                "inspect" => RunInspect(subArgs, stdout, stderr, useDecompressionCache, cancellationToken),
+                "export" => RunExport(subArgs, stdout, stderr, useDecompressionCache, cancellationToken),
                 _ => InvalidArg(stderr, $"Unknown command '{command}'.")
             };
         }
 
-        private static int RunScan(string[] args, TextWriter stdout, TextWriter stderr)
+        private static int RunScan(string[] args, TextWriter stdout, TextWriter stderr, CancellationToken cancellationToken)
         {
             string? targetPath = null;
             OutputFormat format = OutputFormat.Text;
@@ -157,9 +163,11 @@ namespace AssetStudio.CLI
 
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 ProjectScanResult scanResult = Directory.Exists(targetPath)
                     ? ProjectScanner.ScanFolder(targetPath)
                     : ScanSingleFile(targetPath);
+                cancellationToken.ThrowIfCancellationRequested();
 
                 var rows = scanResult.Files
                     .OrderBy(f => f.Path, StringComparer.Ordinal)
@@ -227,6 +235,11 @@ namespace AssetStudio.CLI
 
                 return ExitSuccess;
             }
+            catch (OperationCanceledException)
+            {
+                stderr.WriteLine("Scan cancelled.");
+                return ExitCancelled;
+            }
             catch (Exception ex)
             {
                 stderr.WriteLine($"Error scanning '{targetPath}': {ex.Message}");
@@ -293,7 +306,7 @@ namespace AssetStudio.CLI
             return new ProjectScanResult(Path.GetDirectoryName(fullPath) ?? fullPath, new[] { scanned });
         }
 
-        private static int RunList(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache)
+        private static int RunList(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache, CancellationToken cancellationToken)
         {
             string? targetPath = null;
             ClassIDType? typeFilter = null;
@@ -354,8 +367,10 @@ namespace AssetStudio.CLI
 
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 using var assetsManager = CreateHeadlessAssetsManager(useDecompressionCache, targetPath, stderr);
                 LoadPath(assetsManager, targetPath);
+                cancellationToken.ThrowIfCancellationRequested();
 
                 var rows = assetsManager.ProjectIndex.GetHandles()
                     .Where(h => !typeFilter.HasValue || h.Type == typeFilter.Value)
@@ -416,6 +431,11 @@ namespace AssetStudio.CLI
 
                 return ExitSuccess;
             }
+            catch (OperationCanceledException)
+            {
+                stderr.WriteLine("List cancelled.");
+                return ExitCancelled;
+            }
             catch (Exception ex)
             {
                 stderr.WriteLine($"Error listing '{targetPath}': {ex.Message}");
@@ -423,7 +443,7 @@ namespace AssetStudio.CLI
             }
         }
 
-        private static int RunInspect(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache)
+        private static int RunInspect(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache, CancellationToken cancellationToken)
         {
             string? targetPath = null;
             long? pathId = null;
@@ -489,8 +509,10 @@ namespace AssetStudio.CLI
 
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 using var assetsManager = CreateHeadlessAssetsManager(useDecompressionCache, targetPath, stderr);
                 LoadPath(assetsManager, targetPath);
+                cancellationToken.ThrowIfCancellationRequested();
 
                 var matches = assetsManager.ProjectIndex.GetHandles()
                     .Where(h => h.PathID == pathId.Value)
@@ -552,6 +574,11 @@ namespace AssetStudio.CLI
 
                 return ExitSuccess;
             }
+            catch (OperationCanceledException)
+            {
+                stderr.WriteLine("Inspect cancelled.");
+                return ExitCancelled;
+            }
             catch (Exception ex)
             {
                 stderr.WriteLine($"Error inspecting '{targetPath}': {ex.Message}");
@@ -559,7 +586,7 @@ namespace AssetStudio.CLI
             }
         }
 
-        private static int RunExport(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache)
+        private static int RunExport(string[] args, TextWriter stdout, TextWriter stderr, bool useDecompressionCache, CancellationToken cancellationToken)
         {
             string? targetPath = null;
             string? outputDir = null;
@@ -569,6 +596,7 @@ namespace AssetStudio.CLI
             ModelExportFormat modelFormat = ModelExportFormat.Glb;
             string? assembliesDir = null;
             string? reportPath = null;
+            OutputFormat outputFormat = OutputFormat.Text;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -641,6 +669,14 @@ namespace AssetStudio.CLI
                         return ExitInvalidArguments;
                     }
                 }
+                else if (string.Equals(arg, "--format", StringComparison.Ordinal))
+                {
+                    if (!TryReadOptionValue(args, ref i, "--format", stderr, out string? fmtVal)
+                        || !TryParseOutputFormat(fmtVal!, allowStructuredTables: false, stderr, out outputFormat))
+                    {
+                        return ExitInvalidArguments;
+                    }
+                }
                 else if (string.Equals(arg, "--dry-run", StringComparison.Ordinal))
                 {
                     dryRun = true;
@@ -687,6 +723,39 @@ namespace AssetStudio.CLI
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 string fullOutputRoot = Path.GetFullPath(outputDir);
+                bool structuredJsonStdout = outputFormat == OutputFormat.Json;
+
+                void WriteProgress(string line)
+                {
+                    if (!structuredJsonStdout)
+                    {
+                        stdout.WriteLine(line);
+                    }
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return FinalizeCancelledExport(
+                        sw,
+                        targetPath,
+                        fullOutputRoot,
+                        dryRun,
+                        requestedTypes,
+                        imageFormat,
+                        modelFormat,
+                        assembliesDir,
+                        reportPath,
+                        structuredJsonStdout,
+                        exportedCount: 0,
+                        skippedCount: 0,
+                        failedCount: 0,
+                        cancelledCount: 1,
+                        missingDependencies: Array.Empty<string>(),
+                        diagnostics: new List<ExportDiagnostic>(),
+                        stdout,
+                        stderr);
+                }
+
                 using var assetsManager = CreateHeadlessAssetsManager(useDecompressionCache, targetPath, stderr);
                 LoadPath(assetsManager, targetPath);
 
@@ -702,7 +771,14 @@ namespace AssetStudio.CLI
                 var missingDependencies = new HashSet<string>(StringComparer.Ordinal);
                 var extraExporter = new CliAssetExporter(
                     assetsManager,
-                    new CliExportSettings { ImageFormat = imageFormat, ModelFormat = modelFormat, AssembliesDirectory = assembliesDir, DryRun = dryRun },
+                    new CliExportSettings
+                    {
+                        ImageFormat = imageFormat,
+                        ModelFormat = modelFormat,
+                        AssembliesDirectory = assembliesDir,
+                        DryRun = dryRun,
+                        SuppressStdoutProgress = structuredJsonStdout
+                    },
                     stdout,
                     stderr,
                     diagnostics,
@@ -711,9 +787,18 @@ namespace AssetStudio.CLI
                 int exportedCount = 0;
                 int skippedCount = 0;
                 int failedCount = 0;
+                int processedCount = 0;
+                bool wasCancelled = false;
 
                 foreach (var handle in handles)
                 {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        wasCancelled = true;
+                        break;
+                    }
+
+                    processedCount++;
                     string baseName = !string.IsNullOrWhiteSpace(handle.Name)
                         ? handle.Name
                         : $"{handle.TypeString}_{handle.PathID.ToString(CultureInfo.InvariantCulture)}";
@@ -748,7 +833,7 @@ namespace AssetStudio.CLI
                                 string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, imageFormat.GetFileExtension(), reservedPaths);
                                 if (dryRun)
                                 {
-                                    stdout.WriteLine($"[dry-run] Texture2D {handle.PathID} -> {outPath}");
+                                    WriteProgress($"[dry-run] Texture2D {handle.PathID} -> {outPath}");
                                     exportedCount++;
                                 }
                                 else
@@ -781,7 +866,7 @@ namespace AssetStudio.CLI
                                     EnsureParentDirectory(outPath);
                                     using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None);
                                     bmp.WriteToStream(fs, imageFormat);
-                                    stdout.WriteLine($"Exported: {outPath}");
+                                    WriteProgress($"Exported: {outPath}");
                                     exportedCount++;
                                 }
                                 break;
@@ -814,7 +899,7 @@ namespace AssetStudio.CLI
                                     {
                                         string sliceName = $"{baseName}_slice{slice.ToString("D3", CultureInfo.InvariantCulture)}";
                                         string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, sliceName, imageFormat.GetFileExtension(), reservedPaths);
-                                        stdout.WriteLine($"[dry-run] Texture2DArray {handle.PathID}[{slice}] -> {outPath}");
+                                        WriteProgress($"[dry-run] Texture2DArray {handle.PathID}[{slice}] -> {outPath}");
                                         exportedCount++;
                                     }
                                 }
@@ -848,7 +933,7 @@ namespace AssetStudio.CLI
                                             EnsureParentDirectory(outPath);
                                             using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None);
                                             slices[slice].WriteToStream(fs, imageFormat);
-                                            stdout.WriteLine($"Exported: {outPath}");
+                                            WriteProgress($"Exported: {outPath}");
                                             exportedCount++;
                                         }
                                     }
@@ -867,14 +952,14 @@ namespace AssetStudio.CLI
                                 string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, ".txt", reservedPaths);
                                 if (dryRun)
                                 {
-                                    stdout.WriteLine($"[dry-run] TextAsset {handle.PathID} -> {outPath}");
+                                    WriteProgress($"[dry-run] TextAsset {handle.PathID} -> {outPath}");
                                     exportedCount++;
                                 }
                                 else
                                 {
                                     EnsureParentDirectory(outPath);
                                     File.WriteAllBytes(outPath, textAsset.m_Script ?? Array.Empty<byte>());
-                                    stdout.WriteLine($"Exported: {outPath}");
+                                    WriteProgress($"Exported: {outPath}");
                                     exportedCount++;
                                 }
                                 break;
@@ -902,7 +987,7 @@ namespace AssetStudio.CLI
                                 string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, ".obj", reservedPaths);
                                 if (dryRun)
                                 {
-                                    stdout.WriteLine($"[dry-run] Mesh {handle.PathID} -> {outPath}");
+                                    WriteProgress($"[dry-run] Mesh {handle.PathID} -> {outPath}");
                                     exportedCount++;
                                 }
                                 else
@@ -910,7 +995,7 @@ namespace AssetStudio.CLI
                                     EnsureParentDirectory(outPath);
                                     if (WriteMeshToObj(mesh, outPath))
                                     {
-                                        stdout.WriteLine($"Exported: {outPath}");
+                                        WriteProgress($"Exported: {outPath}");
                                         exportedCount++;
                                     }
                                     else
@@ -946,6 +1031,11 @@ namespace AssetStudio.CLI
                             }
                         }
                     }
+                    catch (OperationCanceledException)
+                    {
+                        wasCancelled = true;
+                        break;
+                    }
                     catch (Exception ex)
                     {
                         failedCount++;
@@ -964,51 +1054,189 @@ namespace AssetStudio.CLI
                     }
                 }
 
-                sw.Stop();
-                if (!string.IsNullOrWhiteSpace(reportPath))
+                if (wasCancelled)
                 {
-                    var identity = ExportBuildIdentity.Resolve(typeof(CliRunner).Assembly);
-                    var report = new ExportReport
-                    {
-                        Operation = "CliExport",
-                        Status = ExportReport.ComputeOutcomeStatus(exportedCount, skippedCount, partialCount: 0, failedCount),
-                        ExporterVersion = identity.DisplayVersion,
-                        CommitHash = identity.CommitHash,
-                        BuildChannel = identity.BuildChannel,
-                        ElapsedMs = sw.ElapsedMilliseconds,
-                        InputPath = Path.GetFullPath(targetPath),
-                        OutputDirectory = fullOutputRoot,
-                        DryRun = dryRun,
-                        Options = new SortedDictionary<string, string>(StringComparer.Ordinal)
-                        {
-                            ["types"] = string.Join(",", requestedTypes.Select(t => t.ToString()).OrderBy(s => s, StringComparer.Ordinal)),
-                            ["imageFormat"] = imageFormat.ToString().ToLowerInvariant(),
-                            ["modelFormat"] = modelFormat.ToString().ToLowerInvariant(),
-                            ["assemblies"] = assembliesDir ?? string.Empty,
-                            ["dryRun"] = dryRun.ToString(CultureInfo.InvariantCulture)
-                        },
-                        ExportedCount = exportedCount,
-                        SkippedCount = skippedCount,
-                        PartialCount = 0,
-                        FailedCount = failedCount,
-                        CancelledCount = 0,
-                        MissingDependencies = missingDependencies.OrderBy(s => s, StringComparer.Ordinal).ToList(),
-                        Diagnostics = diagnostics
-                    };
-                    report.WriteJson(reportPath);
+                    int remainingCount = Math.Max(1, handles.Count - processedCount);
+                    return FinalizeCancelledExport(
+                        sw,
+                        targetPath,
+                        fullOutputRoot,
+                        dryRun,
+                        requestedTypes,
+                        imageFormat,
+                        modelFormat,
+                        assembliesDir,
+                        reportPath,
+                        structuredJsonStdout,
+                        exportedCount,
+                        skippedCount,
+                        failedCount,
+                        remainingCount,
+                        missingDependencies.OrderBy(s => s, StringComparer.Ordinal).ToList(),
+                        diagnostics,
+                        stdout,
+                        stderr);
                 }
 
-                string failedSuffix = failedCount > 0 ? $", {failedCount} failed" : string.Empty;
-                stdout.WriteLine(dryRun
-                    ? $"Dry-run complete: {exportedCount} planned, {skippedCount} skipped{failedSuffix}."
-                    : $"Export complete: {exportedCount} exported, {skippedCount} skipped{failedSuffix}.");
-                return ExitSuccess;
+                sw.Stop();
+                var outcomeStatus = ExportReport.ComputeOutcomeStatus(exportedCount, skippedCount, partialCount: 0, failedCount);
+                ExportReport? report = null;
+                if (!string.IsNullOrWhiteSpace(reportPath) || structuredJsonStdout)
+                {
+                    report = BuildCliExportReport(
+                        outcomeStatus,
+                        sw.ElapsedMilliseconds,
+                        targetPath,
+                        fullOutputRoot,
+                        dryRun,
+                        requestedTypes,
+                        imageFormat,
+                        modelFormat,
+                        assembliesDir,
+                        exportedCount,
+                        skippedCount,
+                        failedCount,
+                        cancelledCount: 0,
+                        missingDependencies.OrderBy(s => s, StringComparer.Ordinal).ToList(),
+                        diagnostics);
+
+                    if (!string.IsNullOrWhiteSpace(reportPath))
+                    {
+                        report.WriteJson(reportPath);
+                    }
+                }
+
+                if (structuredJsonStdout)
+                {
+                    stdout.WriteLine(report!.ToJson());
+                }
+                else
+                {
+                    string failedSuffix = failedCount > 0 ? $", {failedCount} failed" : string.Empty;
+                    stdout.WriteLine(dryRun
+                        ? $"Dry-run complete: {exportedCount} planned, {skippedCount} skipped{failedSuffix}."
+                        : $"Export complete: {exportedCount} exported, {skippedCount} skipped{failedSuffix}.");
+                }
+
+                return MapOutcomeToExitCode(outcomeStatus);
+            }
+            catch (OperationCanceledException)
+            {
+                stderr.WriteLine("Export cancelled.");
+                return ExitCancelled;
             }
             catch (Exception ex)
             {
                 stderr.WriteLine($"Error exporting '{targetPath}': {ex.Message}");
                 return ExitRuntimeError;
             }
+        }
+
+        private static int MapOutcomeToExitCode(ExportOutcomeStatus status) => status switch
+        {
+            ExportOutcomeStatus.Completed => ExitSuccess,
+            ExportOutcomeStatus.Partial => ExitPartialFailure,
+            ExportOutcomeStatus.Cancelled => ExitCancelled,
+            _ => ExitRuntimeError
+        };
+
+        private static int FinalizeCancelledExport(
+            System.Diagnostics.Stopwatch sw,
+            string targetPath,
+            string fullOutputRoot,
+            bool dryRun,
+            HashSet<ClassIDType> requestedTypes,
+            ImageFormat imageFormat,
+            ModelExportFormat modelFormat,
+            string? assembliesDir,
+            string? reportPath,
+            bool structuredJsonStdout,
+            int exportedCount,
+            int skippedCount,
+            int failedCount,
+            int cancelledCount,
+            IReadOnlyList<string> missingDependencies,
+            List<ExportDiagnostic> diagnostics,
+            TextWriter stdout,
+            TextWriter stderr)
+        {
+            sw.Stop();
+            var report = BuildCliExportReport(
+                ExportOutcomeStatus.Cancelled,
+                sw.ElapsedMilliseconds,
+                targetPath,
+                fullOutputRoot,
+                dryRun,
+                requestedTypes,
+                imageFormat,
+                modelFormat,
+                assembliesDir,
+                exportedCount,
+                skippedCount,
+                failedCount,
+                cancelledCount,
+                missingDependencies,
+                diagnostics);
+
+            if (!string.IsNullOrWhiteSpace(reportPath))
+            {
+                report.WriteJson(reportPath);
+            }
+
+            if (structuredJsonStdout)
+            {
+                stdout.WriteLine(report.ToJson());
+            }
+
+            stderr.WriteLine(report.FormatSummaryLine());
+            return ExitCancelled;
+        }
+
+        private static ExportReport BuildCliExportReport(
+            ExportOutcomeStatus status,
+            long elapsedMs,
+            string targetPath,
+            string fullOutputRoot,
+            bool dryRun,
+            HashSet<ClassIDType> requestedTypes,
+            ImageFormat imageFormat,
+            ModelExportFormat modelFormat,
+            string? assembliesDir,
+            int exportedCount,
+            int skippedCount,
+            int failedCount,
+            int cancelledCount,
+            IReadOnlyList<string> missingDependencies,
+            List<ExportDiagnostic> diagnostics)
+        {
+            var identity = ExportBuildIdentity.Resolve(typeof(CliRunner).Assembly);
+            return new ExportReport
+            {
+                Operation = "CliExport",
+                Status = status,
+                ExporterVersion = identity.DisplayVersion,
+                CommitHash = identity.CommitHash,
+                BuildChannel = identity.BuildChannel,
+                ElapsedMs = elapsedMs,
+                InputPath = Path.GetFullPath(targetPath),
+                OutputDirectory = fullOutputRoot,
+                DryRun = dryRun,
+                Options = new SortedDictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["types"] = string.Join(",", requestedTypes.Select(t => t.ToString()).OrderBy(s => s, StringComparer.Ordinal)),
+                    ["imageFormat"] = imageFormat.ToString().ToLowerInvariant(),
+                    ["modelFormat"] = modelFormat.ToString().ToLowerInvariant(),
+                    ["assemblies"] = assembliesDir ?? string.Empty,
+                    ["dryRun"] = dryRun.ToString(CultureInfo.InvariantCulture)
+                },
+                ExportedCount = exportedCount,
+                SkippedCount = skippedCount,
+                PartialCount = 0,
+                FailedCount = failedCount,
+                CancelledCount = cancelledCount,
+                MissingDependencies = missingDependencies.ToList(),
+                Diagnostics = diagnostics
+            };
         }
 
         public static string ResolveSafeOutputPath(
@@ -1399,8 +1627,9 @@ namespace AssetStudio.CLI
             writer.WriteLine("  AssetStudio.CLI scan <path> [--format text|json|jsonl|csv]");
             writer.WriteLine("  AssetStudio.CLI list <path> [--type <ClassID>] [--filter <substring>] [--format text|json|jsonl|csv]");
             writer.WriteLine("  AssetStudio.CLI inspect <path> --path-id <id> [--file <name>] [--format text|json]");
-            writer.WriteLine("  AssetStudio.CLI export <path> --output <dir> [--type <type>[,<type>...]|all] [--image-format png|webp|tga|jpeg|bmp] [--model-format glb|gltf|fbx] [--assemblies <Managed folder>] [--report <json file>] [--dry-run]");
+            writer.WriteLine("  AssetStudio.CLI export <path> --output <dir> [--type <type>[,<type>...]|all] [--image-format png|webp|tga|jpeg|bmp] [--model-format glb|gltf|fbx] [--assemblies <Managed folder>] [--format text|json] [--report <json file>] [--dry-run]");
             writer.WriteLine($"      export types: {CliAssetExporter.SupportedTypeList} (default: Texture2D, Texture2DArray, TextAsset, Mesh)");
+            writer.WriteLine("      exit codes: 0=completed, 1=error/failed, 2=invalid arguments, 3=partial failure, 130=cancelled");
             writer.WriteLine("  AssetStudio.CLI capture-keys <path> [--exe <game executable>] [--timeout <seconds>] [--format text|json]");
             writer.WriteLine();
             writer.WriteLine("Decryption profiles: scan/list/inspect/export load the profiles and plugins of the user folder by default;");

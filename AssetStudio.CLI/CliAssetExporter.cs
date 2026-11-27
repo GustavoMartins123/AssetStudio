@@ -13,6 +13,7 @@ namespace AssetStudio.CLI
         public ModelExportFormat ModelFormat { get; init; } = ModelExportFormat.Glb;
         public string? AssembliesDirectory { get; init; }
         public bool DryRun { get; init; }
+        public bool SuppressStdoutProgress { get; init; }
     }
 
     /// <summary>
@@ -192,7 +193,10 @@ namespace AssetStudio.CLI
                     if (_settings.DryRun) return Planned(handle, path);
                     EnsureAnimationMaps();
                     AssetExportHelper.ExportAnimationClipToFile(animationClip, path, _bonePathHash!, _morphChannelNames!);
-                    _stdout.WriteLine($"Exported: {path}");
+                    if (!_settings.SuppressStdoutProgress)
+                    {
+                        _stdout.WriteLine($"Exported: {path}");
+                    }
                     return 1;
                 }
 
@@ -202,10 +206,38 @@ namespace AssetStudio.CLI
                     if (_settings.DryRun) return Planned(handle, path);
                     var convert = new ModelConverter(animator, _settings.ImageFormat);
                     EnsureParentDirectory(path);
-                    ModelExporter.ExportModel(path, convert, _settings.ModelFormat,
-                        skins: true, animation: false, blendShape: true, castToBone: false,
-                        boneSize: 10f, scaleFactor: 1f, versionIndex: 3, isAscii: false);
-                    _stdout.WriteLine($"Exported: {path}");
+                    if (_settings.ModelFormat is ModelExportFormat.Glb or ModelExportFormat.Gltf)
+                    {
+                        var stats = ModelExporter.ExportGltfWithStats(
+                            path,
+                            convert,
+                            binary: _settings.ModelFormat == ModelExportFormat.Glb,
+                            skins: true,
+                            animation: false,
+                            blendShape: true,
+                            scaleFactor: 1f);
+                        if (_diagnostics != null && stats.MaterialDiagnostics.Count > 0)
+                        {
+                            for (int i = 0; i < stats.MaterialDiagnostics.Count; i++)
+                            {
+                                var matDiag = stats.MaterialDiagnostics[i];
+                                if (matDiag.HasApproximations)
+                                {
+                                    _diagnostics.Add(matDiag.ToExportDiagnostic(handle.SerializedFileName ?? string.Empty, handle.PathID));
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        ModelExporter.ExportModel(path, convert, _settings.ModelFormat,
+                            skins: true, animation: false, blendShape: true, castToBone: false,
+                            boneSize: 10f, scaleFactor: 1f, versionIndex: 3, isAscii: false);
+                    }
+                    if (!_settings.SuppressStdoutProgress)
+                    {
+                        _stdout.WriteLine($"Exported: {path}");
+                    }
                     return 1;
                 }
 
@@ -363,7 +395,10 @@ namespace AssetStudio.CLI
 
         private int Planned(AssetHandle handle, string path)
         {
-            _stdout.WriteLine($"[dry-run] {handle.Type} {handle.PathID} -> {path}");
+            if (!_settings.SuppressStdoutProgress)
+            {
+                _stdout.WriteLine($"[dry-run] {handle.Type} {handle.PathID} -> {path}");
+            }
             return 1;
         }
 
@@ -392,7 +427,10 @@ namespace AssetStudio.CLI
                 throw;
             }
 
-            _stdout.WriteLine($"Exported: {path}");
+            if (!_settings.SuppressStdoutProgress)
+            {
+                _stdout.WriteLine($"Exported: {path}");
+            }
             return 1;
         }
 

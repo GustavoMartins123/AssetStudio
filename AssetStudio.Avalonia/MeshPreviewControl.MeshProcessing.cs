@@ -13,6 +13,51 @@ namespace AssetStudio.Avalonia
         private const int PreviewBoundsMinimumTrimCount = 200;
         private const float PreviewBoundsTrimFraction = 0.0025f;
 
+        internal sealed record MeshPreviewGeometrySnapshot(
+            Vector3[] Vertices,
+            int[] Indices,
+            Vector3[]? Normals,
+            Vector4[] Colors,
+            Vector2[]? Uvs,
+            int[]? SubMeshIndexCounts,
+            Vector3 Min,
+            Vector3 Max);
+
+        internal static MeshPreviewGeometrySnapshot BuildPreviewGeometrySnapshot(Mesh mesh)
+        {
+            ArgumentNullException.ThrowIfNull(mesh);
+            mesh.EnsureProcessed();
+            if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
+            {
+                return new MeshPreviewGeometrySnapshot(
+                    Array.Empty<Vector3>(),
+                    Array.Empty<int>(),
+                    null,
+                    Array.Empty<Vector4>(),
+                    null,
+                    null,
+                    Vector3.Zero,
+                    Vector3.Zero);
+            }
+
+            var vertices = ExtractMeshVertices(mesh.m_Vertices, mesh.m_VertexCount, out var min, out var max);
+            var indices = ExtractMeshIndices(mesh.m_Indices);
+            var normals = ExtractMeshNormals(mesh.m_Normals, mesh.m_VertexCount);
+            var colors = ExtractMeshColors(mesh.m_Colors, mesh.m_VertexCount);
+            var uvs = BuildPreviewUvData(mesh.m_UV0, mesh.m_VertexCount);
+            var subMeshCounts = BuildSubMeshIndexCounts(mesh, indices.Length);
+
+            return new MeshPreviewGeometrySnapshot(
+                vertices,
+                indices,
+                normals,
+                colors,
+                uvs,
+                subMeshCounts,
+                min,
+                max);
+        }
+
         private static Vector3[] ExtractMeshVertices(float[] vertices, int vertexCount, out Vector3 min, out Vector3 max)
         {
             var componentCount = vertices.Length == vertexCount * 4 ? 4 : 3;

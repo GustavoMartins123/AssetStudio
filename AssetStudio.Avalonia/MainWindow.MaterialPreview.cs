@@ -42,7 +42,6 @@ public partial class MainWindow
 
         Task.Run(() =>
         {
-            TexturePreviewImageResult? previewImage = null;
             try
             {
                 // Cache-first lookup via v15 MaterialCache / MaterialTextures (WAL read works even during connections build).
@@ -96,147 +95,25 @@ public partial class MainWindow
                         {
                             return;
                         }
-                        OpenMaterialShaderPreview(previewData.InfoText, token => PrepareShaderScene(
-                            ResolveShaderPreviewReference(m_Material.m_Shader, m_Material.assetsFile ??
-                                throw new InvalidOperationException("The material has no serialized source."), token), m_Material, token));
+                        OpenMaterialShaderPreview(
+                            previewData.InfoText,
+                            token => PrepareShaderScene(
+                                ResolveShaderPreviewReference(m_Material.m_Shader, m_Material.assetsFile ??
+                                    throw new InvalidOperationException("The material has no serialized source."), token), m_Material, token),
+                            shaderName: previewData.ResolvedShaderName,
+                            unityVersion: m_Material.version,
+                            isMaterial: true,
+                            fallbackOnD3D11Error: d3d11Error =>
+                            {
+                                var fallbackId = ++texturePreviewIdCounter;
+                                PreviewSession.SyncPreviewVersion(fallbackId);
+                                Task.Run(() => RenderMaterialFallbackPreview(assetItem, m_Material, previewData, cachedEntry, fallbackId, d3d11Error));
+                            });
                     });
                     return;
                 }
 
-                if (previewData.PreviewTexture == null)
-                {
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
-                        {
-                            return;
-                        }
-
-                        TextPreviewBox.Text = previewData.InfoText;
-                        TextPreviewBox.IsVisible = true;
-                        ImagePreviewBox.IsVisible = false;
-                        ClearPreviewInfoOverlay();
-                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                        ClearPreviewCacheBadge();
-                        StatusStripUpdate("Material loaded (no texture).");
-                    });
-                    return;
-                }
-
-                SetActivePreviewDependencyFiles(m_Material, previewData.PreviewTexture);
-
-                var cachedTexId = previewData.PreviewTexture.assetsFile != null
-                    ? AssetHandle.BuildUniqueID(previewData.PreviewTexture.assetsFile, previewData.PreviewTexture.m_PathID)
-                    : cachedEntry?.MainTextureAssetId ?? string.Empty;
-                previewImage = !string.IsNullOrWhiteSpace(cachedTexId)
-                    ? TryLoadCachedTexturePreviewThumbnailByAssetId(cachedTexId, MaxCachedPreviewTextureDimension)
-                    : null;
-                previewImage ??= LoadTexturePreviewThumbnail(previewData.PreviewTexture, MaxCachedPreviewTextureDimension);
-                var loadedPreviewImage = previewImage;
-                var image = loadedPreviewImage?.Image;
-                if (image == null)
-                {
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
-                        {
-                            return;
-                        }
-
-                        TextPreviewBox.Text = previewData.InfoText;
-                        TextPreviewBox.IsVisible = true;
-                        ImagePreviewBox.IsVisible = false;
-                        ClearPreviewInfoOverlay();
-                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                        ClearPreviewCacheBadge();
-                        StatusStripUpdate("Material loaded (no preview texture support).");
-                    });
-                    return;
-                }
-
-                var activePreviewImage = loadedPreviewImage!;
-                var materialPreviewWasDownscaled = activePreviewImage.Downscaled;
-                var materialPreviewFromCache = activePreviewImage.FromCache;
-                var materialPreviewWidth = image.Width;
-                var materialPreviewHeight = image.Height;
-
-                int validChannel = 0;
-                for (int i = 0; i < 4; i++)
-                {
-                    if (textureChannels[i])
-                    {
-                        validChannel++;
-                    }
-                }
-
-                if (validChannel != 4)
-                {
-                    ApplyPreviewChannelMask(image, textureChannels, validChannel);
-                }
-                else
-                {
-                    MakeAlphaOnlyTextureVisible(image);
-                }
-
-                var postedPreviewImage = activePreviewImage;
-                var postedPreviewTexture = previewData.PreviewTexture!;
-                previewImage = null;
-                Dispatcher.UIThread.Post(() =>
-                {
-                    try
-                    {
-                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
-                        {
-                            return;
-                        }
-
-                        currentPreviewTexture = postedPreviewTexture;
-                        if (GLPreviewControl != null)
-                        {
-                            GLPreviewControl.SetMaterialTexture(postedPreviewImage.Image);
-                            GLPreviewControl.IsVisible = true;
-                            HidePreviewGeometryControls();
-                            GLPreviewControl.Focus();
-                        }
-
-                        ImagePreviewBox.IsVisible = false;
-                        TextPreviewBox.IsVisible = false;
-                        PreviewLabel.IsVisible = false;
-
-                        var previewInfoText = previewData.InfoText;
-                        if (materialPreviewWasDownscaled)
-                        {
-                            previewInfoText += $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}";
-                        }
-                        if (materialPreviewFromCache)
-                        {
-                            previewInfoText += "\nPreview texture loaded from cache";
-                        }
-
-                        SetPreviewInfoOverlay(previewInfoText);
-
-                        UpdatePreviewCacheBadge(fromCache: materialPreviewFromCache, sourceKind: "material");
-                        StatusStripUpdate($"Material preview loaded: {postedPreviewTexture.m_Name}");
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.Log(LoggerEvent.Error, $"Material preview UI failed for {m_Material.m_Name}: {ex}");
-                        if (currentId == texturePreviewIdCounter)
-                        {
-                            TextPreviewBox.Text = previewData.InfoText + "\n[Error showing preview texture: " + ex.Message + "]";
-                            TextPreviewBox.IsVisible = true;
-                            ImagePreviewBox.IsVisible = false;
-                            ClearPreviewInfoOverlay();
-                            if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                            ClearPreviewCacheBadge();
-                            StatusStripUpdate("Material preview UI error.");
-                        }
-                    }
-                    finally
-                    {
-                        postedPreviewImage.Dispose();
-                    }
-                });
+                RenderMaterialFallbackPreview(assetItem, m_Material, previewData, cachedEntry, currentId, d3d11FailureReason: null);
             }
             catch (Exception ex)
             {
@@ -254,11 +131,209 @@ public partial class MainWindow
                     }
                 });
             }
-            finally
-            {
-                previewImage?.Dispose();
-            }
         });
+    }
+
+    private void RenderMaterialFallbackPreview(
+        AssetItem assetItem,
+        Material m_Material,
+        MaterialPreviewData previewData,
+        MaterialCacheEntryInfo? cachedEntry,
+        long currentId,
+        string? d3d11FailureReason)
+    {
+        TexturePreviewImageResult? previewImage = null;
+        try
+        {
+            if (previewData.PreviewTexture == null)
+            {
+                var basicDiag = ShaderConversionClassifier.ClassifyPreview(
+                    previewData.ResolvedShaderName,
+                    m_Material.version,
+                    OperatingSystem.IsWindows(),
+                    d3d11Rendered: false,
+                    hasPreviewTexture: false,
+                    isMaterialPreview: true,
+                    d3d11FailureReason: d3d11FailureReason);
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    {
+                        return;
+                    }
+
+                    PreviewSession.IsLoading = false;
+                    PreviewSession.UpdateShaderPreviewDiagnostic(basicDiag);
+                    TextPreviewBox.Text = basicDiag.BuildOverlayHeader() + "\n\n" + previewData.InfoText;
+                    TextPreviewBox.IsVisible = true;
+                    ImagePreviewBox.IsVisible = false;
+                    ClearPreviewInfoOverlay();
+                    if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                    ClearPreviewCacheBadge();
+                    StatusStripUpdate($"Material loaded ({basicDiag.BadgeLabel} — no texture).");
+                });
+                return;
+            }
+
+            SetActivePreviewDependencyFiles(m_Material, previewData.PreviewTexture);
+
+            var cachedTexId = previewData.PreviewTexture.assetsFile != null
+                ? AssetHandle.BuildUniqueID(previewData.PreviewTexture.assetsFile, previewData.PreviewTexture.m_PathID)
+                : cachedEntry?.MainTextureAssetId ?? string.Empty;
+            previewImage = !string.IsNullOrWhiteSpace(cachedTexId)
+                ? TryLoadCachedTexturePreviewThumbnailByAssetId(cachedTexId, MaxCachedPreviewTextureDimension)
+                : null;
+            previewImage ??= LoadTexturePreviewThumbnail(previewData.PreviewTexture, MaxCachedPreviewTextureDimension);
+            var loadedPreviewImage = previewImage;
+            var image = loadedPreviewImage?.Image;
+            if (image == null)
+            {
+                var basicDiag = ShaderConversionClassifier.ClassifyPreview(
+                    previewData.ResolvedShaderName,
+                    m_Material.version,
+                    OperatingSystem.IsWindows(),
+                    d3d11Rendered: false,
+                    hasPreviewTexture: false,
+                    isMaterialPreview: true,
+                    d3d11FailureReason: d3d11FailureReason);
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    {
+                        return;
+                    }
+
+                    PreviewSession.IsLoading = false;
+                    PreviewSession.UpdateShaderPreviewDiagnostic(basicDiag);
+                    TextPreviewBox.Text = basicDiag.BuildOverlayHeader() + "\n\n" + previewData.InfoText;
+                    TextPreviewBox.IsVisible = true;
+                    ImagePreviewBox.IsVisible = false;
+                    ClearPreviewInfoOverlay();
+                    if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                    ClearPreviewCacheBadge();
+                    StatusStripUpdate($"Material loaded ({basicDiag.BadgeLabel} — texture decode unavailable).");
+                });
+                return;
+            }
+
+            var activePreviewImage = loadedPreviewImage!;
+            var materialPreviewWasDownscaled = activePreviewImage.Downscaled;
+            var materialPreviewFromCache = activePreviewImage.FromCache;
+            var materialPreviewWidth = image.Width;
+            var materialPreviewHeight = image.Height;
+
+            int validChannel = 0;
+            for (int i = 0; i < 4; i++)
+            {
+                if (textureChannels[i])
+                {
+                    validChannel++;
+                }
+            }
+
+            if (validChannel != 4)
+            {
+                ApplyPreviewChannelMask(image, textureChannels, validChannel);
+            }
+            else
+            {
+                MakeAlphaOnlyTextureVisible(image);
+            }
+
+            var pbrDiag = ShaderConversionClassifier.ClassifyPreview(
+                previewData.ResolvedShaderName,
+                m_Material.version,
+                OperatingSystem.IsWindows(),
+                d3d11Rendered: false,
+                hasPreviewTexture: true,
+                isMaterialPreview: true,
+                d3d11FailureReason: d3d11FailureReason);
+
+            var postedPreviewImage = activePreviewImage;
+            var postedPreviewTexture = previewData.PreviewTexture!;
+            previewImage = null;
+            Dispatcher.UIThread.Post(() =>
+            {
+                try
+                {
+                    if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    {
+                        return;
+                    }
+
+                    PreviewSession.IsLoading = false;
+                    PreviewSession.UpdateShaderPreviewDiagnostic(pbrDiag);
+                    currentPreviewTexture = postedPreviewTexture;
+                    if (GLPreviewControl != null)
+                    {
+                        GLPreviewControl.SetMaterialTexture(postedPreviewImage.Image);
+                        GLPreviewControl.IsVisible = true;
+                        HidePreviewGeometryControls();
+                        GLPreviewControl.Focus();
+                    }
+
+                    ImagePreviewBox.IsVisible = false;
+                    TextPreviewBox.IsVisible = false;
+                    PreviewLabel.IsVisible = false;
+
+                    var previewInfoText = pbrDiag.BuildOverlayHeader() + "\n\n" + previewData.InfoText;
+                    if (materialPreviewWasDownscaled)
+                    {
+                        previewInfoText += $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}";
+                    }
+                    if (materialPreviewFromCache)
+                    {
+                        previewInfoText += "\nPreview texture loaded from cache";
+                    }
+
+                    SetPreviewInfoOverlay(previewInfoText);
+
+                    UpdatePreviewCacheBadge(fromCache: materialPreviewFromCache, sourceKind: "material");
+                    StatusStripUpdate($"Material preview loaded ({pbrDiag.BadgeLabel}): {postedPreviewTexture.m_Name}");
+                }
+                catch (Exception ex)
+                {
+                    logger.Log(LoggerEvent.Error, $"Material preview UI failed for {m_Material.m_Name}: {ex}");
+                    if (currentId == texturePreviewIdCounter)
+                    {
+                        TextPreviewBox.Text = previewData.InfoText + "\n[Error showing preview texture: " + ex.Message + "]";
+                        TextPreviewBox.IsVisible = true;
+                        ImagePreviewBox.IsVisible = false;
+                        ClearPreviewInfoOverlay();
+                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                        ClearPreviewCacheBadge();
+                        StatusStripUpdate("Material preview UI error.");
+                    }
+                }
+                finally
+                {
+                    postedPreviewImage.Dispose();
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (currentId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                {
+                    PreviewSession.IsLoading = false;
+                    TextPreviewBox.Text = $"Material: {m_Material.m_Name}\n\n[Error loading material preview: {ex.Message}]";
+                    TextPreviewBox.IsVisible = true;
+                    ImagePreviewBox.IsVisible = false;
+                    ClearPreviewInfoOverlay();
+                    if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                    ClearPreviewCacheBadge();
+                    StatusStripUpdate("Material preview error.");
+                }
+            });
+        }
+        finally
+        {
+            previewImage?.Dispose();
+        }
     }
 
     private MaterialPreviewData BuildMaterialPreviewData(Material material)

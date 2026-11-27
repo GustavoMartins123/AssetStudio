@@ -160,7 +160,7 @@ namespace AssetStudio.Tests
 
                 var (exit, stdout, stderr) = RunCli("export", input, "--output", outDir, "--type", "TextAsset", "--report", reportPath);
 
-                Assert.Equal(CliRunner.ExitSuccess, exit);
+                Assert.Equal(CliRunner.ExitPartialFailure, exit);
                 Assert.Contains("Export complete: 1 exported, 0 skipped, 1 failed.", stdout, StringComparison.Ordinal);
                 Assert.Contains("Failed: TextAsset 1 (blocked):", stderr, StringComparison.Ordinal);
                 Assert.Equal("survived partial failure", File.ReadAllText(Path.Combine(outDir, "TextAsset", "healthy.txt")));
@@ -184,6 +184,161 @@ namespace AssetStudio.Tests
             {
                 TryDelete(tempRoot);
             }
+        }
+
+        [Fact]
+        public void CliExport_TotalFailure_ExitsRuntimeErrorAndMarksReportFailed()
+        {
+            var tempRoot = CreateTempDir("cli_report_total_fail");
+            try
+            {
+                var input = Path.Combine(tempRoot, "level0");
+                var outDir = Path.Combine(tempRoot, "out");
+                var reportPath = Path.Combine(tempRoot, "failed-report.json");
+
+                File.WriteAllBytes(input, SyntheticSerializedFile.BuildTextAssets(new (long, string, string)[]
+                {
+                    (1, "blocked_only", "cannot write")
+                }, out _));
+
+                Directory.CreateDirectory(Path.Combine(outDir, "TextAsset", "blocked_only.txt"));
+
+                var (exit, _, stderr) = RunCli("export", input, "--output", outDir, "--type", "TextAsset", "--report", reportPath);
+
+                Assert.Equal(CliRunner.ExitRuntimeError, exit);
+                Assert.Contains("Failed: TextAsset 1 (blocked_only):", stderr, StringComparison.Ordinal);
+                using var doc = JsonDocument.Parse(File.ReadAllText(reportPath));
+                Assert.Equal("Failed", doc.RootElement.GetProperty("status").GetString());
+                Assert.Equal(0, doc.RootElement.GetProperty("exportedCount").GetInt32());
+                Assert.Equal(1, doc.RootElement.GetProperty("failedCount").GetInt32());
+            }
+            finally
+            {
+                TryDelete(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void CliExport_JsonFormat_KeepsStdoutStrictlyStructuredJsonAndRoutesLogsToStderr()
+        {
+            var tempRoot = CreateTempDir("cli_json_stdout");
+            try
+            {
+                var input = Path.Combine(tempRoot, "level0");
+                var outDir = Path.Combine(tempRoot, "out");
+
+                File.WriteAllBytes(input, SyntheticSerializedFile.BuildTextAssets(new (long, string, string)[]
+                {
+                    (1, "blocked", "fails"),
+                    (2, "ok", "succeeds")
+                }, out _));
+
+                Directory.CreateDirectory(Path.Combine(outDir, "TextAsset", "blocked.txt"));
+
+                var (exit, stdout, stderr) = RunCli("export", input, "--output", outDir, "--type", "TextAsset", "--format", "json");
+
+                Assert.Equal(CliRunner.ExitPartialFailure, exit);
+                Assert.Contains("Failed: TextAsset 1 (blocked):", stderr, StringComparison.Ordinal);
+                Assert.DoesNotContain("Exported:", stdout, StringComparison.Ordinal);
+
+                // stdout must parse cleanly as a single valid ExportReport JSON object
+                using var doc = JsonDocument.Parse(stdout);
+                var root = doc.RootElement;
+                Assert.Equal(1, root.GetProperty("schemaVersion").GetInt32());
+                Assert.Equal("Partial", root.GetProperty("status").GetString());
+                Assert.Equal(1, root.GetProperty("exportedCount").GetInt32());
+                Assert.Equal(1, root.GetProperty("failedCount").GetInt32());
+            }
+            finally
+            {
+                TryDelete(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void CliExport_CancelledToken_WritesCancelledReportAndExits130()
+        {
+            var tempRoot = CreateTempDir("cli_cancelled");
+            try
+            {
+                var input = Path.Combine(tempRoot, "level0");
+                var outDir = Path.Combine(tempRoot, "out");
+                var reportPath = Path.Combine(tempRoot, "cancelled-report.json");
+
+                File.WriteAllBytes(input, SyntheticSerializedFile.BuildTextAssets(new (long, string, string)[]
+                {
+                    (1, "alpha", "hello"),
+                    (2, "beta", "world")
+                }, out _));
+
+                using var cts = new System.Threading.CancellationTokenSource();
+                cts.Cancel();
+
+                using var stdout = new StringWriter();
+                using var stderr = new StringWriter();
+                int exit = CliRunner.Run(
+                    new[] { "export", input, "--output", outDir, "--type", "TextAsset", "--format", "json", "--report", reportPath },
+                    stdout,
+                    stderr,
+                    cts.Token);
+
+                Assert.Equal(CliRunner.ExitCancelled, exit);
+                Assert.Contains("cancelled", stderr.ToString(), StringComparison.OrdinalIgnoreCase);
+
+                using var stdoutDoc = JsonDocument.Parse(stdout.ToString());
+                Assert.Equal("Cancelled", stdoutDoc.RootElement.GetProperty("status").GetString());
+                Assert.True(stdoutDoc.RootElement.GetProperty("cancelledCount").GetInt32() >= 1);
+
+                Assert.True(File.Exists(reportPath));
+                using var fileDoc = JsonDocument.Parse(File.ReadAllText(reportPath));
+                Assert.Equal("Cancelled", fileDoc.RootElement.GetProperty("status").GetString());
+            }
+            finally
+            {
+                TryDelete(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void ShaderPreviewDiagnostics_ClassifiesAllFallbackModesAndUpdatesPreviewSession()
+        {
+            var d3d11 = ShaderConversionClassifier.ClassifyPreview(
+                "Standard", new[] { 2020, 3, 40 }, isWindows: true, d3d11Rendered: true, hasPreviewTexture: false, isMaterialPreview: true);
+            Assert.Equal(ShaderPreviewRenderMode.InterpretedD3D11Shader, d3d11.RenderMode);
+            Assert.Equal("D3D11 Shader", d3d11.BadgeLabel);
+
+            var pbrApprox = ShaderConversionClassifier.ClassifyPreview(
+                "Universal Render Pipeline/Lit", new[] { 6000, 3, 18 }, isWindows: true, d3d11Rendered: false, hasPreviewTexture: true, isMaterialPreview: true);
+            Assert.Equal(ShaderPreviewRenderMode.MaterialPbrApproximation, pbrApprox.RenderMode);
+            Assert.Equal("PBR Approximation", pbrApprox.BadgeLabel);
+            Assert.Equal("URP / LWRP", pbrApprox.ShaderFamily);
+            Assert.Contains("glTF", pbrApprox.ExportAlignmentNote, StringComparison.OrdinalIgnoreCase);
+
+            var basicFallback = ShaderConversionClassifier.ClassifyPreview(
+                "HDRP/Lit", new[] { 2022, 3, 10 }, isWindows: false, d3d11Rendered: false, hasPreviewTexture: false, isMaterialPreview: true);
+            Assert.Equal(ShaderPreviewRenderMode.BasicFallback, basicFallback.RenderMode);
+            Assert.Equal("Basic Fallback", basicFallback.BadgeLabel);
+            Assert.Contains("Windows", basicFallback.Reason, StringComparison.OrdinalIgnoreCase);
+
+            var shaderText = ShaderConversionClassifier.ClassifyPreview(
+                "Custom/StylizedToon", new[] { 2020, 3, 1 }, isWindows: true, d3d11Rendered: false, hasPreviewTexture: false, isMaterialPreview: false,
+                d3d11FailureReason: "No D3D11 pass found.");
+            Assert.Equal(ShaderPreviewRenderMode.ShaderLabText, shaderText.RenderMode);
+            Assert.Equal("ShaderLab Text", shaderText.BadgeLabel);
+            Assert.Contains("No D3D11 pass found.", shaderText.Reason, StringComparison.Ordinal);
+
+            // Verify PreviewSessionViewModel surfaces and clears the shader mode badge cleanly (Pure-MVVM)
+            using var session = new AssetStudio.Avalonia.ViewModels.PreviewSessionViewModel();
+            Assert.False(session.IsShaderPreviewModeBadgeVisible);
+
+            session.UpdateShaderPreviewDiagnostic(pbrApprox);
+            Assert.True(session.IsShaderPreviewModeBadgeVisible);
+            Assert.Equal("PBR Approximation", session.ShaderPreviewModeBadgeText);
+            Assert.Contains("URP / LWRP", session.ShaderPreviewModeTooltip, StringComparison.Ordinal);
+
+            session.ClearShaderPreviewDiagnostic();
+            Assert.False(session.IsShaderPreviewModeBadgeVisible);
+            Assert.Equal(string.Empty, session.ShaderPreviewModeBadgeText);
         }
 
         private static (int Exit, string Stdout, string Stderr) RunCli(params string[] args)

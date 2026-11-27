@@ -74,7 +74,9 @@ namespace AssetStudio.Avalonia.ViewModels
         private readonly SQLiteProjectIndexCache? _sqliteCache;
         private readonly string? _folderPath;
         private readonly string? _signature;
+        private readonly Func<GlobalSearchQuery, CancellationToken, GlobalSearchResult>? _searchRunner;
         private readonly AsyncRelayCommand _executeQueryCommand;
+        private readonly RelayCommand _cancelQueryCommand;
         private readonly RelayCommand _clearCommand;
         private readonly RelayCommand _goToSelectedCommand;
         private readonly AsyncRelayCommand _inspectSelectedUsageCommand;
@@ -94,9 +96,19 @@ namespace AssetStudio.Avalonia.ViewModels
         private bool _isBusy;
         private string _statusText = "Enter a query (text, pathid:123, guid:hex, type:Material, file:bundle, -exclude).";
         private string _errorText = string.Empty;
+        private GlobalSearchCoverage _lastSearchCoverage = GlobalSearchCoverage.Empty;
+        private string _coverageBadgeText = string.Empty;
+        private string _coverageDetailsText = string.Empty;
+        private string _notExaminedText = string.Empty;
         private GlobalSearchResultItem? _selectedResult;
         private CancellationTokenSource? _activeQueryCts;
         private bool _disposed;
+
+        // Context preservation when toggling between Global Asset Search and Semantic Usage Graph
+        private List<GlobalSearchResultItem>? _savedSearchResults;
+        private GlobalSearchResultItem? _savedSearchSelectedResult;
+        private string? _savedSearchStatusText;
+        private GlobalSearchCoverage? _savedSearchCoverage;
 
         public GlobalSearchDialogViewModel()
             : this(projectIndex: null, assetsManager: null, sqliteCache: null, folderPath: null, signature: null)
@@ -108,17 +120,20 @@ namespace AssetStudio.Avalonia.ViewModels
             AssetsManager? assetsManager = null,
             SQLiteProjectIndexCache? sqliteCache = null,
             string? folderPath = null,
-            string? signature = null)
+            string? signature = null,
+            Func<GlobalSearchQuery, CancellationToken, GlobalSearchResult>? searchRunner = null)
         {
             _projectIndex = projectIndex;
             _assetsManager = assetsManager;
             _sqliteCache = sqliteCache;
             _folderPath = folderPath;
             _signature = signature;
+            _searchRunner = searchRunner;
 
             Results = new ObservableCollection<GlobalSearchResultItem>();
 
             _executeQueryCommand = new AsyncRelayCommand(ExecuteQueryInternalAsync, allowConcurrentExecutions: true);
+            _cancelQueryCommand = new RelayCommand(CancelQuery, () => IsBusy);
             _clearCommand = new RelayCommand(Clear);
             _goToSelectedCommand = new RelayCommand(GoToSelected, () => SelectedResult?.IsNavigable == true);
             _inspectSelectedUsageCommand = new AsyncRelayCommand(InspectSelectedUsageAsync, () => SelectedResult != null && !string.IsNullOrWhiteSpace(SelectedResult.AssetUniqueId));
@@ -146,12 +161,25 @@ namespace AssetStudio.Avalonia.ViewModels
             get => _selectedMode;
             set
             {
+                var previous = _selectedMode;
                 if (SetProperty(ref _selectedMode, value))
                 {
+                    if (previous == GlobalSearchDialogMode.GlobalAssetSearch
+                        && value == GlobalSearchDialogMode.SemanticUsageGraph)
+                    {
+                        SaveSearchContextSnapshot();
+                    }
+                    else if (previous == GlobalSearchDialogMode.SemanticUsageGraph
+                        && value == GlobalSearchDialogMode.GlobalAssetSearch)
+                    {
+                        RestoreSearchContextSnapshot();
+                    }
+
                     OnPropertyChanged(nameof(SelectedModeIndex));
                     OnPropertyChanged(nameof(IsSearchMode));
                     OnPropertyChanged(nameof(IsGraphMode));
                     OnPropertyChanged(nameof(ExecuteButtonText));
+                    OnPropertyChanged(nameof(IsSearchCoverageVisible));
                 }
             }
         }
@@ -242,7 +270,13 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool IsBusy
         {
             get => _isBusy;
-            private set => SetProperty(ref _isBusy, value);
+            private set
+            {
+                if (SetProperty(ref _isBusy, value))
+                {
+                    _cancelQueryCommand.NotifyCanExecuteChanged();
+                }
+            }
         }
 
         public string StatusText
@@ -250,6 +284,47 @@ namespace AssetStudio.Avalonia.ViewModels
             get => _statusText;
             private set => SetProperty(ref _statusText, value);
         }
+
+        public GlobalSearchCoverage LastSearchCoverage
+        {
+            get => _lastSearchCoverage;
+            private set
+            {
+                if (SetProperty(ref _lastSearchCoverage, value ?? GlobalSearchCoverage.Empty))
+                {
+                    CoverageBadgeText = _lastSearchCoverage.BadgeText;
+                    CoverageDetailsText = _lastSearchCoverage.DetailsText;
+                    NotExaminedText = _lastSearchCoverage.NotExaminedScopes.Count > 0
+                        ? "Not examined: " + string.Join("; ", _lastSearchCoverage.NotExaminedScopes)
+                        : string.Empty;
+                    OnPropertyChanged(nameof(HasCoverageInfo));
+                    OnPropertyChanged(nameof(IsSearchCoverageVisible));
+                    OnPropertyChanged(nameof(IsPartialCoverage));
+                }
+            }
+        }
+
+        public string CoverageBadgeText
+        {
+            get => _coverageBadgeText;
+            private set => SetProperty(ref _coverageBadgeText, value ?? string.Empty);
+        }
+
+        public string CoverageDetailsText
+        {
+            get => _coverageDetailsText;
+            private set => SetProperty(ref _coverageDetailsText, value ?? string.Empty);
+        }
+
+        public string NotExaminedText
+        {
+            get => _notExaminedText;
+            private set => SetProperty(ref _notExaminedText, value ?? string.Empty);
+        }
+
+        public bool HasCoverageInfo => !string.IsNullOrWhiteSpace(_coverageBadgeText);
+        public bool IsSearchCoverageVisible => IsSearchMode && HasCoverageInfo;
+        public bool IsPartialCoverage => _lastSearchCoverage.IsPartial;
 
         public string ErrorText
         {
@@ -281,6 +356,7 @@ namespace AssetStudio.Avalonia.ViewModels
         }
 
         public AsyncRelayCommand ExecuteQueryCommand => _executeQueryCommand;
+        public RelayCommand CancelQueryCommand => _cancelQueryCommand;
         public RelayCommand ClearCommand => _clearCommand;
         public RelayCommand GoToSelectedCommand => _goToSelectedCommand;
         public AsyncRelayCommand InspectSelectedUsageCommand => _inspectSelectedUsageCommand;
@@ -330,6 +406,22 @@ namespace AssetStudio.Avalonia.ViewModels
             }
             catch (OperationCanceledException)
             {
+                if (ReferenceEquals(_activeQueryCts, cts))
+                {
+                    StatusText = "Query cancelled.";
+                    if (SelectedMode == GlobalSearchDialogMode.GlobalAssetSearch)
+                    {
+                        LastSearchCoverage = new GlobalSearchCoverage
+                        {
+                            Status = GlobalSearchCoverageStatus.Cancelled,
+                            WasCancelled = true,
+                            IndexedAssetsCount = _projectIndex?.Count ?? 0,
+                            BadgeText = "Coverage: Cancelled (Partial)",
+                            NotExaminedScopes = new[] { "Search cancelled before completion" },
+                            DetailsText = "Status: Cancelled before search finished."
+                        };
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -356,22 +448,31 @@ namespace AssetStudio.Avalonia.ViewModels
                 TypeFilter = SelectedTypeFilter,
                 UseRegex = _useRegex,
                 SearchTextAssetContents = _searchTextAssetContents,
-                MaxResults = GlobalSearchQuery.DefaultMaxResults
+                MaxResults = GlobalSearchQuery.DefaultMaxResults,
+                ReturnPartialOnCancellation = true
             };
 
             StatusText = "Searching project assets...";
             var result = await Task.Run(() =>
-                GlobalProjectQueryService.SearchAssets(
-                    query,
-                    _projectIndex,
-                    _assetsManager,
-                    _sqliteCache,
-                    _folderPath,
-                    _signature,
-                    ct), ct);
+                _searchRunner != null
+                    ? _searchRunner(query, ct)
+                    : GlobalProjectQueryService.SearchAssets(
+                        query,
+                        _projectIndex,
+                        _assetsManager,
+                        _sqliteCache,
+                        _folderPath,
+                        _signature,
+                        ct), CancellationToken.None);
 
-            if (ct.IsCancellationRequested || _disposed)
+            if (_disposed)
             {
+                return;
+            }
+
+            if (ct.IsCancellationRequested && !result.WasCancelled)
+            {
+                StatusText = "Query cancelled.";
                 return;
             }
 
@@ -382,6 +483,7 @@ namespace AssetStudio.Avalonia.ViewModels
             {
                 ErrorText = result.ErrorMessage;
                 StatusText = result.ErrorMessage;
+                LastSearchCoverage = GlobalSearchCoverage.Empty;
                 OnPropertyChanged(nameof(HasNoResults));
                 return;
             }
@@ -406,6 +508,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 });
             }
 
+            LastSearchCoverage = result.Coverage;
             StatusText = result.Summary;
             OnPropertyChanged(nameof(HasNoResults));
         }
@@ -497,6 +600,11 @@ namespace AssetStudio.Avalonia.ViewModels
             {
                 QueryText = string.Empty;
                 SelectedTypeFilterIndex = 0;
+                LastSearchCoverage = GlobalSearchCoverage.Empty;
+                _savedSearchResults = null;
+                _savedSearchSelectedResult = null;
+                _savedSearchStatusText = null;
+                _savedSearchCoverage = null;
             }
             else
             {
@@ -510,6 +618,40 @@ namespace AssetStudio.Avalonia.ViewModels
             Results.Clear();
             SelectedResult = null;
             StatusText = "Cleared.";
+            OnPropertyChanged(nameof(HasNoResults));
+        }
+
+        private void CancelQuery()
+        {
+            CancelActiveQueryNoThrow();
+            StatusText = "Cancelling query...";
+        }
+
+        private void SaveSearchContextSnapshot()
+        {
+            _savedSearchResults = new List<GlobalSearchResultItem>(Results);
+            _savedSearchSelectedResult = SelectedResult;
+            _savedSearchStatusText = StatusText;
+            _savedSearchCoverage = LastSearchCoverage;
+        }
+
+        private void RestoreSearchContextSnapshot()
+        {
+            if (_savedSearchResults == null)
+            {
+                return;
+            }
+
+            Results.Clear();
+            for (var i = 0; i < _savedSearchResults.Count; i++)
+            {
+                Results.Add(_savedSearchResults[i]);
+            }
+
+            SelectedResult = _savedSearchSelectedResult;
+            StatusText = _savedSearchStatusText ?? StatusText;
+            LastSearchCoverage = _savedSearchCoverage ?? GlobalSearchCoverage.Empty;
+            ErrorText = string.Empty;
             OnPropertyChanged(nameof(HasNoResults));
         }
 

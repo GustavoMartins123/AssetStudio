@@ -821,6 +821,7 @@ public partial class MainWindow : Window
         ClearMeshMaterialControls();
         ClearPreviewCandidateControls();
         ClearPreviewCacheBadge();
+        PreviewSession.ClearShaderPreviewDiagnostic();
         Stop2DAnimation();
         HideAnimationPlayback();
         GLPreviewControl?.StopAnimation();

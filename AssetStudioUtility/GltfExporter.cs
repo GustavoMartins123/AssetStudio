@@ -27,6 +27,9 @@ namespace AssetStudio
         public int CamerasCount { get; init; }
         public int LightsCount { get; init; }
         public int HiddenNodesCount { get; init; }
+        public int ApproximatedMaterialsCount { get; init; }
+        public int FallbackMaterialsCount { get; init; }
+        public IReadOnlyList<MaterialConversionDiagnostic> MaterialDiagnostics { get; init; } = Array.Empty<MaterialConversionDiagnostic>();
         public long OutputBytes { get; init; }
 
         public double InstancingPercent =>
@@ -93,6 +96,7 @@ namespace AssetStudio
         private readonly List<GltfMesh> _meshes = new List<GltfMesh>();
         private readonly List<GltfSkin> _skins = new List<GltfSkin>();
         private readonly List<GltfMaterial> _materials = new List<GltfMaterial>();
+        private readonly List<MaterialConversionDiagnostic> _materialDiagnostics = new List<MaterialConversionDiagnostic>();
         private readonly List<GltfTexture> _textures = new List<GltfTexture>();
         private readonly List<GltfImage> _images = new List<GltfImage>();
         private readonly List<GltfAnimation> _animations = new List<GltfAnimation>();
@@ -244,6 +248,15 @@ namespace AssetStudio
                 {
                 }
 
+                int approximatedMaterials = 0;
+                int fallbackMaterials = 0;
+                for (int i = 0; i < _materialDiagnostics.Count; i++)
+                {
+                    var d = _materialDiagnostics[i];
+                    if (d.HasApproximations) approximatedMaterials++;
+                    if (d.Mode == MaterialConversionMode.BasicFallback) fallbackMaterials++;
+                }
+
                 LastExportStats = new GltfExportStatistics
                 {
                     TotalNodes = _nodes.Count,
@@ -259,6 +272,9 @@ namespace AssetStudio
                     CamerasCount = _cameras.Count,
                     LightsCount = _lights.Count,
                     HiddenNodesCount = _hiddenNodesCount,
+                    ApproximatedMaterialsCount = approximatedMaterials,
+                    FallbackMaterialsCount = fallbackMaterials,
+                    MaterialDiagnostics = _materialDiagnostics.ToArray(),
                     OutputBytes = outputBytes
                 };
             }
@@ -277,6 +293,7 @@ namespace AssetStudio
             _meshes.Clear();
             _skins.Clear();
             _materials.Clear();
+            _materialDiagnostics.Clear();
             _textures.Clear();
             _images.Clear();
             _animations.Clear();
@@ -624,6 +641,15 @@ namespace AssetStudio
             ImportedMaterialTexture? occlusionTex = null;
             ImportedMaterialTexture? roughnessTex = null;
 
+            var consumedTextureNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var preservedChannels = new List<string>(10) { "baseColorFactor" };
+            var matExtensions = new HashSet<string>(StringComparer.Ordinal);
+            var approximations = new List<string>();
+            var ignoredTextureSlots = new List<string>();
+            var missingTextures = new List<string>();
+            bool maskDowngradedToOpaque = false;
+            bool specGlossConverted = false;
+
             if (mat.Textures != null)
             {
                 for (int i = 0; i < mat.Textures.Count; i++)
@@ -657,6 +683,9 @@ namespace AssetStudio
                         case 8:
                             roughnessTex ??= t;
                             break;
+                        default:
+                            ignoredTextureSlots.Add(t.Name);
+                            break;
                     }
                 }
             }
@@ -687,9 +716,19 @@ namespace AssetStudio
                 DoubleSided = mat.DoubleSided
             };
 
-            if (diffuseTex != null && TryRegisterTexture(diffuseTex.Name, out int baseColorTexIdx))
+            if (diffuseTex != null)
             {
-                gltfMat.BaseColorTexture = CreateTextureInfo(baseColorTexIdx, diffuseTex);
+                if (TryRegisterTexture(diffuseTex.Name, out int baseColorTexIdx))
+                {
+                    gltfMat.BaseColorTexture = CreateTextureInfo(baseColorTexIdx, diffuseTex);
+                    consumedTextureNames.Add(diffuseTex.Name);
+                    preservedChannels.Add("baseColorTexture");
+                    if (gltfMat.BaseColorTexture.Offset != null) matExtensions.Add("KHR_texture_transform");
+                }
+                else
+                {
+                    missingTextures.Add($"Diffuse:{diffuseTex.Name}");
+                }
             }
 
             // Pack Metallic-Roughness texture into glTF G=Roughness, B=Metallic when source textures exist.
@@ -712,6 +751,15 @@ namespace AssetStudio
                     gltfMat.MetallicRoughnessTexture = CreateTextureInfo(mrTexIdx, uvSource);
                     gltfMat.MetallicFactor = hasMetallicMap ? 1f : scalarMetallic;
                     gltfMat.RoughnessFactor = hasRoughnessMap ? 1f : scalarRoughness;
+                    if (metallicTex != null && srcMetal != null) consumedTextureNames.Add(metallicTex.Name);
+                    if (roughnessTex != null && srcRough != null) consumedTextureNames.Add(roughnessTex.Name);
+                    preservedChannels.Add("metallicRoughnessTexture");
+                    if (gltfMat.MetallicRoughnessTexture.Offset != null) matExtensions.Add("KHR_texture_transform");
+                }
+                else
+                {
+                    if (metallicTex != null) missingTextures.Add($"Metallic:{metallicTex.Name}");
+                    if (roughnessTex != null) missingTextures.Add($"Roughness:{roughnessTex.Name}");
                 }
             }
             else if (specularTex != null)
@@ -722,28 +770,60 @@ namespace AssetStudio
                     gltfMat.MetallicRoughnessTexture = CreateTextureInfo(specMrTexIdx, specularTex);
                     gltfMat.MetallicFactor = 0f;
                     gltfMat.RoughnessFactor = 1f;
+                    consumedTextureNames.Add(specularTex.Name);
+                    preservedChannels.Add("metallicRoughnessTexture");
+                    if (gltfMat.MetallicRoughnessTexture.Offset != null) matExtensions.Add("KHR_texture_transform");
+                    specGlossConverted = true;
+                }
+                else if (srcSpec == null)
+                {
+                    missingTextures.Add($"Specular:{specularTex.Name}");
+                }
+                else
+                {
+                    specGlossConverted = true;
                 }
             }
 
-            if (normalTex != null && TryRegisterTexture(normalTex.Name, out int normalTexIdx))
+            if (normalTex != null)
             {
-                gltfMat.NormalTexture = CreateTextureInfo(normalTexIdx, normalTex);
-                if (mat.BumpScale.HasValue && float.IsFinite(mat.BumpScale.Value) && MathF.Abs(mat.BumpScale.Value - 1f) > 1e-4f)
+                if (TryRegisterTexture(normalTex.Name, out int normalTexIdx))
                 {
-                    gltfMat.NormalScale = Math.Max(0f, mat.BumpScale.Value);
-                }
-            }
-
-            if (occlusionTex != null && TryRegisterOcclusionTexture(matName, occlusionTex.Name, out int occTexIdx))
-            {
-                gltfMat.OcclusionTexture = CreateTextureInfo(occTexIdx, occlusionTex);
-                if (mat.OcclusionStrength.HasValue && float.IsFinite(mat.OcclusionStrength.Value))
-                {
-                    float strength = Clamp01(mat.OcclusionStrength.Value);
-                    if (MathF.Abs(strength - 1f) > 1e-4f)
+                    gltfMat.NormalTexture = CreateTextureInfo(normalTexIdx, normalTex);
+                    consumedTextureNames.Add(normalTex.Name);
+                    preservedChannels.Add("normalTexture");
+                    if (gltfMat.NormalTexture.Offset != null) matExtensions.Add("KHR_texture_transform");
+                    if (mat.BumpScale.HasValue && float.IsFinite(mat.BumpScale.Value) && MathF.Abs(mat.BumpScale.Value - 1f) > 1e-4f)
                     {
-                        gltfMat.OcclusionStrength = strength;
+                        gltfMat.NormalScale = Math.Max(0f, mat.BumpScale.Value);
                     }
+                }
+                else
+                {
+                    missingTextures.Add($"Normal:{normalTex.Name}");
+                }
+            }
+
+            if (occlusionTex != null)
+            {
+                if (TryRegisterOcclusionTexture(matName, occlusionTex.Name, out int occTexIdx))
+                {
+                    gltfMat.OcclusionTexture = CreateTextureInfo(occTexIdx, occlusionTex);
+                    consumedTextureNames.Add(occlusionTex.Name);
+                    preservedChannels.Add("occlusionTexture");
+                    if (gltfMat.OcclusionTexture.Offset != null) matExtensions.Add("KHR_texture_transform");
+                    if (mat.OcclusionStrength.HasValue && float.IsFinite(mat.OcclusionStrength.Value))
+                    {
+                        float strength = Clamp01(mat.OcclusionStrength.Value);
+                        if (MathF.Abs(strength - 1f) > 1e-4f)
+                        {
+                            gltfMat.OcclusionStrength = strength;
+                        }
+                    }
+                }
+                else
+                {
+                    missingTextures.Add($"Occlusion:{occlusionTex.Name}");
                 }
             }
 
@@ -754,14 +834,30 @@ namespace AssetStudio
                 Clamp01(SanitizeFloat(mat.Emissive.B, 0f))
             };
             bool hasEmissiveColor = emissive[0] > 1e-4f || emissive[1] > 1e-4f || emissive[2] > 1e-4f;
-            if (emissiveTex != null && TryRegisterTexture(emissiveTex.Name, out int emTexIdx))
+            if (emissiveTex != null)
             {
-                gltfMat.EmissiveTexture = CreateTextureInfo(emTexIdx, emissiveTex);
-                gltfMat.EmissiveFactor = hasEmissiveColor ? emissive : new[] { 1f, 1f, 1f };
+                if (TryRegisterTexture(emissiveTex.Name, out int emTexIdx))
+                {
+                    gltfMat.EmissiveTexture = CreateTextureInfo(emTexIdx, emissiveTex);
+                    gltfMat.EmissiveFactor = hasEmissiveColor ? emissive : new[] { 1f, 1f, 1f };
+                    consumedTextureNames.Add(emissiveTex.Name);
+                    preservedChannels.Add("emissiveTexture");
+                    if (gltfMat.EmissiveTexture.Offset != null) matExtensions.Add("KHR_texture_transform");
+                }
+                else
+                {
+                    missingTextures.Add($"Emissive:{emissiveTex.Name}");
+                    if (hasEmissiveColor)
+                    {
+                        gltfMat.EmissiveFactor = emissive;
+                        preservedChannels.Add("emissiveFactor");
+                    }
+                }
             }
             else if (hasEmissiveColor)
             {
                 gltfMat.EmissiveFactor = emissive;
+                preservedChannels.Add("emissiveFactor");
             }
 
             // Alpha mode
@@ -780,6 +876,7 @@ namespace AssetStudio
                         // Downgrade MASK without a baseColorTexture to OPAQUE so untextured materials never clip geometry to invisible.
                         gltfMat.AlphaMode = "OPAQUE";
                         gltfMat.AlphaCutoff = null;
+                        maskDowngradedToOpaque = true;
                     }
                 }
                 else if (modeInt >= 2)
@@ -796,6 +893,7 @@ namespace AssetStudio
             {
                 gltfMat.IsUnlit = true;
                 _extensionsUsed.Add("KHR_materials_unlit");
+                matExtensions.Add("KHR_materials_unlit");
             }
             else
             {
@@ -806,6 +904,7 @@ namespace AssetStudio
                     {
                         gltfMat.TransmissionFactor = tf;
                         _extensionsUsed.Add("KHR_materials_transmission");
+                        matExtensions.Add("KHR_materials_transmission");
                     }
                 }
 
@@ -816,15 +915,162 @@ namespace AssetStudio
                     {
                         gltfMat.Ior = ior;
                         _extensionsUsed.Add("KHR_materials_ior");
+                        matExtensions.Add("KHR_materials_ior");
                     }
                 }
             }
 
             gltfMat.UnityShaderMetadata = mat.UnityShaderMetadata;
 
+            var effectiveAlphaMode = gltfMat.AlphaMode ?? "OPAQUE";
+            preservedChannels.Add($"alphaMode:{effectiveAlphaMode}");
+            if (gltfMat.DoubleSided) preservedChannels.Add("doubleSided");
+            if (matExtensions.Contains("KHR_texture_transform")) preservedChannels.Add("uvTransform");
+
+            _materialDiagnostics.Add(BuildMaterialConversionDiagnostic(
+                matName,
+                mat,
+                gltfMat,
+                effectiveAlphaMode,
+                consumedTextureNames,
+                preservedChannels,
+                matExtensions,
+                approximations,
+                ignoredTextureSlots,
+                missingTextures,
+                specGlossConverted,
+                maskDowngradedToOpaque));
+
             int matIdx = _materials.Count;
             _materials.Add(gltfMat);
             _materialIndexByName[matName] = matIdx;
+        }
+
+        private static MaterialConversionDiagnostic BuildMaterialConversionDiagnostic(
+            string matName,
+            ImportedMaterial mat,
+            GltfMaterial gltfMat,
+            string effectiveAlphaMode,
+            HashSet<string> consumedTextureNames,
+            List<string> preservedChannels,
+            HashSet<string> matExtensions,
+            List<string> approximations,
+            List<string> ignoredTextureSlots,
+            List<string> missingTextures,
+            bool specGlossConverted,
+            bool maskDowngradedToOpaque)
+        {
+            var shaderName = mat.UnityShaderMetadata?.ShaderName ?? string.Empty;
+            var classification = mat.UnityShaderMetadata?.Classification ?? string.Empty;
+
+            if (mat.UnityShaderMetadata?.TextureProperties != null)
+            {
+                foreach (var kv in mat.UnityShaderMetadata.TextureProperties)
+                {
+                    if (!string.IsNullOrWhiteSpace(kv.Value) && !consumedTextureNames.Contains(kv.Value))
+                    {
+                        if (!ignoredTextureSlots.Contains(kv.Key, StringComparer.OrdinalIgnoreCase))
+                        {
+                            ignoredTextureSlots.Add(kv.Key);
+                        }
+                    }
+                }
+            }
+
+            if (specGlossConverted)
+            {
+                approximations.Add("Specular-glossiness map approximated as metallic-roughness (metallic=0, roughness=1-gloss).");
+            }
+            if (maskDowngradedToOpaque)
+            {
+                approximations.Add("AlphaMode MASK downgraded to OPAQUE because no baseColorTexture was resolved.");
+            }
+
+            bool isInvisible = string.Equals(classification, "Invisible", StringComparison.OrdinalIgnoreCase);
+            if (isInvisible)
+            {
+                approximations.Add("Shader writes no color; exported as basic fallback material.");
+            }
+            else if (string.Equals(classification, "Water", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(classification, "Refractive", StringComparison.OrdinalIgnoreCase))
+            {
+                approximations.Add("Water/refractive shader approximated via KHR_materials_transmission and KHR_materials_ior.");
+            }
+            else if (string.Equals(classification, "Additive", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(classification, "Effect", StringComparison.OrdinalIgnoreCase))
+            {
+                approximations.Add("Additive/effect shader approximated via glTF BLEND alpha mode.");
+            }
+            else if (ShaderConversionClassifier.IsUrpShader(shaderName))
+            {
+                approximations.Add($"URP shader '{shaderName}' approximated with glTF 2.0 metallic-roughness PBR.");
+            }
+            else if (ShaderConversionClassifier.IsHdrpShader(shaderName))
+            {
+                approximations.Add($"HDRP shader '{shaderName}' approximated with glTF 2.0 metallic-roughness PBR.");
+            }
+            else if (ShaderConversionClassifier.IsShaderGraphShader(shaderName))
+            {
+                approximations.Add($"Shader Graph '{shaderName}' approximated with glTF 2.0 metallic-roughness PBR.");
+            }
+            else if (ShaderConversionClassifier.IsStandardSpecularShader(shaderName))
+            {
+                approximations.Add("Built-in Standard (Specular setup) approximated with glTF 2.0 metallic-roughness PBR.");
+            }
+            else if (!string.IsNullOrWhiteSpace(shaderName)
+                && !ShaderConversionClassifier.IsStandardBuiltInPbrShader(shaderName)
+                && !ShaderConversionClassifier.IsBuiltInUnlitShader(shaderName))
+            {
+                approximations.Add($"Custom shader '{shaderName}' approximated with glTF 2.0 PBR (custom shader programs are not converted).");
+            }
+
+            if (!gltfMat.IsUnlit
+                && !mat.Roughness.HasValue
+                && !mat.Smoothness.HasValue
+                && gltfMat.MetallicRoughnessTexture == null
+                && (mat.UnityShaderMetadata?.FloatProperties.ContainsKey("_Shininess") == true
+                    || MathF.Abs(mat.Shininess - 20f) > 1e-3f))
+            {
+                approximations.Add("Legacy Shininess scalar converted to roughness approximation.");
+            }
+
+            bool hasAnyResolvedTexture = gltfMat.BaseColorTexture != null
+                || gltfMat.MetallicRoughnessTexture != null
+                || gltfMat.NormalTexture != null
+                || gltfMat.OcclusionTexture != null
+                || gltfMat.EmissiveTexture != null;
+
+            MaterialConversionMode mode;
+            if (isInvisible || (missingTextures.Count > 0 && !hasAnyResolvedTexture))
+            {
+                mode = MaterialConversionMode.BasicFallback;
+            }
+            else if (gltfMat.IsUnlit && approximations.Count == 0 && ignoredTextureSlots.Count == 0 && missingTextures.Count == 0)
+            {
+                mode = MaterialConversionMode.Unlit;
+            }
+            else if (approximations.Count > 0 || ignoredTextureSlots.Count > 0 || missingTextures.Count > 0)
+            {
+                mode = MaterialConversionMode.PbrApproximation;
+            }
+            else
+            {
+                mode = MaterialConversionMode.StandardPbr;
+            }
+
+            return new MaterialConversionDiagnostic
+            {
+                MaterialName = matName,
+                ShaderName = shaderName,
+                ShaderClassification = classification,
+                Mode = mode,
+                AlphaMode = effectiveAlphaMode,
+                PreservedChannels = preservedChannels,
+                ExtensionsUsed = matExtensions.OrderBy(static e => e, StringComparer.Ordinal).ToList(),
+                Approximations = approximations,
+                IgnoredTextureSlots = ignoredTextureSlots,
+                MissingTextures = missingTextures
+            };
         }
 
         private GltfTextureInfo CreateTextureInfo(int textureIndex, ImportedMaterialTexture matTex)

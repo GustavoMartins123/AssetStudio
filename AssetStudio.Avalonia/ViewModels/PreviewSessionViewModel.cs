@@ -134,6 +134,10 @@ namespace AssetStudio.Avalonia.ViewModels
         private bool _lastPreviewWasFromCache;
         private string? _lastPreviewSourceKind;
         private bool _lastPreviewMaterialsLoading;
+        private ShaderPreviewDiagnosticInfo? _shaderPreviewDiagnostic;
+        private string _shaderPreviewModeBadgeText = string.Empty;
+        private string _shaderPreviewModeTooltip = string.Empty;
+        private bool _isShaderPreviewModeBadgeVisible;
 
         // Phase 1: MonoBehaviour Searchable Tree / JSON Viewer
         private IReadOnlyList<AssetPropertyNode> _allMonoBehaviourTreeRoots = Array.Empty<AssetPropertyNode>();
@@ -720,6 +724,30 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             get => _lastPreviewMaterialsLoading;
             private set => SetProperty(ref _lastPreviewMaterialsLoading, value);
+        }
+
+        public ShaderPreviewDiagnosticInfo? ShaderPreviewDiagnostic
+        {
+            get => _shaderPreviewDiagnostic;
+            private set => SetProperty(ref _shaderPreviewDiagnostic, value);
+        }
+
+        public string ShaderPreviewModeBadgeText
+        {
+            get => _shaderPreviewModeBadgeText;
+            private set => SetProperty(ref _shaderPreviewModeBadgeText, value ?? string.Empty);
+        }
+
+        public string ShaderPreviewModeTooltip
+        {
+            get => _shaderPreviewModeTooltip;
+            private set => SetProperty(ref _shaderPreviewModeTooltip, value ?? string.Empty);
+        }
+
+        public bool IsShaderPreviewModeBadgeVisible
+        {
+            get => _isShaderPreviewModeBadgeVisible;
+            private set => SetProperty(ref _isShaderPreviewModeBadgeVisible, value);
         }
 
         // Phase 1: MonoBehaviour Searchable Tree / JSON Viewer properties
@@ -2940,6 +2968,26 @@ namespace AssetStudio.Avalonia.ViewModels
             UpdateCacheBadge(fromCache: false, sourceKind: null, materialsLoading: false);
         }
 
+        public void UpdateShaderPreviewDiagnostic(ShaderPreviewDiagnosticInfo? diagnostic)
+        {
+            var badgeText = diagnostic?.BadgeLabel ?? string.Empty;
+            var tooltipText = diagnostic?.BuildTooltip() ?? string.Empty;
+            var isVisible = !string.IsNullOrWhiteSpace(badgeText);
+
+            _dispatchToUi(() =>
+            {
+                ShaderPreviewDiagnostic = diagnostic;
+                ShaderPreviewModeBadgeText = badgeText;
+                ShaderPreviewModeTooltip = tooltipText;
+                IsShaderPreviewModeBadgeVisible = isVisible;
+            });
+        }
+
+        public void ClearShaderPreviewDiagnostic()
+        {
+            UpdateShaderPreviewDiagnostic(null);
+        }
+
         public void ClearPreview(string placeholderTitle = DefaultPlaceholderTitle)
         {
             CancelPendingPreview();
@@ -2974,6 +3022,10 @@ namespace AssetStudio.Avalonia.ViewModels
                     LastPreviewMaterialsLoading = false;
                     CacheBadgeText = string.Empty;
                     IsCacheBadgeVisible = false;
+                    ShaderPreviewDiagnostic = null;
+                    ShaderPreviewModeBadgeText = string.Empty;
+                    ShaderPreviewModeTooltip = string.Empty;
+                    IsShaderPreviewModeBadgeVisible = false;
                 }
             });
         }
@@ -3021,6 +3073,10 @@ namespace AssetStudio.Avalonia.ViewModels
                     LastPreviewMaterialsLoading = false;
                     CacheBadgeText = string.Empty;
                     IsCacheBadgeVisible = false;
+                    ShaderPreviewDiagnostic = null;
+                    ShaderPreviewModeBadgeText = string.Empty;
+                    ShaderPreviewModeTooltip = string.Empty;
+                    IsShaderPreviewModeBadgeVisible = false;
                 }
             });
         }

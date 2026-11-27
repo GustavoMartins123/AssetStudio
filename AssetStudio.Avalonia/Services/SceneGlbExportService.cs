@@ -122,6 +122,7 @@ public sealed class SceneExportManifest
     public List<string> MissingDependencies { get; init; } = new();
     public List<SceneExportMissingAsset> MissingAssets { get; init; } = new();
     public SortedDictionary<string, int> UnsupportedComponents { get; init; } = new(StringComparer.Ordinal);
+    public List<MaterialConversionDiagnostic> MaterialDiagnostics { get; init; } = new();
     public SceneExportScriptSpawnsSection ScriptSpawns { get; init; } = new();
 }
 
@@ -148,6 +149,8 @@ public sealed class SceneExportManifestStatistics
     public int UniqueGeometryCount { get; init; }
     public int InstancedNodes { get; init; }
     public int Materials { get; init; }
+    public int ApproximatedMaterials { get; init; }
+    public int FallbackMaterials { get; init; }
     public int Textures { get; init; }
     public int Cameras { get; init; }
     public int Lights { get; init; }
@@ -1500,6 +1503,8 @@ public sealed class SceneGlbExportService
                 UniqueGeometryCount = stats.UniqueGeometryBuffers,
                 InstancedNodes = stats.ReusedGeometryCount,
                 Materials = stats.MaterialsCount,
+                ApproximatedMaterials = stats.ApproximatedMaterialsCount,
+                FallbackMaterials = stats.FallbackMaterialsCount,
                 Textures = stats.TexturesCount,
                 Cameras = stats.CamerasCount,
                 Lights = stats.LightsCount,
@@ -1512,6 +1517,7 @@ public sealed class SceneGlbExportService
             MissingDependencies = missingDeps.OrderBy(static s => s, StringComparer.Ordinal).ToList(),
             MissingAssets = missingAssetsTracker.ToDeterministicList(),
             UnsupportedComponents = new SortedDictionary<string, int>(unsupportedComponents, StringComparer.Ordinal),
+            MaterialDiagnostics = stats.MaterialDiagnostics.ToList(),
             ScriptSpawns = scriptSpawnsSection
         };
     }

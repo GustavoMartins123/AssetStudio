@@ -11,7 +11,7 @@
         MinHeight="520"
         WindowStartupLocation="CenterOwner">
 
-    <Grid RowDefinitions="Auto,Auto,Auto,*,Auto" Margin="14" RowSpacing="10">
+    <Grid RowDefinitions="Auto,Auto,Auto,Auto,*,Auto" Margin="14" RowSpacing="8">
         <!-- Mode Selector -->
         <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
             <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6">
@@ -47,18 +47,23 @@
             <Grid>
                 <!-- Global Asset Search Controls -->
                 <Grid RowDefinitions="Auto,Auto" RowSpacing="8" IsVisible="{Binding IsSearchMode}">
-                    <Grid Grid.Row="0" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                    <Grid Grid.Row="0" ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="8">
                         <TextBox Grid.Column="0"
                                  PlaceholderText="Search assets: text, pathid:123, guid:hex, type:Material, file:sharedassets0, -exclude"
                                  Text="{Binding QueryText, Mode=TwoWay}" />
                         <Button Grid.Column="1"
                                 Content="Search"
-                                MinWidth="92"
+                                MinWidth="88"
                                 IsDefault="True"
                                 Command="{Binding ExecuteQueryCommand}" />
                         <Button Grid.Column="2"
+                                Content="Cancel"
+                                MinWidth="74"
+                                IsVisible="{Binding IsBusy}"
+                                Command="{Binding CancelQueryCommand}" />
+                        <Button Grid.Column="3"
                                 Content="Clear"
-                                MinWidth="72"
+                                MinWidth="70"
                                 Command="{Binding ClearCommand}" />
                     </Grid>
 
@@ -112,8 +117,29 @@
             </Grid>
         </Border>
 
-        <!-- Error Banner -->
+        <!-- Explicit Search Coverage Banner -->
         <Border Grid.Row="2"
+                IsVisible="{Binding IsSearchCoverageVisible}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="10,6"
+                Background="{DynamicResource SystemControlBackgroundBaseLowBrush}"
+                ToolTip.Tip="{Binding CoverageDetailsText}">
+            <StackPanel Spacing="2">
+                <TextBlock Text="{Binding CoverageBadgeText}"
+                           FontSize="11"
+                           FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis" />
+                <TextBlock Text="{Binding NotExaminedText}"
+                           FontSize="10"
+                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                           TextTrimming="CharacterEllipsis" />
+            </StackPanel>
+        </Border>
+
+        <!-- Error Banner -->
+        <Border Grid.Row="3"
                 IsVisible="{Binding HasError}"
                 BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
                 BorderThickness="1"
@@ -127,7 +153,7 @@
         </Border>
 
         <!-- Results List -->
-        <Border Grid.Row="3"
+        <Border Grid.Row="4"
                 BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
                 BorderThickness="1"
                 CornerRadius="4">
@@ -205,7 +231,7 @@
         </Border>
 
         <!-- Footer -->
-        <Grid Grid.Row="4" ColumnDefinitions="*,Auto" ColumnSpacing="10">
+        <Grid Grid.Row="5" ColumnDefinitions="*,Auto" ColumnSpacing="10">
             <TextBlock Grid.Column="0"
                        Text="{Binding StatusText}"
                        VerticalAlignment="Center"

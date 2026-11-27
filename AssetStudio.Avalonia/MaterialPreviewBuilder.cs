@@ -9,14 +9,16 @@ namespace AssetStudio.Avalonia;
 
 internal sealed class MaterialPreviewData
 {
-    public MaterialPreviewData(string infoText, Texture2D? previewTexture)
+    public MaterialPreviewData(string infoText, Texture2D? previewTexture, string? resolvedShaderName = null)
     {
         InfoText = infoText;
         PreviewTexture = previewTexture;
+        ResolvedShaderName = resolvedShaderName ?? string.Empty;
     }
 
     public string InfoText { get; }
     public Texture2D? PreviewTexture { get; }
+    public string ResolvedShaderName { get; }
 }
 
 internal sealed class MaterialPreviewBuilder
@@ -125,7 +127,7 @@ internal sealed class MaterialPreviewBuilder
             sb.AppendLine($"Parent material: {displayMaterial.m_Name}");
         }
 
-        AppendShaderReference(sb, displayMaterial);
+        var resolvedShaderName = AppendShaderReference(sb, displayMaterial);
         sb.AppendLine();
         sb.AppendLine("Texture slots:");
 
@@ -170,7 +172,7 @@ internal sealed class MaterialPreviewBuilder
             previewTexture = findTextureForMaterial(displayMaterial);
         }
 
-        return new MaterialPreviewData(sb.ToString(), previewTexture);
+        return new MaterialPreviewData(sb.ToString(), previewTexture, resolvedShaderName);
     }
 
     public static bool IsPreferredTextureSlot(string? propertyName)
@@ -288,13 +290,13 @@ internal sealed class MaterialPreviewBuilder
         return false;
     }
 
-    private void AppendShaderReference(StringBuilder sb, Material material)
+    private string AppendShaderReference(StringBuilder sb, Material material)
     {
         var shaderRef = material.m_Shader;
         if (shaderRef == null || shaderRef.IsNull)
         {
             sb.AppendLine("Shader: <none>");
-            return;
+            return string.Empty;
         }
 
         var shaderName = TryGetLoadedShaderName(shaderRef);
@@ -309,6 +311,7 @@ internal sealed class MaterialPreviewBuilder
             }
         }
 
+        var resolvedName = shaderName ?? string.Empty;
         if (string.IsNullOrWhiteSpace(shaderName))
         {
             shaderName = "unloaded or unsupported shader";
@@ -319,6 +322,8 @@ internal sealed class MaterialPreviewBuilder
         {
             sb.AppendLine($"Shader source: {sourceName}");
         }
+
+        return resolvedName;
     }
 
     private static string? TryGetLoadedShaderName(PPtr<Shader> shaderRef)

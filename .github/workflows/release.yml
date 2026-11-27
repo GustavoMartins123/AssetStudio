@@ -203,10 +203,31 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$cliDir/x64" | Out-Null
           Copy-Item -LiteralPath "Texture2DDecoderNative/bin/x64/Release/Texture2DDecoderNative.dll" -Destination "$cliDir/x64/"
           Get-ChildItem -LiteralPath $cliDir -Filter *.pdb -Recurse | Remove-Item -Force
-          & "$cliDir/AssetStudio.CLI.exe" --help
-          if ($LASTEXITCODE -ne 0) { throw "AssetStudio.CLI --help failed with exit code $LASTEXITCODE." }
+
           $zipPath = "dist/AssetStudio.CLI-win-x64-$($env:RELEASE_VERSION).zip"
           Compress-Archive -Path "$cliDir/*" -DestinationPath $zipPath -CompressionLevel Optimal -Force
+
+          $unpackDir = Join-Path ([System.IO.Path]::GetTempPath()) ("AssetStudio_CliPkg_" + [Guid]::NewGuid().ToString("N"))
+          try {
+            Expand-Archive -LiteralPath $zipPath -DestinationPath $unpackDir -Force
+            if (-not (Test-Path -LiteralPath (Join-Path $unpackDir "x64/Texture2DDecoderNative.dll"))) {
+              throw "Packaged CLI archive is missing x64/Texture2DDecoderNative.dll."
+            }
+            pwsh -File scripts/smoke-test-cli.ps1 -CliExecutable (Join-Path $unpackDir "AssetStudio.CLI.exe") -ExpectedVersion "$($env:RELEASE_VERSION)"
+          }
+          finally {
+            if (Test-Path -LiteralPath $unpackDir) {
+              Remove-Item -LiteralPath $unpackDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          $checksumLines = Get-ChildItem -LiteralPath "dist" -Filter "*.zip" | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $checksumPath = "dist/SHA256SUMS-win-x64.txt"
+          [System.IO.File]::WriteAllLines($checksumPath, $checksumLines, (New-Object System.Text.UTF8Encoding($false)))
+          Get-Content -LiteralPath $checksumPath
           Get-Item -LiteralPath $zipPath | Select-Object Name, Length
 
       - name: Upload Windows release artifact
@@ -216,6 +237,7 @@ jobs:
           path: |
             dist/AssetStudio-win-x64-*.zip
             dist/AssetStudio.CLI-win-x64-*.zip
+            dist/SHA256SUMS-win-x64.txt
           if-no-files-found: error
 
   build-linux-x64:
@@ -354,7 +376,7 @@ jobs:
         run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj -p:RuntimeIdentifier=linux-x64 --locked-mode
 
       - name: Validate Linux packaging scripts
-        run: bash -n scripts/publish-linux.sh scripts/package-linux.sh
+        run: bash -n scripts/publish-linux.sh scripts/package-linux.sh scripts/smoke-test-cli.sh
 
       # scripts/package-linux.sh invokes scripts/publish-linux.sh internally (downloading
       # SHA-256-verified FFmpeg 8.1.3 LGPL shared libs and publishing self-contained linux-x64),
@@ -418,8 +440,26 @@ jobs:
           mkdir -p "$cli_dir/x64"
           cp Texture2DDecoderNative/build/libTexture2DDecoderNative.so "$cli_dir/x64/"
           find "$cli_dir" -name '*.pdb' -delete
-          "$cli_dir/AssetStudio.CLI" --help
-          tar -czf "dist/AssetStudio.CLI-linux-x64-${RELEASE_VERSION}.tar.gz" -C dist-cli AssetStudio.CLI-linux-x64
+
+          cli_tarball="dist/AssetStudio.CLI-linux-x64-${RELEASE_VERSION}.tar.gz"
+          tar -czf "$cli_tarball" -C dist-cli AssetStudio.CLI-linux-x64
+
+          unpack_dir="$(mktemp -d)"
+          trap 'rm -rf "$unpack_dir"' EXIT
+          tar -xzf "$cli_tarball" -C "$unpack_dir"
+          if [[ ! -f "$unpack_dir/AssetStudio.CLI-linux-x64/x64/libTexture2DDecoderNative.so" ]]; then
+            echo "Packaged CLI archive is missing x64/libTexture2DDecoderNative.so." >&2
+            exit 1
+          fi
+          bash scripts/smoke-test-cli.sh "$unpack_dir/AssetStudio.CLI-linux-x64/AssetStudio.CLI" "${RELEASE_VERSION}"
+
+          (
+            cd dist
+            rm -f SHA256SUMS-linux-x64.txt
+            LC_ALL=C sha256sum -- *.AppImage *.deb AssetStudio-linux-x64-*.tar.gz AssetStudio.CLI-linux-x64-*.tar.gz > SHA256SUMS-linux-x64.txt
+            sha256sum -c SHA256SUMS-linux-x64.txt
+            cat SHA256SUMS-linux-x64.txt
+          )
           ls -lh dist/
 
       - name: Upload Linux release artifacts
@@ -431,6 +471,7 @@ jobs:
             dist/*.deb
             dist/AssetStudio-linux-x64-*.tar.gz
             dist/AssetStudio.CLI-linux-x64-*.tar.gz
+            dist/SHA256SUMS-linux-x64.txt
           if-no-files-found: error
 
   publish-release:
@@ -454,14 +495,21 @@ jobs:
         run: |
           set -euo pipefail
           cd release-assets
-          rm -f SHA256SUMS.txt
+          rm -f SHA256SUMS.txt SHA256SUMS-*.txt
           shopt -s nullglob
           files=(*)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "No release artifacts were downloaded." >&2
             exit 1
           fi
+          cli_win=(AssetStudio.CLI-win-x64-*.zip)
+          cli_linux=(AssetStudio.CLI-linux-x64-*.tar.gz)
+          if [[ ${#cli_win[@]} -eq 0 || ${#cli_linux[@]} -eq 0 ]]; then
+            echo "Expected packaged AssetStudio.CLI archives for both win-x64 and linux-x64." >&2
+            exit 1
+          fi
           LC_ALL=C sha256sum -- "${files[@]}" > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish GitHub Release

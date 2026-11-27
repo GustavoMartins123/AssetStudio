@@ -27,7 +27,7 @@ On Windows, use `-p:RuntimeIdentifier=win-x64` and copy `Texture2DDecoderNative/
 
 ## Commands
 
-Every command takes a file or a folder. Put paths with spaces or accents in quotes, for example `"D:\Jogos\Meu Jogo\Game_Data"`.
+Every command takes a file or a folder. Put paths with spaces or accents in quotes, for example `"path/to/My Project/App_Data"`.
 
 | Command | What it does |
 | --- | --- |
@@ -73,6 +73,7 @@ AssetStudio.CLI export <path> --output <dir>
     [--image-format png|webp|tga|jpeg|bmp]
     [--model-format glb|gltf|fbx]
     [--assemblies <Managed folder>]
+    [--format text|json]
     [--report <json file>]
     [--dry-run]
 ```
@@ -136,14 +137,18 @@ Files go to `<output>/<Type>/<name>.<ext>`. Names are cleaned for the file syste
 
 Scene export to `.glb`, Unity project / prefab / `.unitypackage` export, C# project export, build comparison, global search and previews. The CLI also does not load Addressables catalog dependencies or external `.assets` files that sit outside `<path>`.
 
-## Exit codes and messages
+## Exit codes and stream separation
 
 | Code | Meaning |
 | --- | --- |
-| `0` | The command ran. For `export`, check the summary line. |
-| `1` | Runtime error, for example a path that does not exist or a file that can't be read. |
+| `0` | Completed cleanly (no asset failures). |
+| `1` | Fatal runtime error (missing path, unreadable file) or a batch where all attempted exports failed (`status: "Failed"`). |
 | `2` | Invalid arguments: unknown command, option or type, or a missing value. |
+| `3` | Partial success: at least one asset exported while one or more failed (`status: "Partial"`). |
+| `130` | Cancelled by interrupt (`Ctrl+C` / `SIGINT`, `status: "Cancelled"`). |
 
-`export` ends with `Export complete: <n> exported, <n> skipped.` (or `Dry-run complete: <n> planned, ...`). When an asset fails, the line adds `, <n> failed`, and each failure is printed on standard error as `Failed: <Type> <PathID> (<name>): <reason>`. A run with failures still exits with `0`, so scripts that need every asset should check for `failed` in the summary.
+### Stream separation (`stdout` vs. `stderr`)
 
-Exported paths are printed on standard output (`Exported: <path>`). Errors and skip reasons go to standard error.
+- **Structured output (`--format json`, `jsonl`, `csv`):** `stdout` contains **only** the structured data payload (for `export --format json`, `stdout` emits the `ExportReport` JSON document directly without progress lines).
+- **Text output (`--format text`, default):** `export` prints exported paths (`Exported: <path>`) and the final summary (`Export complete: <n> exported, <n> skipped[, <n> failed].`) on `stdout`.
+- **Logs and errors (`stderr`):** all warnings, skip reasons, per-asset failures (`Failed: <Type> <PathID> (<name>): <reason>`), and cancellation summaries go strictly to `stderr` so automated pipelines can safely parse `stdout` or `--report <json>`.
