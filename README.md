@@ -1,22 +1,28 @@
 # AssetStudio
 
+AssetStudio is a cross-platform (Windows x64 and Linux x64) desktop and command-line tool for exploring, inspecting, and exporting Unity assets and AssetBundles — featuring a persistent SQLite project index, lazy/low-memory loading, semantic asset references and global search, integrated 3D/shader/media previews, glTF/GLB/FBX/Unity export, and a headless CLI for batch automation.
+
+- **Downloads:** prebuilt self-contained packages are published on [GitHub Releases](https://github.com/GustavoMartins123/AssetStudio/releases) (Windows x64 `.zip`; Linux x64 `.AppImage`, `.deb`, `.tar.gz`; plus `AssetStudio.CLI` archives and `SHA256SUMS.txt` starting with the next release).
+- **Availability:** see [`SUPPORTED_FEATURES.md`](SUPPORTED_FEATURES.md) for a plain-language list separating features in the latest release (`v0.20.0`) from features currently on `main` or under study.
+
+### Documentation
+
+* [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md): Unity versions, asset families, build variants, and platform support matrix with evidence levels.
+* [`docs/EXPORT_FORMATS.md`](docs/EXPORT_FORMATS.md): what each export format preserves, approximates, or drops, plus verification steps and report contracts.
+* [`docs/CLI.md`](docs/CLI.md): headless `AssetStudio.CLI` commands, export options, JSON reports, stream separation, and exit codes.
+* [`docs/PROJECTS_AND_CACHE.md`](docs/PROJECTS_AND_CACHE.md): installation layouts, native dependencies (`Texture2DDecoderNative`, FFmpeg), Project Root vs. caches, recovery, and troubleshooting.
+* [`docs/DECRYPTION_AND_FORMATS.md`](docs/DECRYPTION_AND_FORMATS.md): declarative decryption profile format, supported cipher modes, diagnostic categories, and out-of-scope middleware banks.
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): codebase layer map, shared GUI/CLI pipelines, and lifecycle/disposal contracts.
+* [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md): reproducible synthetic benchmark methodology and runner.
+* [`CONTRIBUTING.md`](CONTRIBUTING.md): build setup, test policy, Pure-MVVM rules, and release checklist.
+
 ## Attribution and maintenance note
 
 This project is based on [Perfare/AssetStudio](https://github.com/Perfare/AssetStudio), originally created and maintained by Perfare. The original repository was archived by its owner on January 21, 2023 and remains the upstream source and credit for AssetStudio.
 
-This update is an independent community maintenance effort. Its purpose is to keep AssetStudio usable on newer .NET versions, reduce crashes during load/export, and experiment with exporter fixes. It is not an official continuation by Perfare, and it does not claim ownership of the original project.
+This fork is an independent community maintenance effort. It is not an official continuation by Perfare, and it does not claim ownership of the original project.
 
 **None of the repo, the tool, nor the repo owner is affiliated with, or sponsored or authorized by, Unity Technologies or its affiliates.**
-
-AssetStudio is a tool for exploring, extracting and exporting assets and AssetBundles.
-
-For a plain-language overview of what is currently supported, known limits, and features still under study, see [`SUPPORTED_FEATURES.md`](SUPPORTED_FEATURES.md). It also marks which features are in the latest release (`v0.20.0`) and which are only in the `main` branch so far.
-
-More details:
-
-* [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md): which Unity versions, build types and platforms are verified, and how.
-* [`docs/EXPORT_FORMATS.md`](docs/EXPORT_FORMATS.md): what each export format keeps and what it loses.
-* [`docs/CLI.md`](docs/CLI.md): the command-line tool (including `AssetStudio.CLI --version` to identify dev builds vs. releases).
 
 ## Features
 
@@ -59,7 +65,7 @@ The project root is different from the loaded file or folder:
 * **Loaded file/folder** is the subset of assets you want to inspect or export.
 * **Project root** is an optional wider search root used when resolving external dependencies, such as streamed texture or mesh data referenced by loaded assets.
 
-For example, you can load only `F:\Unity_Projects\TEST_PROJECT\Assets\Assets_Ripp\scene_objects`, while setting the project root to `F:\Unity_Projects\TEST_PROJECT`. AssetStudio will load only the selected folder, but can still search the project root when exported models need external texture or mesh resources.
+For example, you can load only `path/to/MyProject/Assets/scene_objects`, while setting the project root to `path/to/MyProject`. AssetStudio will load only the selected folder, but can still search the project root when exported models need external texture or mesh resources.
 
 ### Project Manager
 
@@ -146,8 +152,8 @@ Generate dummy DLLs with [Il2CppDumper by Perfare](https://github.com/Perfare/Il
 `AssetStudio.CLI` (in `main`, packaged from the next release) scans, lists, inspects and exports assets without the GUI:
 
 ```bash
-AssetStudio.CLI list "D:\Games\My Game\Game_Data" --type Texture2D --format csv
-AssetStudio.CLI export "D:\Games\My Game\Game_Data" --output out --type all
+AssetStudio.CLI list "path/to/My Project/App_Data" --type Texture2D --format csv
+AssetStudio.CLI export "path/to/My Project/App_Data" --output out --type all --report out/report.json
 ```
 
 See [`docs/CLI.md`](docs/CLI.md) for every command, export type, option and exit code.
