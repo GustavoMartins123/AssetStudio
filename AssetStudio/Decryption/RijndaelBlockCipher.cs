@@ -45,6 +45,7 @@ namespace AssetStudio
         public int BlockSize => nb * 4;
         public int KeySize { get; }
         public int Rounds => nr;
+        internal ReadOnlySpan<uint> EncryptionKeySchedule => encryptKeys.AsSpan(0, nb * (nr + 1));
 
         public RijndaelBlockCipher(ReadOnlySpan<byte> key, int blockSizeBits)
         {

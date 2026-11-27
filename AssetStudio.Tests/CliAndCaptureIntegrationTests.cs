@@ -408,6 +408,9 @@ namespace AssetStudio.Tests
                 byte[] key = new byte[32];
                 random.NextBytes(key);
                 CaptureResult capture = Capture(root, random, key);
+                string otherDirectory = Path.Combine(root, "other");
+                Directory.CreateDirectory(otherDirectory);
+                CaptureResult other = Capture(otherDirectory, random);
                 var image = new RuntimeGameCaptureTests.ManagedImage(random);
                 image.AddArray(key).AddArray(new byte[32]);
                 image.AddDump(RuntimeGameCaptureTests.MakeDump(capture.Plain[1], 8184));
@@ -425,11 +428,19 @@ namespace AssetStudio.Tests
                         address & ~0xFFFL,
                         address + pinnedBytes.Length + 4096);
 
-                    Assert.True(key.SequenceEqual(Assert.Single(result.Keys).Key));
+                    CapturedKey found = Assert.Single(result.Keys, candidate => candidate.Key.AsSpan().SequenceEqual(key));
+                    Assert.Equal(CapturedCipherKind.Aes, found.Kind);
+                    Assert.Equal(CapturedCipherMode.Cbc, found.Mode);
+                    Assert.True(found.Padding);
                     Assert.Contains(result.Dumps, dump => dump.DeclaredSize == capture.Plain[1].Length
                         && dump.Data.AsSpan(0, 8184).SequenceEqual(capture.Plain[1].AsSpan(0, 8184)));
                     Assert.Contains(result.Dumps, dump => dump.DeclaredSize == capture.Plain[0].Length
                         && dump.Data.AsSpan(0, capture.Plain[0].Length).SequenceEqual(capture.Plain[0]));
+
+                    Assert.False(RuntimeCipherRecovery.TryRecover(found, other.Files, result.Dumps, out _));
+                    Assert.True(RuntimeCipherRecovery.TryRecover(found, capture.Files, result.Dumps, out CapturedCipher? recovered) && recovered != null);
+                    Assert.Equal(capture.Files.Length, RuntimeCipherRecovery.ValidateOnFiles(recovered!, capture.Files, out int filesChecked));
+                    Assert.Equal(capture.Files.Length, filesChecked);
                 }
                 finally
                 {

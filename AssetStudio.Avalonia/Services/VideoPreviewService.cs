@@ -1597,7 +1597,7 @@ namespace AssetStudio.Avalonia.Services
 
             // 1) Try reading directly from DecompressedBundleCache without reloading the SerializedFile.
             if (assetsManager.DecompressionCache != null
-                && assetsManager.DecompressionCache.TryOpenCachedStreamFiles(bundlePath, out var streamFiles))
+                && assetsManager.DecompressionCache.TryOpenCachedStreamFiles(bundlePath, out var streamFiles, decryptionFingerprint: ReadDecryptionFingerprint(bundlePath)))
             {
                 try
                 {
@@ -1643,6 +1643,19 @@ namespace AssetStudio.Avalonia.Services
             using var session = refreshedReader.OpenReadSession();
             CopyReadSessionToFile(session, destinationPath, expectedSize > 0 ? expectedSize : session.Size, cancellationToken);
             return true;
+        }
+
+        private static string? ReadDecryptionFingerprint(string bundlePath)
+        {
+            try
+            {
+                using var reader = new FileReader(bundlePath);
+                return reader.DecryptionFingerprint;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                return null;
+            }
         }
 
         private static string NormalizeArchiveResourcePath(string path)

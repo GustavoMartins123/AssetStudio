@@ -20,6 +20,7 @@ namespace AssetStudio
         public int BlockSize => Cipher.BlockSize;
         public long HeaderSkipBytes => headerSkipBytes;
         public bool Pkcs7Padding => pkcs7Padding;
+        internal ReadOnlySpan<byte> Iv => iv;
         internal bool LeaveBaseStreamOpen { get; set; }
 
         public RijndaelCbcTransformStream(

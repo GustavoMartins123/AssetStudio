@@ -134,7 +134,8 @@ namespace AssetStudio
                             var cacheEntry = decompressionCache.GetOrExtractBlocks(
                                 reader.FullPath,
                                 uncompressedSizeSum,
-                                tempStream => ReadBlocksAndDirectory(reader, tempStream));
+                                tempStream => ReadBlocksAndDirectory(reader, tempStream),
+                                decryptionFingerprint: reader.DecryptionFingerprint);
                             if (cacheEntry.FromCache)
                             {
                                 using var cachedStream = new FileStream(
@@ -253,7 +254,8 @@ namespace AssetStudio
                                 reader.FullPath,
                                 uncompressedSizeSum,
                                 tempStream => ReadBlocks(reader, tempStream),
-                                cachedNodes);
+                                cachedNodes,
+                                decryptionFingerprint: reader.DecryptionFingerprint);
                             LoadedFromDecompressionCache = cacheEntry.FromCache;
                             CachedBlocksPath = cacheEntry.BlocksFilePath;
                             ReadFilesFromDiskPath(cacheEntry.BlocksFilePath, cacheEntry.UncompressedSize);

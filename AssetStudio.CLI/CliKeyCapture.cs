@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -35,25 +34,25 @@ namespace AssetStudio.CLI
                 string arg = args[i];
                 if (string.Equals(arg, "--exe", StringComparison.Ordinal))
                 {
-                    if (!TryReadValue(args, ref i, "--exe", stderr, out executable))
+                    if (!CliRunner.TryReadOptionValue(args, ref i, "--exe", stderr, out executable))
                     {
                         return CliRunner.ExitInvalidArguments;
                     }
                 }
                 else if (string.Equals(arg, "--timeout", StringComparison.Ordinal))
                 {
-                    if (!TryReadValue(args, ref i, "--timeout", stderr, out string? value)
+                    if (!CliRunner.TryReadOptionValue(args, ref i, "--timeout", stderr, out string? value)
                         || !double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double seconds)
                         || !double.IsFinite(seconds) || seconds < 5 || seconds > 3600)
                     {
-                        return InvalidArg(stderr, "Invalid --timeout value. Use a number of seconds between 5 and 3600.");
+                        return CliRunner.InvalidArg(stderr, "Invalid --timeout value. Use a number of seconds between 5 and 3600.");
                     }
 
                     timeout = TimeSpan.FromSeconds(seconds);
                 }
                 else if (string.Equals(arg, "--format", StringComparison.Ordinal))
                 {
-                    if (!TryReadValue(args, ref i, "--format", stderr, out string? value))
+                    if (!CliRunner.TryReadOptionValue(args, ref i, "--format", stderr, out string? value))
                     {
                         return CliRunner.ExitInvalidArguments;
                     }
@@ -64,12 +63,12 @@ namespace AssetStudio.CLI
                     }
                     else if (!string.Equals(value, "text", StringComparison.OrdinalIgnoreCase))
                     {
-                        return InvalidArg(stderr, "Invalid --format value. Use text or json.");
+                        return CliRunner.InvalidArg(stderr, "Invalid --format value. Use text or json.");
                     }
                 }
                 else if (arg.StartsWith('-'))
                 {
-                    return InvalidArg(stderr, $"Unknown option '{arg}' for '{CommandName}'.");
+                    return CliRunner.InvalidArg(stderr, $"Unknown option '{arg}' for '{CommandName}'.");
                 }
                 else if (targetPath == null)
                 {
@@ -77,18 +76,18 @@ namespace AssetStudio.CLI
                 }
                 else
                 {
-                    return InvalidArg(stderr, $"Unexpected positional argument '{arg}' for '{CommandName}'.");
+                    return CliRunner.InvalidArg(stderr, $"Unexpected positional argument '{arg}' for '{CommandName}'.");
                 }
             }
 
             if (string.IsNullOrWhiteSpace(targetPath))
             {
-                return InvalidArg(stderr, $"Missing required <path> argument for '{CommandName}'.");
+                return CliRunner.InvalidArg(stderr, $"Missing required <path> argument for '{CommandName}'.");
             }
 
             if (!Directory.Exists(targetPath) && !File.Exists(targetPath))
             {
-                return InvalidArg(stderr, $"path does not exist: {targetPath}");
+                return CliRunner.InvalidArg(stderr, $"path does not exist: {targetPath}");
             }
 
             if (!GameKeyCapture.IsSupported)
@@ -123,7 +122,7 @@ namespace AssetStudio.CLI
             Report report = CreateReport(result, target, profilePath);
             if (json)
             {
-                stdout.WriteLine(JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+                stdout.WriteLine(JsonSerializer.Serialize(report, CliRunner.JsonIndentedOptions));
             }
             else
             {
@@ -193,30 +192,11 @@ namespace AssetStudio.CLI
             }
         }
 
-        private static bool TryReadValue(string[] args, ref int index, string option, TextWriter stderr, out string? value)
-        {
-            if (index + 1 >= args.Length)
-            {
-                value = null;
-                stderr.WriteLine($"Error: missing value for {option}.");
-                return false;
-            }
-
-            value = args[++index];
-            return true;
-        }
-
-        private static int InvalidArg(TextWriter stderr, string message)
-        {
-            stderr.WriteLine($"Error: {message}");
-            return CliRunner.ExitInvalidArguments;
-        }
-
         private static int Fail(TextWriter stderr, bool json, string message, Report? report)
         {
             if (json)
             {
-                stderr.WriteLine(JsonSerializer.Serialize(report ?? new Report("failed", message, null, null, null, null, 0, 0), new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+                stderr.WriteLine(JsonSerializer.Serialize(report ?? new Report("failed", message, null, null, null, null, 0, 0), CliRunner.JsonCompactOptions));
             }
             else
             {

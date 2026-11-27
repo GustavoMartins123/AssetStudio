@@ -12,6 +12,7 @@ namespace AssetStudio
         public FileType FileType;
         public string? AppliedDecryptionProvider { get; }
         public StreamEncryptionBarrier? EncryptionBarrier { get; }
+        public string? DecryptionFingerprint { get; }
         private byte[]? cachedMemoryBuffer;
         private readonly object cachedMemoryBufferLock = new object();
 
@@ -28,31 +29,33 @@ namespace AssetStudio
         {
         }
 
-        private FileReader(string path, (Stream Stream, string? ProviderId, StreamEncryptionBarrier? Barrier) prepared, EndianType endian, bool isInitialOpen)
+        private FileReader(string path, (Stream Stream, Stream Source, string? ProviderId, StreamEncryptionBarrier? Barrier) prepared, EndianType endian, bool isInitialOpen)
             : base(prepared.Stream, endian)
         {
             FullPath = Path.GetFullPath(path);
             FileName = Path.GetFileName(path);
             AppliedDecryptionProvider = prepared.ProviderId;
             EncryptionBarrier = prepared.Barrier;
+            DecryptionFingerprint = DecryptionFingerprints.Compute(prepared.Stream, prepared.Source, prepared.ProviderId);
             FileType = CheckFileType();
         }
 
-        private FileReader(string path, Stream stream, EndianType endian, FileType fileType, byte[]? cachedMemoryBuffer, string? appliedDecryptionProvider = null, StreamEncryptionBarrier? encryptionBarrier = null) : base(stream, endian)
+        private FileReader(string path, Stream stream, EndianType endian, FileType fileType, byte[]? cachedMemoryBuffer, string? appliedDecryptionProvider = null, StreamEncryptionBarrier? encryptionBarrier = null, string? decryptionFingerprint = null) : base(stream, endian)
         {
             FullPath = path;
             FileName = Path.GetFileName(path);
             FileType = fileType;
             AppliedDecryptionProvider = appliedDecryptionProvider;
             EncryptionBarrier = encryptionBarrier;
+            DecryptionFingerprint = decryptionFingerprint;
             this.cachedMemoryBuffer = cachedMemoryBuffer;
             Position = 0;
         }
 
-        private static (Stream Stream, string? ProviderId, StreamEncryptionBarrier? Barrier) PrepareStream(Stream stream, string path)
+        private static (Stream Stream, Stream Source, string? ProviderId, StreamEncryptionBarrier? Barrier) PrepareStream(Stream stream, string path)
         {
             var resolved = DecryptionHelper.CheckAndDecryptStream(stream, path, out var providerId, out var barrier) ?? stream;
-            return (resolved, providerId, barrier);
+            return (resolved, stream, providerId, barrier);
         }
 
         private FileType CheckFileType()
@@ -100,7 +103,7 @@ namespace AssetStudio
                 if (memStream.TryGetBuffer(out var segment) && segment.Array != null)
                 {
                     var segmentStream = PooledReadOnlyMemoryStream.Rent(segment.Array, segment.Offset, segment.Count);
-                    return new FileReader(FullPath, segmentStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+                    return new FileReader(FullPath, segmentStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier, DecryptionFingerprint);
                 }
 
                 if (cachedMemoryBuffer == null)
@@ -115,31 +118,31 @@ namespace AssetStudio
                 }
 
                 var newStream = PooledReadOnlyMemoryStream.Rent(cachedMemoryBuffer, 0, cachedMemoryBuffer.Length);
-                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier, DecryptionFingerprint);
             }
             else if (BaseStream is DecryptedStream decStream)
             {
                 var clonedUnderlying = CloneStream(decStream.BaseStream);
                 var newDecStream = new DecryptedStream(clonedUnderlying, decStream.Token);
-                return new FileReader(FullPath, newDecStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+                return new FileReader(FullPath, newDecStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier, DecryptionFingerprint);
             }
             else if (BaseStream is XorTransformStream xorStream)
             {
                 var clonedUnderlying = CloneStream(xorStream.BaseStream);
                 var newXorStream = xorStream.Clone(clonedUnderlying);
-                return new FileReader(FullPath, newXorStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+                return new FileReader(FullPath, newXorStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier, DecryptionFingerprint);
             }
             else if (BaseStream is CipherTransformStream cipherStream)
             {
                 var clonedUnderlying = CloneStream(cipherStream.BaseStream);
                 var newCipherStream = cipherStream.Clone(clonedUnderlying);
-                return new FileReader(FullPath, newCipherStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+                return new FileReader(FullPath, newCipherStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier, DecryptionFingerprint);
             }
             else if (BaseStream is RijndaelCbcTransformStream rijndaelStream)
             {
                 var clonedUnderlying = CloneStream(rijndaelStream.BaseStream);
                 var newRijndaelStream = rijndaelStream.Clone(clonedUnderlying);
-                return new FileReader(FullPath, newRijndaelStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+                return new FileReader(FullPath, newRijndaelStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier, DecryptionFingerprint);
             }
             else if (BaseStream is HeaderMaskStream maskStream)
             {
@@ -148,7 +151,7 @@ namespace AssetStudio
                     ? innerCipher.Clone(CloneStream(innerCipher.BaseStream))
                     : CloneStream(inner);
                 var newMaskStream = maskStream.Clone(clonedInner);
-                return new FileReader(FullPath, newMaskStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+                return new FileReader(FullPath, newMaskStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier, DecryptionFingerprint);
             }
             else if (BaseStream is SubStream subStream)
             {
@@ -157,7 +160,7 @@ namespace AssetStudio
                     : subStream.BaseStream != null
                         ? new SubStream(CloneStream(subStream.BaseStream), subStream.Offset, subStream.Length, leaveOpen: false)
                         : throw new NotSupportedException("Cannot clone detached SubStream.");
-                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier, DecryptionFingerprint);
             }
             else if (BaseStream is FileStream fileStream)
             {
@@ -175,7 +178,7 @@ namespace AssetStudio
                     BaseStream.CopyTo(tempMemStream);
                     BaseStream.Position = originalPosition;
                     tempMemStream.Position = originalPosition;
-                    return new FileReader(FullPath, tempMemStream, Endian, FileType, cachedMemoryBuffer);
+                    return new FileReader(FullPath, tempMemStream, Endian, FileType, cachedMemoryBuffer, null, null, DecryptionFingerprint);
                 }
                 catch (System.Exception ex)
                 {

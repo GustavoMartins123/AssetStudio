@@ -211,6 +211,7 @@ namespace AssetStudio
             Action<Stream> writeDecompressedBlocks,
             IReadOnlyList<CachedBundleNode>? directoryNodes = null,
             string? gameScopePath = null,
+            string? decryptionFingerprint = null,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(sourceBundlePath))
@@ -253,6 +254,7 @@ namespace AssetStudio
                     sourceLength,
                     sourceLastWriteTicks,
                     expectedUncompressedSize,
+                    decryptionFingerprint,
                     out var existingManifest,
                     out var actualBlocksLength))
                 {
@@ -311,6 +313,7 @@ namespace AssetStudio
                         SourcePath = normalizedBundlePath,
                         SourceLength = sourceLength,
                         SourceLastWriteTimeUtcTicks = sourceLastWriteTicks,
+                        DecryptionFingerprint = decryptionFingerprint,
                         UncompressedSize = writtenLength,
                         CreatedUtcTicks = nowTicks,
                         LastAccessedUtcTicks = nowTicks,
@@ -369,7 +372,8 @@ namespace AssetStudio
         public bool TryOpenCachedStreamFiles(
             string sourceBundlePath,
             out StreamFile[] streamFiles,
-            string? gameScopePath = null)
+            string? gameScopePath = null,
+            string? decryptionFingerprint = null)
         {
             streamFiles = Array.Empty<StreamFile>();
             if (string.IsNullOrWhiteSpace(sourceBundlePath) || !File.Exists(sourceBundlePath))
@@ -395,6 +399,7 @@ namespace AssetStudio
                     sourceLength,
                     sourceLastWriteTicks,
                     expectedUncompressedSize: -1,
+                    decryptionFingerprint,
                     out var manifest,
                     out var actualBlocksLength)
                     || manifest == null)
@@ -783,6 +788,7 @@ namespace AssetStudio
             long expectedSourceLength,
             long expectedSourceLastWriteTicks,
             long expectedUncompressedSize,
+            string? expectedDecryptionFingerprint,
             out BundleCacheManifest? manifest,
             out long actualBlocksLength)
         {
@@ -817,7 +823,8 @@ namespace AssetStudio
 
                 if (manifest.SourceLength != expectedSourceLength
                     || manifest.SourceLastWriteTimeUtcTicks != expectedSourceLastWriteTicks
-                    || manifest.UncompressedSize != actualBlocksLength)
+                    || manifest.UncompressedSize != actualBlocksLength
+                    || !string.Equals(manifest.DecryptionFingerprint, expectedDecryptionFingerprint, StringComparison.Ordinal))
                 {
                     return false;
                 }
@@ -1048,6 +1055,7 @@ namespace AssetStudio
             public string SourcePath { get; set; } = string.Empty;
             public long SourceLength { get; set; }
             public long SourceLastWriteTimeUtcTicks { get; set; }
+            public string? DecryptionFingerprint { get; set; }
             public long UncompressedSize { get; set; }
             public long CreatedUtcTicks { get; set; }
             public long LastAccessedUtcTicks { get; set; }

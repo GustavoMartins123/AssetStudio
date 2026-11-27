@@ -16,6 +16,7 @@ namespace AssetStudio
 
         public Stream InnerStream { get; }
         public int MaskLength => mask.Length;
+        internal ReadOnlySpan<byte> Mask => mask;
         internal bool LeaveInnerStreamOpen { get; set; }
 
         public HeaderMaskStream(Stream innerStream, ReadOnlySpan<byte> mask, bool leaveInnerStreamOpen = false)
