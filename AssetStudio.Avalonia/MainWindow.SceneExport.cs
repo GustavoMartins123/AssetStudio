@@ -241,6 +241,29 @@ public partial class MainWindow
         await CompleteSceneGlbExportUiAsync(result, exportFolder);
     }
 
+    private static HashSet<ClassIDType> BuildRequiredUnitySceneObjectTypes(
+        bool includeAnimations,
+        bool includeCamerasAndLights,
+        bool resolveStaticScriptSpawns,
+        bool includeUnityProjectExtras)
+    {
+        var required = SceneGlbExportService.GetRequiredSceneObjectTypes(
+            includeAnimations: includeAnimations,
+            exportCamerasAndLights: includeCamerasAndLights,
+            resolveStaticScriptSpawns: resolveStaticScriptSpawns);
+
+        if (includeUnityProjectExtras)
+        {
+            required.Add(ClassIDType.Texture2D);
+            required.Add(ClassIDType.BoxCollider);
+            required.Add(ClassIDType.SphereCollider);
+            required.Add(ClassIDType.CapsuleCollider);
+            required.Add(ClassIDType.MeshCollider);
+        }
+
+        return required;
+    }
+
     internal async Task ExportSceneToUnityProjectCommandHandlerAsync()
     {
         await ExportSceneToUnityProjectCoreAsync(packageOnlyMode: false);
@@ -393,15 +416,11 @@ public partial class MainWindow
                 ctsToken.ThrowIfCancellationRequested();
                 ReportSceneExportProgress(4, $"Loading {selectedBindings.Count} selected scene(s)...");
 
-                var requiredObjectTypes = SceneGlbExportService.GetRequiredSceneObjectTypes(
+                var requiredObjectTypes = BuildRequiredUnitySceneObjectTypes(
                     includeAnimations: exportOptions.ExportAnimations,
-                    exportCamerasAndLights: true,
-                    resolveStaticScriptSpawns: true);
-                requiredObjectTypes.Add(ClassIDType.Texture2D);
-                requiredObjectTypes.Add(ClassIDType.BoxCollider);
-                requiredObjectTypes.Add(ClassIDType.SphereCollider);
-                requiredObjectTypes.Add(ClassIDType.CapsuleCollider);
-                requiredObjectTypes.Add(ClassIDType.MeshCollider);
+                    includeCamerasAndLights: true,
+                    resolveStaticScriptSpawns: true,
+                    includeUnityProjectExtras: true);
 
                 var prepared = PrepareSelectedScenesForExport(
                     selectedBindings,
@@ -411,7 +430,7 @@ public partial class MainWindow
                     cacheFolder,
                     cacheSignature,
                     projectRoot,
-                    includeInactiveRoots: true,
+                    includeInactiveRoots: sceneExportOptions.IncludeInactive,
                     ctsToken);
 
                 if (prepared.RootGameObjects.Count == 0)
@@ -426,20 +445,34 @@ public partial class MainWindow
                     return;
                 }
 
-                // Append any resolved companion stage preset roots cleanly alongside base scene roots.
-                var rootsToExport = new List<GameObject>(prepared.RootGameObjects);
+                // Reuse the exact same SceneScriptSpawnAnalyzer pipeline as Scene .glb export
+                // so script-populated worlds and companion stage presets appear identically in Unity.
+                var mergedSpawnAttachments = new List<SceneScriptSpawnAttachment>();
                 if (prepared.CompanionAttachments is { Count: > 0 })
                 {
-                    var seenExportRoots = new HashSet<GameObject>(rootsToExport);
-                    for (int i = 0; i < prepared.CompanionAttachments.Count; i++)
+                    mergedSpawnAttachments.AddRange(prepared.CompanionAttachments);
+                }
+                if (sceneExportOptions.ResolveStaticScriptSpawns)
+                {
+                    ReportSceneExportProgress(18, $"Analyzing static script spawns for '{displaySceneName}'...");
+                    var scriptSpawnOptions = BuildSceneScriptSpawnAnalysisOptions(
+                        sceneExportOptions,
+                        prepared.DependencyClosure?.AddressablesCatalogs,
+                        projectRoot,
+                        requiredObjectTypes,
+                        ctsToken);
+                    var analyzer = new SceneScriptSpawnAnalyzer();
+                    var spawnAnalysis = analyzer.AnalyzeScene(prepared.RootGameObjects, scriptSpawnOptions, ctsToken);
+                    var analyzedAttachments = spawnAnalysis.ToModelConverterAttachments();
+                    if (analyzedAttachments.Count > 0)
                     {
-                        var prefabRoot = prepared.CompanionAttachments[i]?.PrefabRoot;
-                        if (prefabRoot != null && seenExportRoots.Add(prefabRoot))
-                        {
-                            rootsToExport.Add(prefabRoot);
-                        }
+                        mergedSpawnAttachments.AddRange(analyzedAttachments);
                     }
                 }
+
+                var effectiveIncludeInactive = sceneExportOptions.IncludeInactive
+                    || prepared.UsedInactiveFallback
+                    || !prepared.RootGameObjects.Any(static go => go != null && go.m_IsActive);
 
                 var includeScriptsCallback = BuildUnityProjectIncludeScriptsCallback(
                     includeScriptsInUnityProject,
@@ -452,7 +485,7 @@ public partial class MainWindow
                     OutputDirectory = projectOutputDir,
                     SceneName = outputSceneName,
                     ScenePath = primaryCandidate.ScenePath,
-                    IncludeInactive = true,
+                    IncludeInactive = effectiveIncludeInactive,
                     ExportMeshes = true,
                     ExportTextures = true,
                     ExportMaterials = true,
@@ -471,11 +504,13 @@ public partial class MainWindow
                     AssemblyLoader = assemblyLoader,
                     AdditionalSceneNames = selectedBindings.Skip(1).Select(static b => b.Candidate.Name).ToList(),
                     ResolvedDependencies = prepared.DependencyClosure?.ResolvedDependencies,
-                    MissingDependencies = prepared.DependencyClosure?.MissingDependencies
+                    MissingDependencies = prepared.DependencyClosure?.MissingDependencies,
+                    ScriptSpawnAttachments = mergedSpawnAttachments.Count > 0 ? mergedSpawnAttachments : null,
+                    MaxScriptSpawnInstances = sceneExportOptions.MaxScriptSpawnInstances
                 };
 
                 result = _unityProjectExporterService.ExportSceneToUnityProject(
-                    rootsToExport,
+                    prepared.RootGameObjects,
                     unityOptions,
                     progressCallback: (pct, _, status) =>
                     {
@@ -614,11 +649,11 @@ public partial class MainWindow
                 if (prefabRoot.assetsFile != null)
                 {
                     ReportSceneExportProgress(8, $"Resolving dependencies for prefab '{prefabName}'...");
-                    var requiredObjectTypes = SceneGlbExportService.GetRequiredSceneObjectTypes(
+                    var requiredObjectTypes = BuildRequiredUnitySceneObjectTypes(
                         includeAnimations: exportOptions.ExportAnimations,
-                        exportCamerasAndLights: true,
-                        resolveStaticScriptSpawns: true);
-                    requiredObjectTypes.Add(ClassIDType.Texture2D);
+                        includeCamerasAndLights: true,
+                        resolveStaticScriptSpawns: true,
+                        includeUnityProjectExtras: true);
 
                     depClosure = SceneGlbExportService.ResolveAndLoadSceneDependencies(
                         assetsManager: assetsManager,

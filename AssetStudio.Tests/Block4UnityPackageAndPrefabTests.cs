@@ -392,8 +392,8 @@ namespace AssetStudio.Tests
                 Assert.NotNull(result.Manifest);
                 Assert.Equal(1, result.Manifest!.Statistics.ColliderMeshesExported);
 
-                // Verify mesh OBJ meta also maps fileID 4300000 via internalIDToNameTable (Unity 6000.x + 2019-2022)
-                var crateMeshMeta = File.ReadAllText(Path.Combine(projectOut, "Assets", "Meshes", "SM_Crate.obj.meta"));
+                // Verify mesh FBX meta maps fileID 4300000 via internalIDToNameTable (Unity 6000.x + 2019-2022)
+                var crateMeshMeta = File.ReadAllText(Path.Combine(projectOut, "Assets", "Meshes", "SM_Crate.fbx.meta"));
                 Assert.Contains("43: 4300000", crateMeshMeta);
                 Assert.Contains("second: SM_Crate", crateMeshMeta);
 
@@ -411,12 +411,12 @@ namespace AssetStudio.Tests
                     Assert.True(entryCount > 0);
                 }
 
-                // Verify the generated .unitypackage contains the prefab, mesh, material, texture, collider OBJ, and C# script!
+                // Verify the generated .unitypackage contains the prefab, FBX mesh, material, texture, collider OBJ, and C# script!
                 var pkgInspection = UnityPackageExporterService.InspectUnityPackage(pkgOut);
                 Assert.True(pkgInspection.IsValid, pkgInspection.ErrorMessage);
                 Assert.Contains("Assets/Prefabs/InteractiveCrate.prefab", pkgInspection.Pathnames);
                 Assert.Contains("Assets/Materials/Mat_Crate.mat", pkgInspection.Pathnames);
-                Assert.Contains("Assets/Meshes/SM_Crate.obj", pkgInspection.Pathnames);
+                Assert.Contains("Assets/Meshes/SM_Crate.fbx", pkgInspection.Pathnames);
                 Assert.Contains("Assets/Textures/T_Crate_Albedo.png", pkgInspection.Pathnames);
                 Assert.Contains("Assets/Colliders/InteractiveCrate_Collider_Box.obj", pkgInspection.Pathnames);
                 Assert.Contains(pkgInspection.Pathnames, p => p.EndsWith("InteractableCrate.cs", StringComparison.Ordinal));
@@ -773,11 +773,11 @@ namespace AssetStudio.Tests
                 Assert.Equal(1, lod0Res.Manifest.Statistics.ColliderMeshesExported);
 
                 // Verify exact mesh files exported vs filtered
-                Assert.True(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_Tree_LOD0.obj")));
-                Assert.True(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_Tree_TrunkShared.obj")));
-                Assert.True(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_StandaloneRock.obj")));
-                Assert.False(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_Tree_LOD1.obj")));
-                Assert.False(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_Tree_LOD2.obj")));
+                Assert.True(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_Tree_LOD0.fbx")));
+                Assert.True(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_Tree_TrunkShared.fbx")));
+                Assert.True(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_StandaloneRock.fbx")));
+                Assert.False(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_Tree_LOD1.fbx")));
+                Assert.False(File.Exists(Path.Combine(lod0Dir, "Assets", "Meshes", "SM_Tree_LOD2.fbx")));
 
                 // Verify collider auxiliary mesh exported
                 Assert.True(File.Exists(Path.Combine(lod0Dir, "Assets", "Colliders", "StandaloneRock_Collider_Sphere.obj")));
@@ -808,9 +808,9 @@ namespace AssetStudio.Tests
                 Assert.True(lod1Res.Success, lod1Res.ErrorMessage);
                 Assert.Equal(3, lod1Res.Manifest!.Statistics.MeshRenderers); // LOD1 + Shared + StandaloneRock
                 Assert.Equal(2, lod1Res.Manifest.Statistics.RenderersSkippedByLodFilter); // LOD0 + LOD2
-                Assert.True(File.Exists(Path.Combine(lod1Dir, "Assets", "Meshes", "SM_Tree_LOD1.obj")));
-                Assert.False(File.Exists(Path.Combine(lod1Dir, "Assets", "Meshes", "SM_Tree_LOD0.obj")));
-                Assert.False(File.Exists(Path.Combine(lod1Dir, "Assets", "Meshes", "SM_Tree_LOD2.obj")));
+                Assert.True(File.Exists(Path.Combine(lod1Dir, "Assets", "Meshes", "SM_Tree_LOD1.fbx")));
+                Assert.False(File.Exists(Path.Combine(lod1Dir, "Assets", "Meshes", "SM_Tree_LOD0.fbx")));
+                Assert.False(File.Exists(Path.Combine(lod1Dir, "Assets", "Meshes", "SM_Tree_LOD2.fbx")));
 
                 var expectedDefaultPkg = Path.GetFullPath(lod1Dir) + ".unitypackage";
                 Assert.Equal(expectedDefaultPkg, lod1Res.UnityPackagePath);
@@ -818,7 +818,7 @@ namespace AssetStudio.Tests
                 var defaultPkgInspect = UnityPackageExporterService.InspectUnityPackage(expectedDefaultPkg);
                 Assert.True(defaultPkgInspect.IsValid, defaultPkgInspect.ErrorMessage);
                 Assert.Contains("Assets/Scenes/ForestLod1.unity", defaultPkgInspect.Pathnames);
-                Assert.Contains("Assets/Meshes/SM_Tree_LOD1.obj", defaultPkgInspect.Pathnames);
+                Assert.Contains("Assets/Meshes/SM_Tree_LOD1.fbx", defaultPkgInspect.Pathnames);
             }
             finally
             {

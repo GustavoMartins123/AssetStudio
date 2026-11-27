@@ -23,7 +23,7 @@ namespace AssetStudio
 
         public static void ExportFbx(string path, IImported imported,
             bool skins, bool animation, bool blendShape, bool castToBone, float boneSize, float scaleFactor, int versionIndex, bool isAscii,
-            bool combineMeshes = false)
+            bool combineMeshes = false, bool writeExportReport = true)
         {
             var exportSource = imported;
             if (combineMeshes && imported != null && imported.MeshList != null && imported.MeshList.Count > 1)
@@ -32,7 +32,7 @@ namespace AssetStudio
             }
 
             var exporter = new FbxSharpieExporter(path, scaleFactor, versionIndex, isAscii, false,
-                skins, animation, blendShape, castToBone, boneSize);
+                skins, animation, blendShape, castToBone, boneSize, exportMeshes: true, writeExportReport: writeExportReport);
             exporter.Export(exportSource!, path);
         }
 

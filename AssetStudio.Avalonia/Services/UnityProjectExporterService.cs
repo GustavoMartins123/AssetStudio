@@ -10,6 +10,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using System.Threading.Tasks;
 using AssetStudio.Avalonia.Services.Scripting;
 
 namespace AssetStudio.Avalonia.Services;
@@ -66,6 +67,39 @@ public sealed class UnityProjectExportOptions
     public IReadOnlyList<string>? AdditionalSceneNames { get; init; }
     public IReadOnlyList<string>? ResolvedDependencies { get; init; }
     public IReadOnlyList<string>? MissingDependencies { get; init; }
+    public IReadOnlyList<SceneScriptSpawnAttachment>? ScriptSpawnAttachments { get; init; }
+    public int MaxScriptSpawnInstances { get; init; } = 512;
+
+    /// <summary>
+    /// Maximum nesting depth when serializing MonoBehaviour YAML fields (protects against pathological/corrupted graphs).
+    /// Any field reaching this limit is explicitly recorded in <see cref="UnityProjectExportResult.TruncationDiagnostics"/>.
+    /// </summary>
+    public int MaxYamlSerializationDepth { get; init; } = 64;
+
+    /// <summary>
+    /// Optional cap on elements per collection/dictionary in MonoBehaviour YAML export.
+    /// 0 (default) streams all elements with zero truncation. Positive values cap output and record explicit truncation diagnostics.
+    /// </summary>
+    public int MaxYamlCollectionElements { get; init; } = 0;
+
+    /// <summary>
+    /// Optional cap on bytes written for byte[] fields in MonoBehaviour YAML export.
+    /// 0 (default) streams the entire byte array in chunks with zero truncation. Positive values cap output and record explicit truncation diagnostics.
+    /// </summary>
+    public int MaxYamlByteArrayLength { get; init; } = 0;
+}
+
+public sealed class UnityProjectTruncationDiagnostic
+{
+    public string AssetName { get; init; } = string.Empty;
+    public string AssetType { get; init; } = "MonoBehaviour";
+    public string SourceFile { get; init; } = string.Empty;
+    public long PathId { get; init; }
+    public string FieldPath { get; init; } = string.Empty;
+    public string LimitKind { get; init; } = string.Empty;
+    public int LimitValue { get; init; }
+    public int TotalCount { get; init; }
+    public int OmittedCount { get; init; }
 }
 
 public sealed class UnityProjectShaderReference
@@ -127,18 +161,22 @@ public sealed class UnityProjectExportManifest
     public List<string> ResolvedDependencies { get; init; } = new();
     public List<string> MissingDependencies { get; init; } = new();
     public List<SceneExportMissingAsset> MissingAssets { get; init; } = new();
+    public bool IsPartial { get; init; }
+    public List<UnityProjectTruncationDiagnostic> TruncationDiagnostics { get; init; } = new();
     public UnityProjectScriptExportSummary? ScriptExportSummary { get; init; }
 }
 
 public sealed class UnityProjectExportResult
 {
     public bool Success { get; init; }
+    public bool IsPartial { get; init; }
     public string OutputDirectory { get; init; } = string.Empty;
     public string SceneFilePath { get; init; } = string.Empty;
     public string? PrefabFilePath { get; init; }
     public string? UnityPackagePath { get; init; }
     public string? ManifestPath { get; init; }
     public UnityProjectExportManifest? Manifest { get; init; }
+    public List<UnityProjectTruncationDiagnostic> TruncationDiagnostics { get; init; } = new();
     public string SceneName { get; init; } = string.Empty;
     public string SummaryMessage { get; init; } = string.Empty;
     public string? ErrorMessage { get; init; }
@@ -146,14 +184,13 @@ public sealed class UnityProjectExportResult
 
 /// <summary>
 /// Exports a Unity scene graph directly into an openable Unity project directory containing valid
-/// Unity YAML 1.1 scene (.unity), materials (.mat), meshes (.obj), textures (.png), .meta files with
+/// Unity YAML 1.1 scene (.unity), materials (.mat), meshes (.fbx), textures (.png), .meta files with
 /// deterministic GUIDs, ProjectSettings (ProjectVersion.txt &amp; TagManager.asset), and ExportManifest.json.
 /// </summary>
 public sealed class UnityProjectExporterService
 {
     private const int StreamWriterBufferSize = 65_536;
-    private const int MaxYamlSerializationDepth = 12;
-    private const int MaxYamlCollectionElements = 256;
+    private const int YamlHexChunkBytes = 4096;
     private const int MaxSanitizedFileNameLength = 96;
     private const string DefaultFallbackUnityVersion = "2022.3.0f1";
 
@@ -399,16 +436,26 @@ public sealed class UnityProjectExporterService
             var state = new ExportState(rootDirWithSep, options, prefabRoot);
             var unityVersion = DetectUnityVersion(rootGameObjects, options.UnityVersion);
 
-            // Pass 0: Optional LODGroup filtering pre-pass so excluded non-target LOD renderers are skipped cleanly.
+            // Pass 0: Shared LODGroup filtering pre-pass (reuses ModelConverter.ComputeLodGroupExclusions).
             if (options.TargetLodLevel.HasValue)
             {
                 progressCallback?.Invoke(3, 100, $"Inspecting LODGroups for LOD{Math.Max(0, options.TargetLodLevel.Value)} filtering...");
-                CollectLodGroupFilteringState(rootGameObjects, state, cancellationToken);
+                var lodExclusions = ModelConverter.ComputeLodGroupExclusions(
+                    rootGameObjects,
+                    targetLodLevel: Math.Max(0, options.TargetLodLevel.Value),
+                    includeInactive: options.IncludeInactive,
+                    cancellationToken: cancellationToken);
+                state.LodExclusions = lodExclusions;
+                state.LodGroupsFiltered = lodExclusions.FilteredLodGroupCount;
             }
 
             // Pass 1: Traverse hierarchy iteratively, assign deterministic positive fileIDs, and index all unique assets.
             progressCallback?.Invoke(8, 100, $"Indexing {(isPrefabExport ? "prefab" : "scene")} '{safePrimaryName}' hierarchy...");
             CollectSceneGraph(rootGameObjects, state, cancellationToken);
+            if (!isPrefabExport && options.ScriptSpawnAttachments is { Count: > 0 })
+            {
+                AttachScriptSpawnedSubtrees(options.ScriptSpawnAttachments, state, cancellationToken);
+            }
 
             if (state.SceneNodes.Count == 0)
             {
@@ -566,19 +613,27 @@ public sealed class UnityProjectExporterService
             var destinationLabel = !string.IsNullOrEmpty(unityPackagePath)
                 ? $"{rootDirFull} (package: {unityPackagePath})"
                 : rootDirFull;
+            var isPartial = state.TruncationDiagnostics.Count > 0;
+            var truncationNote = isPartial
+                ? string.Create(
+                    CultureInfo.InvariantCulture,
+                    $" [PARTIAL: {state.TruncationDiagnostics.Count:N0} truncated field(s), {state.TruncationDiagnostics.Sum(static t => t.OmittedCount):N0} omitted item(s)]")
+                : string.Empty;
             var summary = string.Create(
                 CultureInfo.InvariantCulture,
-                $"Exported {exportKindLabel} '{safePrimaryName}' ({sw.ElapsedMilliseconds:N0} ms): {stats.GameObjects:N0} GameObjects ({stats.InactiveGameObjects:N0} inactive), {stats.UniqueMeshes:N0} meshes, {stats.UniqueMaterials:N0} materials, {stats.UniqueTextures:N0} textures, {stats.Terrains:N0} terrains, {stats.MonoBehaviours:N0} scripts -> {destinationLabel}");
+                $"Exported {exportKindLabel} '{safePrimaryName}' ({sw.ElapsedMilliseconds:N0} ms): {stats.GameObjects:N0} GameObjects ({stats.InactiveGameObjects:N0} inactive), {stats.UniqueMeshes:N0} meshes, {stats.UniqueMaterials:N0} materials, {stats.UniqueTextures:N0} textures, {stats.Terrains:N0} terrains, {stats.MonoBehaviours:N0} scripts{truncationNote} -> {destinationLabel}");
 
             return new UnityProjectExportResult
             {
                 Success = true,
+                IsPartial = isPartial,
                 OutputDirectory = rootDirFull,
                 SceneFilePath = sceneFilePath,
                 PrefabFilePath = prefabFilePath,
                 UnityPackagePath = unityPackagePath,
                 ManifestPath = manifestPath,
                 Manifest = manifest,
+                TruncationDiagnostics = new List<UnityProjectTruncationDiagnostic>(state.TruncationDiagnostics),
                 SceneName = safePrimaryName,
                 SummaryMessage = summary
             };
@@ -610,6 +665,11 @@ public sealed class UnityProjectExporterService
         public Transform? Transform { get; init; }
         public long TransformFileId { get; init; }
         public int RootOrder { get; set; }
+        public long? OverrideFatherFileId { get; init; }
+        public Vector3? OverrideLocalPosition { get; init; }
+        public Quaternion? OverrideLocalRotation { get; init; }
+        public Vector3? OverrideLocalScale { get; init; }
+        public List<long>? ExtraChildTransformFileIds { get; set; }
         public List<ExportedComponentRecord> Components { get; } = new();
     }
 
@@ -649,6 +709,7 @@ public sealed class UnityProjectExporterService
         public required Mesh Mesh { get; init; }
         public required string Guid { get; init; }
         public required string SafeName { get; init; }
+        public bool RequiresSkinning { get; set; }
         public bool Exported { get; set; }
     }
 
@@ -709,9 +770,12 @@ public sealed class UnityProjectExporterService
         public List<SceneNodeRecord> SceneNodes { get; } = new();
         public Dictionary<AssetStudio.Object, long> LocalFileIdByObject { get; } = new(ReferenceEqualityComparer.Instance);
         public Dictionary<(string FileName, long PathId), long> LocalFileIdByKey { get; } = new();
+        public Dictionary<GameObject, SceneNodeRecord> SceneNodeByGameObject { get; } = new(ReferenceEqualityComparer.Instance);
+        public Dictionary<Transform, SceneNodeRecord> SceneNodeByTransform { get; } = new(ReferenceEqualityComparer.Instance);
+        public Dictionary<long, SceneNodeRecord> SceneNodeByGameObjectPathId { get; } = new();
+        public Dictionary<long, SceneNodeRecord> SceneNodeByTransformPathId { get; } = new();
 
-        public HashSet<Renderer> ExcludedLodRenderers { get; } = new(ReferenceEqualityComparer.Instance);
-        public HashSet<(string FileName, long PathId)> ExcludedLodRendererIds { get; } = new();
+        public LodGroupExclusionResult? LodExclusions { get; set; }
 
         public Dictionary<(string FileName, long PathId), ExportedMeshAsset> MeshesByKey { get; } = new();
         public Dictionary<Mesh, ExportedMeshAsset> MeshesByRef { get; } = new(ReferenceEqualityComparer.Instance);
@@ -741,6 +805,7 @@ public sealed class UnityProjectExporterService
         public Dictionary<string, ScriptUsageCounter> ScriptUsage { get; } = new(StringComparer.Ordinal);
         public HashSet<(string Type, long PathId, string SourceFile)> MissingAssetKeys { get; } = new();
         public List<SceneExportMissingAsset> MissingAssets { get; } = new();
+        public List<UnityProjectTruncationDiagnostic> TruncationDiagnostics { get; } = new();
 
         public int ActiveGameObjects;
         public int InactiveGameObjects;
@@ -824,367 +889,170 @@ public sealed class UnityProjectExporterService
         }
     }
 
-    // =========================================================================
-    // Pass 0: LODGroup Inspection & Target LOD Filtering (MESH-11)
-    // =========================================================================
+    private static bool IsRendererExcludedByLodFilter(Renderer renderer, ExportState state)
+        => state.LodExclusions != null && state.LodExclusions.IsExcluded(renderer);
 
-    private static void CollectLodGroupFilteringState(
-        IReadOnlyList<GameObject> rootGameObjects,
+    private static void AttachScriptSpawnedSubtrees(
+        IReadOnlyList<SceneScriptSpawnAttachment> attachments,
         ExportState state,
         CancellationToken cancellationToken)
     {
-        if (!state.Options.TargetLodLevel.HasValue)
-        {
-            return;
-        }
+        int maxInstances = Math.Max(1, state.Options.MaxScriptSpawnInstances);
+        int attachedCount = 0;
 
-        int requestedLod = Math.Max(0, state.Options.TargetLodLevel.Value);
-        var visited = new HashSet<GameObject>(ReferenceEqualityComparer.Instance);
-        var stack = new Stack<GameObject>();
-        var keptRenderers = new HashSet<Renderer>(ReferenceEqualityComparer.Instance);
-        var keptRendererIds = new HashSet<(string FileName, long PathId)>();
-        var perGroupCandidates = new List<(List<Renderer> Renderers, List<(string FileName, long PathId)> Keys)>();
-
-        for (int i = rootGameObjects.Count - 1; i >= 0; i--)
-        {
-            if (rootGameObjects[i] != null)
-            {
-                stack.Push(rootGameObjects[i]);
-            }
-        }
-
-        while (stack.Count > 0)
+        for (int a = 0; a < attachments.Count && attachedCount < maxInstances; a++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var go = stack.Pop();
-            if (go == null || !visited.Add(go))
+            var att = attachments[a];
+            if (att?.PrefabRoot == null)
             {
                 continue;
             }
 
-            if (!state.Options.IncludeInactive && !go.m_IsActive)
+            SceneNodeRecord? anchorNode = null;
+            if (att.AnchorTransform != null && state.SceneNodeByTransform.TryGetValue(att.AnchorTransform, out var byTr))
             {
-                continue;
+                anchorNode = byTr;
+            }
+            else if (att.OwnerGameObject != null && state.SceneNodeByGameObject.TryGetValue(att.OwnerGameObject, out var byGo))
+            {
+                anchorNode = byGo;
+            }
+            else if (att.AnchorTransformPathId != 0 && state.SceneNodeByTransformPathId.TryGetValue(att.AnchorTransformPathId, out var byTrId))
+            {
+                anchorNode = byTrId;
+            }
+            else if (att.OwnerPathId != 0 && state.SceneNodeByGameObjectPathId.TryGetValue(att.OwnerPathId, out var byGoId))
+            {
+                anchorNode = byGoId;
             }
 
-            SceneGlbExportService.EnsureGameObjectComponentsLinked(go);
+            long parentTransformFileId = anchorNode?.TransformFileId ?? 0;
+            int siblingOrder = anchorNode?.ExtraChildTransformFileIds?.Count ?? 0;
 
-            if (go.m_Components != null)
+            var localVisited = new HashSet<GameObject>(ReferenceEqualityComparer.Instance);
+            var stack = new Stack<(GameObject Go, long FatherTransformId, int SiblingOrder, bool IsSpawnRoot, SceneNodeRecord? ParentRecord)>();
+            stack.Push((att.PrefabRoot, parentTransformFileId, siblingOrder, true, anchorNode));
+
+            while (stack.Count > 0)
             {
-                for (int c = 0; c < go.m_Components.Length; c++)
+                cancellationToken.ThrowIfCancellationRequested();
+                var (go, fatherTrId, order, isSpawnRoot, parentRecord) = stack.Pop();
+                if (go == null || !localVisited.Add(go))
                 {
-                    var compPtr = go.m_Components[c];
-                    if (compPtr == null || compPtr.IsNull)
+                    continue;
+                }
+
+                if (!state.Options.IncludeInactive && !go.m_IsActive)
+                {
+                    continue;
+                }
+
+                SceneGlbExportService.EnsureGameObjectComponentsLinked(go);
+
+                if (go.m_IsActive) state.ActiveGameObjects++;
+                else state.InactiveGameObjects++;
+
+                if (go.m_Layer >= 0 && go.m_Layer < 32) state.UsedLayers.Add(go.m_Layer);
+                var tagString = ResolveUnityTagString(go.m_Tag);
+                if (go.m_Tag >= 20000) state.UsedCustomTags.Add(tagString);
+
+                var goFileId = state.AllocateFileId();
+                var tr = go.m_Transform;
+                long trFileId = 0;
+                if (tr != null)
+                {
+                    trFileId = state.AllocateFileId();
+                    state.TransformCount++;
+                }
+
+                Vector3? posOverride = null;
+                Quaternion? rotOverride = null;
+                Vector3? scaleOverride = null;
+                if (isSpawnRoot && tr != null)
+                {
+                    posOverride = tr.m_LocalPosition + att.LocalPositionOffset;
+                    rotOverride = MultiplyQuaternions(tr.m_LocalRotation, att.LocalRotationOffset);
+                    scaleOverride = new Vector3(
+                        tr.m_LocalScale.X * att.LocalScaleMultiplier.X,
+                        tr.m_LocalScale.Y * att.LocalScaleMultiplier.Y,
+                        tr.m_LocalScale.Z * att.LocalScaleMultiplier.Z);
+                }
+
+                var nodeRecord = new SceneNodeRecord
+                {
+                    GameObject = go,
+                    GameObjectFileId = goFileId,
+                    Transform = tr,
+                    TransformFileId = trFileId,
+                    RootOrder = order,
+                    OverrideFatherFileId = fatherTrId,
+                    OverrideLocalPosition = posOverride,
+                    OverrideLocalRotation = rotOverride,
+                    OverrideLocalScale = scaleOverride
+                };
+
+                if (tr != null)
+                {
+                    nodeRecord.Components.Add(new ExportedComponentRecord
                     {
-                        continue;
+                        Kind = tr is RectTransform ? ExportedComponentKind.RectTransform : ExportedComponentKind.Transform,
+                        FileId = trFileId,
+                        OwnerGameObjectFileId = goFileId,
+                        SourceObject = tr
+                    });
+
+                    if (parentRecord != null)
+                    {
+                        parentRecord.ExtraChildTransformFileIds ??= new List<long>();
+                        parentRecord.ExtraChildTransformFileIds.Add(trFileId);
                     }
+                }
 
-                    var compObj = ResolveComponentObject(go, compPtr);
-                    if (compObj == null || (compObj is not LODGroup && compObj.type != ClassIDType.LODGroup))
+                if (go.m_Components != null)
+                {
+                    for (int c = 0; c < go.m_Components.Length; c++)
                     {
-                        continue;
+                        var compPtr = go.m_Components[c];
+                        if (compPtr == null || compPtr.IsNull) continue;
+                        var compObj = ResolveComponentObject(go, compPtr);
+                        if (compObj == null || ReferenceEquals(compObj, tr)) continue;
+                        RegisterComponentForNode(go, nodeRecord, compObj, state);
                     }
+                }
 
-                    if (compObj is LODGroup typedLod && !typedLod.m_Enabled)
+                state.SceneNodes.Add(nodeRecord);
+
+                if (tr?.m_Children != null && tr.m_Children.Length > 0)
+                {
+                    for (int i = tr.m_Children.Length - 1; i >= 0; i--)
                     {
-                        continue;
-                    }
-
-                    var lods = ExtractLodLevels(compObj);
-                    if (lods.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    int selectedIndex = SelectTargetLodIndex(lods, requestedLod);
-                    if (selectedIndex < 0)
-                    {
-                        continue;
-                    }
-
-                    var groupExcludedRends = new List<Renderer>();
-                    var groupExcludedKeys = new List<(string FileName, long PathId)>();
-
-                    for (int l = 0; l < lods.Count; l++)
-                    {
-                        var lod = lods[l];
-                        if (lod?.renderers == null || lod.renderers.Length == 0)
+                        var childPtr = tr.m_Children[i];
+                        if (childPtr == null || childPtr.IsNull) continue;
+                        var childTr = ResolveTransform(tr, childPtr);
+                        if (childTr?.m_GameObject != null && !childTr.m_GameObject.IsNull)
                         {
-                            continue;
-                        }
-
-                        bool isTargetTier = l == selectedIndex;
-                        for (int r = 0; r < lod.renderers.Length; r++)
-                        {
-                            var rPtr = lod.renderers[r];
-                            if (rPtr == null || rPtr.IsNull)
+                            var childGo = ResolveGameObject(childTr, childTr.m_GameObject);
+                            if (childGo != null)
                             {
-                                continue;
-                            }
-
-                            var resolvedRend = ResolveRendererPPtr(compObj, rPtr);
-                            var key = resolvedRend != null && resolvedRend.m_PathID != 0
-                                ? (resolvedRend.assetsFile?.fileName ?? string.Empty, resolvedRend.m_PathID)
-                                : (ResolvePPtrFileName(compObj.assetsFile, rPtr.m_FileID), rPtr.m_PathID);
-
-                            if (isTargetTier)
-                            {
-                                if (resolvedRend != null) keptRenderers.Add(resolvedRend);
-                                if (key.Item2 != 0) keptRendererIds.Add(key);
-                            }
-                            else
-                            {
-                                if (resolvedRend != null)
-                                {
-                                    state.ExcludedLodRenderers.Add(resolvedRend);
-                                    groupExcludedRends.Add(resolvedRend);
-                                }
-                                if (key.Item2 != 0)
-                                {
-                                    state.ExcludedLodRendererIds.Add(key);
-                                    groupExcludedKeys.Add(key);
-                                }
+                                stack.Push((childGo, trFileId, i, false, nodeRecord));
                             }
                         }
                     }
-
-                    if (groupExcludedRends.Count > 0 || groupExcludedKeys.Count > 0)
-                    {
-                        perGroupCandidates.Add((groupExcludedRends, groupExcludedKeys));
-                    }
                 }
             }
 
-            var tr = go.m_Transform;
-            if (tr?.m_Children != null && tr.m_Children.Length > 0)
-            {
-                for (int i = tr.m_Children.Length - 1; i >= 0; i--)
-                {
-                    var childPtr = tr.m_Children[i];
-                    if (childPtr == null || childPtr.IsNull)
-                    {
-                        continue;
-                    }
-
-                    var childTr = ResolveTransform(tr, childPtr);
-                    if (childTr?.m_GameObject != null && !childTr.m_GameObject.IsNull)
-                    {
-                        var childGo = ResolveGameObject(childTr, childTr.m_GameObject);
-                        if (childGo != null)
-                        {
-                            stack.Push(childGo);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Renderers shared with the target LOD tier (e.g. present in both LOD0 and LOD1) are ALWAYS kept.
-        state.ExcludedLodRenderers.ExceptWith(keptRenderers);
-        state.ExcludedLodRendererIds.ExceptWith(keptRendererIds);
-
-        for (int i = 0; i < perGroupCandidates.Count; i++)
-        {
-            var (rends, keys) = perGroupCandidates[i];
-            bool anyExcluded = false;
-            for (int r = 0; r < rends.Count; r++)
-            {
-                if (state.ExcludedLodRenderers.Contains(rends[r]))
-                {
-                    anyExcluded = true;
-                    break;
-                }
-            }
-            if (!anyExcluded)
-            {
-                for (int k = 0; k < keys.Count; k++)
-                {
-                    if (state.ExcludedLodRendererIds.Contains(keys[k]))
-                    {
-                        anyExcluded = true;
-                        break;
-                    }
-                }
-            }
-
-            if (anyExcluded)
-            {
-                state.LodGroupsFiltered++;
-            }
+            attachedCount++;
         }
     }
 
-    private static int SelectTargetLodIndex(IReadOnlyList<LOD> lods, int requestedLod)
+    private static Quaternion MultiplyQuaternions(Quaternion a, Quaternion b)
     {
-        static bool HasRenderers(LOD? lod)
-        {
-            if (lod?.renderers == null || lod.renderers.Length == 0)
-            {
-                return false;
-            }
-            for (int i = 0; i < lod.renderers.Length; i++)
-            {
-                if (lod.renderers[i] != null && !lod.renderers[i].IsNull)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if (requestedLod >= 0 && requestedLod < lods.Count && HasRenderers(lods[requestedLod]))
-        {
-            return requestedLod;
-        }
-
-        for (int i = Math.Min(requestedLod + 1, lods.Count); i < lods.Count; i++)
-        {
-            if (HasRenderers(lods[i]))
-            {
-                return i;
-            }
-        }
-
-        for (int i = Math.Min(requestedLod - 1, lods.Count - 1); i >= 0; i--)
-        {
-            if (HasRenderers(lods[i]))
-            {
-                return i;
-            }
-        }
-
-        return -1;
-    }
-
-    private static List<LOD> ExtractLodLevels(AssetStudio.Object lodGroupObj)
-    {
-        if (lodGroupObj is LODGroup typed && typed.m_LODs is { Length: > 0 })
-        {
-            var list = new List<LOD>(typed.m_LODs.Length);
-            for (int i = 0; i < typed.m_LODs.Length; i++)
-            {
-                if (typed.m_LODs[i] != null)
-                {
-                    list.Add(typed.m_LODs[i]);
-                }
-            }
-            if (list.Count > 0)
-            {
-                return list;
-            }
-        }
-
-        // TypeTree fallback when LODGroup m_LODs wasn't populated via binary constructor.
-        if (lodGroupObj.serializedType?.m_Type?.m_Nodes is { Count: > 0 })
-        {
-            try
-            {
-                var dict = lodGroupObj.ToType(lodGroupObj.serializedType.m_Type);
-                if (dict != null && dict.Contains("m_LODs") && dict["m_LODs"] is IEnumerable lodItems && dict["m_LODs"] is not string)
-                {
-                    var result = new List<LOD>();
-                    foreach (var lodItem in lodItems)
-                    {
-                        if (lodItem is not IDictionary lodDict)
-                        {
-                            continue;
-                        }
-
-                        var lod = new LOD();
-                        if (TryReadFloat(lodDict, "screenRelativeHeight", out var screenHeight)
-                            || TryReadFloat(lodDict, "screenRelativeTransitionHeight", out screenHeight))
-                        {
-                            lod.screenRelativeHeight = screenHeight;
-                        }
-                        if (TryReadFloat(lodDict, "fadeTransitionWidth", out var fadeWidth))
-                        {
-                            lod.fadeTransitionWidth = fadeWidth;
-                        }
-
-                        var renderers = new List<PPtr<Renderer>>();
-                        if (lodDict.Contains("renderers") && lodDict["renderers"] is IEnumerable rendItems && lodDict["renderers"] is not string)
-                        {
-                            foreach (var rendItem in rendItems)
-                            {
-                                if (rendItem is not IDictionary rendDict)
-                                {
-                                    continue;
-                                }
-
-                                IDictionary pptrDict = rendDict.Contains("renderer") && rendDict["renderer"] is IDictionary inner
-                                    ? inner
-                                    : rendDict;
-                                if (pptrDict.Contains("m_FileID") && pptrDict.Contains("m_PathID")
-                                    && TryConvertInt(pptrDict["m_FileID"], out int fId)
-                                    && TryConvertLong(pptrDict["m_PathID"], out long pId)
-                                    && pId != 0)
-                                {
-                                    renderers.Add(new PPtr<Renderer>(fId, pId, lodGroupObj.assetsFile));
-                                }
-                            }
-                        }
-
-                        lod.renderers = renderers.ToArray();
-                        result.Add(lod);
-                    }
-                    return result;
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        return new List<LOD>();
-    }
-
-    private static Renderer? ResolveRendererPPtr(AssetStudio.Object ownerObj, PPtr<Renderer> rendPtr)
-    {
-        if (rendPtr.TryGet(out var rend) && rend != null)
-        {
-            return rend;
-        }
-
-        if (rendPtr.m_FileID == 0 && ownerObj.assetsFile != null
-            && ownerObj.assetsFile.TryGetObject(rendPtr.m_PathID, out var localObj)
-            && localObj is Renderer localRend)
-        {
-            return localRend;
-        }
-
-        foreach (var sf in SnapshotAssetsFiles(ownerObj.assetsFile?.assetsManager))
-        {
-            if (sf.TryGetObject(rendPtr.m_PathID, out var found) && found is Renderer foundRend)
-            {
-                return foundRend;
-            }
-        }
-
-        return null;
-    }
-
-    private static bool IsRendererExcludedByLodFilter(Renderer renderer, ExportState state)
-    {
-        if (state.ExcludedLodRenderers.Count == 0 && state.ExcludedLodRendererIds.Count == 0)
-        {
-            return false;
-        }
-
-        if (state.ExcludedLodRenderers.Contains(renderer))
-        {
-            return true;
-        }
-
-        if (renderer.m_PathID != 0)
-        {
-            var key = (renderer.assetsFile?.fileName ?? string.Empty, renderer.m_PathID);
-            if (state.ExcludedLodRendererIds.Contains(key))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return new Quaternion(
+            a.W * b.X + a.X * b.W + a.Y * b.Z - a.Z * b.Y,
+            a.W * b.Y - a.X * b.Z + a.Y * b.W + a.Z * b.X,
+            a.W * b.Z + a.X * b.Y - a.Y * b.X + a.Z * b.W,
+            a.W * b.W - a.X * b.X - a.Y * b.Y - a.Z * b.Z);
     }
 
     // =========================================================================
@@ -1292,6 +1160,13 @@ public sealed class UnityProjectExporterService
             }
 
             state.SceneNodes.Add(nodeRecord);
+            state.SceneNodeByGameObject.TryAdd(go, nodeRecord);
+            if (go.m_PathID != 0) state.SceneNodeByGameObjectPathId.TryAdd(go.m_PathID, nodeRecord);
+            if (tr != null)
+            {
+                state.SceneNodeByTransform.TryAdd(tr, nodeRecord);
+                if (tr.m_PathID != 0) state.SceneNodeByTransformPathId.TryAdd(tr.m_PathID, nodeRecord);
+            }
 
             // Push Transform children in reverse so they pop in exact Unity sibling order.
             if (tr?.m_Children != null && tr.m_Children.Length > 0)
@@ -1415,7 +1290,7 @@ public sealed class UnityProjectExporterService
 
                 var mesh = ResolveMeshForRenderer(go, smr, state);
                 ExportedMeshAsset? exportedMesh = state.Options.ExportMeshes && mesh != null
-                    ? RegisterMeshAsset(mesh, state)
+                    ? RegisterMeshAsset(mesh, state, requiresSkinning: true)
                     : null;
                 if (mesh == null && smr.m_Mesh != null && !smr.m_Mesh.IsNull)
                 {
@@ -1633,10 +1508,11 @@ public sealed class UnityProjectExporterService
         }
     }
 
-    private static ExportedMeshAsset RegisterMeshAsset(Mesh mesh, ExportState state)
+    private static ExportedMeshAsset RegisterMeshAsset(Mesh mesh, ExportState state, bool requiresSkinning = false)
     {
         if (state.MeshesByRef.TryGetValue(mesh, out var byRef))
         {
+            if (requiresSkinning) byRef.RequiresSkinning = true;
             return byRef;
         }
 
@@ -1644,6 +1520,7 @@ public sealed class UnityProjectExporterService
         var key = (sfName, mesh.m_PathID);
         if (mesh.m_PathID != 0 && state.MeshesByKey.TryGetValue(key, out var existing))
         {
+            if (requiresSkinning) existing.RequiresSkinning = true;
             state.MeshesByRef[mesh] = existing;
             return existing;
         }
@@ -1654,7 +1531,8 @@ public sealed class UnityProjectExporterService
         {
             Mesh = mesh,
             Guid = guid,
-            SafeName = safeName
+            SafeName = safeName,
+            RequiresSkinning = requiresSkinning
         };
 
         state.MeshesByRef[mesh] = asset;
@@ -1690,7 +1568,7 @@ public sealed class UnityProjectExporterService
             Texture = tex,
             Guid = guid,
             SafeName = safeName,
-            IsNormalMap = isNormalMap || LooksLikeNormalMapName(tex.m_Name)
+            IsNormalMap = isNormalMap || ModelConverter.IsLikelyNormalMapTextureAssetName(tex.m_Name)
         };
 
         state.TexturesByRef[tex] = asset;
@@ -1760,7 +1638,7 @@ public sealed class UnityProjectExporterService
                     var tex2d = ResolveMaterialTexture(mat, propName, texEnv.m_Texture, state);
                     if (tex2d != null)
                     {
-                        bool isNormalProp = IsNormalMapPropertyName(propName);
+                        bool isNormalProp = ModelConverter.GetTextureDestination(propName) == 1;
                         texAsset = RegisterTextureAsset(tex2d, isNormalProp, state);
                     }
                     else if (texEnv.m_Texture != null && !texEnv.m_Texture.IsNull)
@@ -1930,32 +1808,82 @@ public sealed class UnityProjectExporterService
 
     private static void ExportTextures(ExportState state, string texturesDir, CancellationToken cancellationToken)
     {
-        for (int i = 0; i < state.TexturesToExport.Count; i++)
+        int total = state.TexturesToExport.Count;
+        if (total == 0)
+        {
+            return;
+        }
+
+        // Follow ModelConverter.FlushPendingTextures's proven two-phase pattern in bounded chunks:
+        // Phase A (sequential, thread-safe on shared asset/.resS readers) decodes Texture2D into SKBitmap;
+        // Phase B (parallel across CPU cores) encodes PNG + writes .meta and immediately disposes bitmaps.
+        const int chunkSize = 16;
+        var parallelOpts = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount, 1, 8),
+            CancellationToken = cancellationToken
+        };
+
+        var batch = new List<(ExportedTextureAsset Asset, string PngPath, string MetaPath, SkiaSharp.SKBitmap Bitmap)>(chunkSize);
+        for (int start = 0; start < total; start += chunkSize)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var asset = state.TexturesToExport[i];
-            var pngPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(texturesDir, asset.SafeName + ".png"));
-            var metaPath = EnsureConfinedPath(state.RootDirWithSep, pngPath + ".meta");
+            batch.Clear();
 
+            int end = Math.Min(total, start + chunkSize);
+            for (int i = start; i < end; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var asset = state.TexturesToExport[i];
+                var pngPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(texturesDir, asset.SafeName + ".png"));
+                var metaPath = EnsureConfinedPath(state.RootDirWithSep, pngPath + ".meta");
+                try
+                {
+                    var bmp = asset.Texture.ConvertToImage(flip: true, unpackNormalMap: true, forceNormalMapUnpack: asset.IsNormalMap);
+                    if (bmp != null)
+                    {
+                        batch.Add((asset, pngPath, metaPath, bmp));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"UnityProjectExporter: failed to decode texture '{asset.SafeName}': {ex.Message}");
+                }
+            }
+
+            if (batch.Count == 0)
+            {
+                continue;
+            }
+
+            if (batch.Count == 1)
+            {
+                WriteDecodedTextureItem(batch[0]);
+            }
+            else
+            {
+                Parallel.ForEach(batch, parallelOpts, WriteDecodedTextureItem);
+            }
+        }
+    }
+
+    private static void WriteDecodedTextureItem((ExportedTextureAsset Asset, string PngPath, string MetaPath, SkiaSharp.SKBitmap Bitmap) item)
+    {
+        using (item.Bitmap)
+        {
             try
             {
-                using var bmp = asset.Texture.ConvertToImage(flip: true, unpackNormalMap: true, forceNormalMapUnpack: asset.IsNormalMap);
-                if (bmp == null)
+                using (var fs = new FileStream(item.PngPath, FileMode.Create, FileAccess.Write, FileShare.None, StreamWriterBufferSize))
                 {
-                    continue;
+                    item.Bitmap.WriteToStream(fs, ImageFormat.Png);
                 }
 
-                using (var fs = new FileStream(pngPath, FileMode.Create, FileAccess.Write, FileShare.None, StreamWriterBufferSize))
-                {
-                    bmp.WriteToStream(fs, ImageFormat.Png);
-                }
-
-                WriteTextureMetaFile(metaPath, asset.Guid, asset.IsNormalMap);
-                asset.Exported = true;
+                WriteTextureMetaFile(item.MetaPath, item.Asset.Guid, item.Asset.IsNormalMap);
+                item.Asset.Exported = true;
             }
             catch (Exception ex)
             {
-                Logger.Warning($"UnityProjectExporter: failed to export texture '{asset.SafeName}': {ex.Message}");
+                Logger.Warning($"UnityProjectExporter: failed to write texture '{item.Asset.SafeName}': {ex.Message}");
             }
         }
     }
@@ -2037,13 +1965,17 @@ public sealed class UnityProjectExporterService
 
     private static void ExportMeshes(ExportState state, string meshesDir, CancellationToken cancellationToken)
     {
+        if (state.MeshesToExport.Count == 0)
+        {
+            return;
+        }
+
+        // Phase A (sequential, thread-safe on shared SerializedFile / .resS streams): ensure mesh buffers are hydrated.
+        var ready = new List<(ExportedMeshAsset Asset, string FbxPath, string MetaPath, string MeshNodeName)>(state.MeshesToExport.Count);
         for (int i = 0; i < state.MeshesToExport.Count; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var asset = state.MeshesToExport[i];
-            var objPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(meshesDir, asset.SafeName + ".obj"));
-            var metaPath = EnsureConfinedPath(state.RootDirWithSep, objPath + ".meta");
-
             try
             {
                 asset.Mesh.EnsureProcessed();
@@ -2052,27 +1984,72 @@ public sealed class UnityProjectExporterService
                     continue;
                 }
 
-                var objGroupName = SanitizeObjGroupName(asset.SafeName, "Mesh");
-                int subMeshCount = asset.Mesh.m_SubMeshes?.Length ?? 0;
-                string? mtlFileName = null;
-                if (subMeshCount > 1)
-                {
-                    mtlFileName = asset.SafeName + ".mtl";
-                    var mtlPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(meshesDir, mtlFileName));
-                    var mtlMetaPath = EnsureConfinedPath(state.RootDirWithSep, mtlPath + ".meta");
-                    WriteMeshCompanionMtl(mtlPath, subMeshCount);
-                    var mtlGuid = ComputeUnityAssetGuid("mesh-mtl", asset.Mesh.assetsFile?.fileName, asset.Mesh.m_PathID, asset.SafeName);
-                    WriteSceneMetaFile(mtlMetaPath, mtlGuid);
-                }
-
-                WriteMeshObjStreaming(objPath, objGroupName, asset.Mesh, mtlFileName);
-                WriteModelImporterMetaFile(metaPath, asset.Guid, objGroupName);
-                asset.Exported = true;
+                var fbxPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(meshesDir, asset.SafeName + ".fbx"));
+                var metaPath = EnsureConfinedPath(state.RootDirWithSep, fbxPath + ".meta");
+                var meshNodeName = SanitizeObjGroupName(asset.SafeName, "Mesh");
+                ready.Add((asset, fbxPath, metaPath, meshNodeName));
             }
             catch (Exception ex)
             {
-                Logger.Warning($"UnityProjectExporter: failed to export mesh '{asset.SafeName}': {ex.Message}");
+                Logger.Warning($"UnityProjectExporter: failed to prepare mesh '{asset.SafeName}': {ex.Message}");
             }
+        }
+
+        if (ready.Count == 0)
+        {
+            return;
+        }
+
+        // Phase B (parallel across CPU cores): reuse AssetStudio's central ModelConverter + ModelExporter.ExportFbx
+        // so static meshes, multi-submesh meshes, UV0..UV7, vertex colors, BlendShapes, and SkinnedMeshRenderer
+        // bindposes/boneWeights all flow through the exact same battle-tested FBX pipeline as solo export.
+        static void WriteSingleMeshFbx((ExportedMeshAsset Asset, string FbxPath, string MetaPath, string MeshNodeName) item)
+        {
+            try
+            {
+                bool includeSkin = item.Asset.RequiresSkinning
+                    && item.Asset.Mesh.m_BindPose is { Length: > 0 }
+                    && item.Asset.Mesh.m_Skin is { Length: > 0 };
+                var converted = ModelConverter.CreateForUnityMeshAsset(item.Asset.Mesh, item.MeshNodeName, includeBindPoses: includeSkin);
+                if (converted.MeshList.Count == 0)
+                {
+                    return;
+                }
+
+                ModelExporter.ExportFbx(
+                    item.FbxPath,
+                    converted,
+                    skins: includeSkin,
+                    animation: false,
+                    blendShape: true,
+                    castToBone: false,
+                    boneSize: 10f,
+                    scaleFactor: 1f,
+                    versionIndex: 4,
+                    isAscii: false,
+                    combineMeshes: false,
+                    writeExportReport: false);
+                WriteModelImporterMetaFile(item.MetaPath, item.Asset.Guid, item.MeshNodeName);
+                item.Asset.Exported = true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"UnityProjectExporter: failed to export mesh '{item.Asset.SafeName}': {ex.Message}");
+            }
+        }
+
+        if (ready.Count == 1)
+        {
+            WriteSingleMeshFbx(ready[0]);
+        }
+        else
+        {
+            var parallelOpts = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount, 1, 8),
+                CancellationToken = cancellationToken
+            };
+            Parallel.ForEach(ready, parallelOpts, WriteSingleMeshFbx);
         }
     }
 
@@ -2092,174 +2069,6 @@ public sealed class UnityProjectExporterService
 
         var cleaned = sb.ToString().Trim('_');
         return string.IsNullOrEmpty(cleaned) ? fallback : cleaned;
-    }
-
-    private static void WriteMeshCompanionMtl(string mtlPath, int subMeshCount)
-    {
-        using var fs = new FileStream(mtlPath, FileMode.Create, FileAccess.Write, FileShare.None, 4096);
-        using var sw = new StreamWriter(fs, Utf8NoBom, 4096) { NewLine = "\n" };
-
-        sw.WriteLine("# AssetStudio Multi-SubMesh Material Library");
-        for (int s = 0; s < subMeshCount; s++)
-        {
-            sw.Write("newmtl mat_");
-            sw.WriteLine(s.ToString(CultureInfo.InvariantCulture));
-            sw.WriteLine("Kd 1 1 1");
-        }
-    }
-
-    private static void WriteMeshObjStreaming(string objPath, string meshName, Mesh mesh, string? mtlFileName = null)
-    {
-        using var fs = new FileStream(objPath, FileMode.Create, FileAccess.Write, FileShare.None, StreamWriterBufferSize);
-        using var sw = new StreamWriter(fs, Utf8NoBom, StreamWriterBufferSize) { NewLine = "\n" };
-
-        sw.Write("# AssetStudio Unity Project Exporter\n");
-        if (!string.IsNullOrEmpty(mtlFileName))
-        {
-            sw.Write("mtllib ");
-            sw.WriteLine(mtlFileName);
-        }
-        sw.Write("o ");
-        sw.WriteLine(meshName);
-
-        int vertexCount = mesh.m_VertexCount;
-        var verts = mesh.m_Vertices!;
-        int posStride = verts.Length >= vertexCount * 4 ? 4 : 3;
-
-        // Negate X so Unity ModelImporter's OBJ import (which negates X) restores exact original Unity coordinates.
-        for (int v = 0; v < vertexCount; v++)
-        {
-            int o = v * posStride;
-            sw.Write("v ");
-            sw.Write(FormatFloat(-verts[o]));
-            sw.Write(' ');
-            sw.Write(FormatFloat(verts[o + 1]));
-            sw.Write(' ');
-            sw.WriteLine(FormatFloat(verts[o + 2]));
-        }
-
-        bool hasUv = mesh.m_UV0 != null && mesh.m_UV0.Length >= vertexCount * 2;
-        if (hasUv)
-        {
-            int uvStride = mesh.m_UV0!.Length / vertexCount;
-            for (int v = 0; v < vertexCount; v++)
-            {
-                int o = v * uvStride;
-                sw.Write("vt ");
-                sw.Write(FormatFloat(mesh.m_UV0[o]));
-                sw.Write(' ');
-                sw.WriteLine(FormatFloat(mesh.m_UV0[o + 1]));
-            }
-        }
-
-        bool hasNormals = mesh.m_Normals != null && mesh.m_Normals.Length >= vertexCount * 3;
-        if (hasNormals)
-        {
-            int nrmStride = mesh.m_Normals!.Length >= vertexCount * 4 ? 4 : 3;
-            for (int v = 0; v < vertexCount; v++)
-            {
-                int o = v * nrmStride;
-                sw.Write("vn ");
-                sw.Write(FormatFloat(-mesh.m_Normals[o]));
-                sw.Write(' ');
-                sw.Write(FormatFloat(mesh.m_Normals[o + 1]));
-                sw.Write(' ');
-                sw.WriteLine(FormatFloat(mesh.m_Normals[o + 2]));
-            }
-        }
-
-        // Keep a single OBJ group matching the ModelImporter internalIDToNameTable entry (fileID: 4300000),
-        // switching materials via `usemtl` so Unity imports all submeshes on one unified Mesh asset.
-        sw.Write("g ");
-        sw.WriteLine(meshName);
-
-        int subMeshCount = mesh.m_SubMeshes?.Length ?? 0;
-        int indexCursor = 0;
-        if (subMeshCount > 0 && mesh.m_Indices != null)
-        {
-            for (int s = 0; s < subMeshCount; s++)
-            {
-                var sub = mesh.m_SubMeshes![s];
-                int faceCount = (int)(sub.indexCount / 3);
-                sw.Write("usemtl mat_");
-                sw.WriteLine(s.ToString(CultureInfo.InvariantCulture));
-
-                for (int f = 0; f < faceCount; f++)
-                {
-                    int idxBase = indexCursor + f * 3;
-                    if (idxBase + 2 >= mesh.m_Indices.Count)
-                    {
-                        break;
-                    }
-
-                    // Reverse winding to match X-negation for Unity ModelImporter roundtrip.
-                    int a = (int)mesh.m_Indices[idxBase + 2] + 1;
-                    int b = (int)mesh.m_Indices[idxBase + 1] + 1;
-                    int c = (int)mesh.m_Indices[idxBase + 0] + 1;
-
-                    if (a < 1 || a > vertexCount || b < 1 || b > vertexCount || c < 1 || c > vertexCount)
-                    {
-                        continue;
-                    }
-
-                    WriteObjFace(sw, a, b, c, hasUv, hasNormals);
-                }
-
-                indexCursor += faceCount * 3;
-            }
-        }
-        else if (mesh.m_Indices != null && mesh.m_Indices.Count >= 3)
-        {
-            sw.WriteLine("usemtl mat_0");
-            int faceCount = mesh.m_Indices.Count / 3;
-            for (int f = 0; f < faceCount; f++)
-            {
-                int idxBase = f * 3;
-                int a = (int)mesh.m_Indices[idxBase + 2] + 1;
-                int b = (int)mesh.m_Indices[idxBase + 1] + 1;
-                int c = (int)mesh.m_Indices[idxBase + 0] + 1;
-                if (a < 1 || a > vertexCount || b < 1 || b > vertexCount || c < 1 || c > vertexCount)
-                {
-                    continue;
-                }
-
-                WriteObjFace(sw, a, b, c, hasUv, hasNormals);
-            }
-        }
-    }
-
-    private static void WriteObjFace(StreamWriter sw, int a, int b, int c, bool hasUv, bool hasNormals)
-    {
-        sw.Write("f ");
-        WriteObjVertexRef(sw, a, hasUv, hasNormals);
-        sw.Write(' ');
-        WriteObjVertexRef(sw, b, hasUv, hasNormals);
-        sw.Write(' ');
-        WriteObjVertexRef(sw, c, hasUv, hasNormals);
-        sw.WriteLine();
-    }
-
-    private static void WriteObjVertexRef(StreamWriter sw, int idx, bool hasUv, bool hasNormals)
-    {
-        var s = idx.ToString(CultureInfo.InvariantCulture);
-        sw.Write(s);
-        if (hasUv && hasNormals)
-        {
-            sw.Write('/');
-            sw.Write(s);
-            sw.Write('/');
-            sw.Write(s);
-        }
-        else if (hasUv)
-        {
-            sw.Write('/');
-            sw.Write(s);
-        }
-        else if (hasNormals)
-        {
-            sw.Write("//");
-            sw.Write(s);
-        }
     }
 
     private static void WriteModelImporterMetaFile(string metaPath, string guid, string meshName)
@@ -2344,11 +2153,24 @@ public sealed class UnityProjectExporterService
 
             asset.MeshData = meshData;
 
-            // 1. Write Terrain OBJ + meta.
-            var terrainObjGroup = SanitizeObjGroupName(asset.SafeName, "Terrain");
-            var objPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(meshesDir, asset.SafeName + ".obj"));
-            WriteTerrainObjStreaming(objPath, terrainObjGroup, meshData);
-            WriteModelImporterMetaFile(EnsureConfinedPath(state.RootDirWithSep, objPath + ".meta"), asset.MeshGuid, terrainObjGroup);
+            // 1. Write Terrain binary FBX + meta via shared ModelConverter + ModelExporter.ExportFbx.
+            var terrainNodeName = SanitizeObjGroupName(asset.SafeName, "Terrain");
+            var fbxPath = EnsureConfinedPath(state.RootDirWithSep, Path.Combine(meshesDir, asset.SafeName + ".fbx"));
+            var terrainConverted = ModelConverter.CreateForTerrainMeshData(meshData, terrainNodeName);
+            ModelExporter.ExportFbx(
+                fbxPath,
+                terrainConverted,
+                skins: false,
+                animation: false,
+                blendShape: false,
+                castToBone: false,
+                boneSize: 10f,
+                scaleFactor: 1f,
+                versionIndex: 4,
+                isAscii: false,
+                combineMeshes: false,
+                writeExportReport: false);
+            WriteModelImporterMetaFile(EnsureConfinedPath(state.RootDirWithSep, fbxPath + ".meta"), asset.MeshGuid, terrainNodeName);
 
             // 2. Write baked splatmap PNG + meta (if present).
             if (state.Options.ExportTextures && meshData.BakedAlbedoBytes is { Length: > 0 })
@@ -2367,61 +2189,6 @@ public sealed class UnityProjectExporterService
                 WriteTerrainMaterialFile(matPath, matName, asset.HasBakedTexture ? asset.TextureGuid : null);
                 WriteMaterialMetaFile(EnsureConfinedPath(state.RootDirWithSep, matPath + ".meta"), asset.MaterialGuid);
             }
-        }
-    }
-
-    private static void WriteTerrainObjStreaming(string objPath, string meshName, TerrainMeshData meshData)
-    {
-        using var fs = new FileStream(objPath, FileMode.Create, FileAccess.Write, FileShare.None, StreamWriterBufferSize);
-        using var sw = new StreamWriter(fs, Utf8NoBom, StreamWriterBufferSize) { NewLine = "\n" };
-
-        sw.Write("# AssetStudio Unity Project Exporter (Terrain Heightmap)\n");
-        sw.Write("o ");
-        sw.WriteLine(meshName);
-
-        for (int i = 0; i < meshData.Positions.Length; i++)
-        {
-            var p = meshData.Positions[i];
-            sw.Write("v ");
-            sw.Write(FormatFloat(-p.X));
-            sw.Write(' ');
-            sw.Write(FormatFloat(p.Y));
-            sw.Write(' ');
-            sw.WriteLine(FormatFloat(p.Z));
-        }
-
-        for (int i = 0; i < meshData.UVs.Length; i++)
-        {
-            var uv = meshData.UVs[i];
-            sw.Write("vt ");
-            sw.Write(FormatFloat(uv.X));
-            sw.Write(' ');
-            sw.WriteLine(FormatFloat(uv.Y));
-        }
-
-        for (int i = 0; i < meshData.Normals.Length; i++)
-        {
-            var n = meshData.Normals[i];
-            sw.Write("vn ");
-            sw.Write(FormatFloat(-n.X));
-            sw.Write(' ');
-            sw.Write(FormatFloat(n.Y));
-            sw.Write(' ');
-            sw.WriteLine(FormatFloat(n.Z));
-        }
-
-        sw.Write("g ");
-        sw.WriteLine(meshName);
-        sw.WriteLine("usemtl mat_0");
-
-        int triCount = meshData.Indices.Length / 3;
-        for (int t = 0; t < triCount; t++)
-        {
-            int idx = t * 3;
-            int a = meshData.Indices[idx + 2] + 1;
-            int b = meshData.Indices[idx + 1] + 1;
-            int c = meshData.Indices[idx + 0] + 1;
-            WriteObjFace(sw, a, b, c, hasUv: true, hasNormals: true);
         }
     }
 
@@ -2605,7 +2372,35 @@ public sealed class UnityProjectExporterService
         sw.Write("  m_DoubleSidedGI: ");
         sw.WriteLine(mat.m_DoubleSidedGI ? "1" : "0");
         sw.Write("  m_CustomRenderQueue: ");
-        sw.WriteLine(mat.m_CustomRenderQueue.ToString(CultureInfo.InvariantCulture));
+        int effectiveQueue = mat.m_CustomRenderQueue;
+        if (shaderFileId == 46 && effectiveQueue >= 0)
+        {
+            // Built-in Standard enforces strict queue bands per RenderType tag:
+            // Opaque/unset: -1..2449, TransparentCutout: 2450..2500, Transparent: 2501..3999.
+            string? renderType = null;
+            if (mat.stringTagMap != null)
+            {
+                for (int i = 0; i < mat.stringTagMap.Length; i++)
+                {
+                    if (string.Equals(mat.stringTagMap[i].Key, "RenderType", StringComparison.OrdinalIgnoreCase))
+                    {
+                        renderType = mat.stringTagMap[i].Value;
+                        break;
+                    }
+                }
+            }
+
+            bool outOfBand = string.Equals(renderType, "TransparentCutout", StringComparison.OrdinalIgnoreCase)
+                ? (effectiveQueue < 2450 || effectiveQueue > 2500)
+                : string.Equals(renderType, "Transparent", StringComparison.OrdinalIgnoreCase)
+                    ? (effectiveQueue < 2501 || effectiveQueue > 3999)
+                    : effectiveQueue > 2449;
+            if (outOfBand)
+            {
+                effectiveQueue = -1;
+            }
+        }
+        sw.WriteLine(effectiveQueue.ToString(CultureInfo.InvariantCulture));
 
         if (mat.stringTagMap == null || mat.stringTagMap.Length == 0)
         {
@@ -2628,16 +2423,72 @@ public sealed class UnityProjectExporterService
         sw.WriteLine("  m_SavedProperties:");
         sw.WriteLine("    serializedVersion: 3");
 
-        if (asset.ResolvedTexEnvs.Count == 0)
+        // Build effective m_TexEnvs preserving all original properties while aliasing URP/ShaderGraph
+        // primary albedo (_BaseMap, _BaseColorMap, etc.) -> _MainTex and normal -> _BumpMap using
+        // ModelConverter's shared texture slot classifier so Built-in Standard renders textures immediately.
+        var effectiveTexEnvs = new List<(string PropName, ExportedTextureAsset? Texture, Vector2 Scale, Vector2 Offset)>(asset.ResolvedTexEnvs.Count + 2);
+        bool hasBoundMainTex = false;
+        bool hasBoundBumpMap = false;
+        (ExportedTextureAsset Texture, Vector2 Scale, Vector2 Offset, int Priority)? bestAlbedo = null;
+        (ExportedTextureAsset Texture, Vector2 Scale, Vector2 Offset)? bestNormal = null;
+
+        for (int i = 0; i < asset.ResolvedTexEnvs.Count; i++)
+        {
+            var entry = asset.ResolvedTexEnvs[i];
+            effectiveTexEnvs.Add(entry);
+            if (entry.Texture != null && entry.Texture.Exported)
+            {
+                if (string.Equals(entry.PropName, "_MainTex", StringComparison.Ordinal))
+                {
+                    hasBoundMainTex = true;
+                }
+                else if (string.Equals(entry.PropName, "_BumpMap", StringComparison.Ordinal))
+                {
+                    hasBoundBumpMap = true;
+                }
+
+                int dest = ModelConverter.GetTextureDestination(entry.PropName);
+                if (dest == 0 && !entry.Texture.IsNormalMap)
+                {
+                    int prio = ModelConverter.GetDiffuseSlotPriority(entry.PropName);
+                    if (!bestAlbedo.HasValue || prio < bestAlbedo.Value.Priority)
+                    {
+                        bestAlbedo = (entry.Texture, entry.Scale, entry.Offset, prio);
+                    }
+                }
+                else if (dest == 1 && !bestNormal.HasValue)
+                {
+                    bestNormal = (entry.Texture, entry.Scale, entry.Offset);
+                }
+            }
+        }
+
+        if (!hasBoundMainTex && bestAlbedo.HasValue)
+        {
+            int existingIdx = effectiveTexEnvs.FindIndex(static e => string.Equals(e.PropName, "_MainTex", StringComparison.Ordinal));
+            var aliased = ("_MainTex", (ExportedTextureAsset?)bestAlbedo.Value.Texture, bestAlbedo.Value.Scale, bestAlbedo.Value.Offset);
+            if (existingIdx >= 0) effectiveTexEnvs[existingIdx] = aliased;
+            else effectiveTexEnvs.Insert(0, aliased);
+        }
+
+        if (!hasBoundBumpMap && bestNormal.HasValue)
+        {
+            int existingIdx = effectiveTexEnvs.FindIndex(static e => string.Equals(e.PropName, "_BumpMap", StringComparison.Ordinal));
+            var aliased = ("_BumpMap", (ExportedTextureAsset?)bestNormal.Value.Texture, bestNormal.Value.Scale, bestNormal.Value.Offset);
+            if (existingIdx >= 0) effectiveTexEnvs[existingIdx] = aliased;
+            else effectiveTexEnvs.Add(aliased);
+        }
+
+        if (effectiveTexEnvs.Count == 0)
         {
             sw.WriteLine("    m_TexEnvs: []");
         }
         else
         {
             sw.WriteLine("    m_TexEnvs:");
-            for (int i = 0; i < asset.ResolvedTexEnvs.Count; i++)
+            for (int i = 0; i < effectiveTexEnvs.Count; i++)
             {
-                var (propName, texAsset, scale, offset) = asset.ResolvedTexEnvs[i];
+                var (propName, texAsset, scale, offset) = effectiveTexEnvs[i];
                 sw.Write("    - ");
                 sw.Write(FormatYamlKey(propName));
                 sw.WriteLine(":");
@@ -2700,18 +2551,41 @@ public sealed class UnityProjectExporterService
         }
 
         var colors = mat.m_SavedProperties?.m_Colors;
-        if (colors == null || colors.Length == 0)
+        var effectiveColors = new List<KeyValuePair<string, Color>>(colors?.Length ?? 0);
+        bool hasMainColor = false;
+        Color? baseColorFallback = null;
+        if (colors != null)
+        {
+            for (int i = 0; i < colors.Length; i++)
+            {
+                effectiveColors.Add(colors[i]);
+                if (string.Equals(colors[i].Key, "_Color", StringComparison.Ordinal))
+                {
+                    hasMainColor = true;
+                }
+                else if (string.Equals(colors[i].Key, "_BaseColor", StringComparison.Ordinal))
+                {
+                    baseColorFallback = colors[i].Value;
+                }
+            }
+        }
+        if (!hasMainColor && baseColorFallback.HasValue)
+        {
+            effectiveColors.Add(new KeyValuePair<string, Color>("_Color", baseColorFallback.Value));
+        }
+
+        if (effectiveColors.Count == 0)
         {
             sw.WriteLine("    m_Colors: []");
         }
         else
         {
             sw.WriteLine("    m_Colors:");
-            for (int i = 0; i < colors.Length; i++)
+            for (int i = 0; i < effectiveColors.Count; i++)
             {
-                var c = colors[i].Value;
+                var c = effectiveColors[i].Value;
                 sw.Write("    - ");
-                sw.Write(FormatYamlKey(colors[i].Key));
+                sw.Write(FormatYamlKey(effectiveColors[i].Key));
                 sw.Write(": {r: ");
                 sw.Write(FormatFloat(c.R));
                 sw.Write(", g: ");
@@ -2974,28 +2848,31 @@ public sealed class UnityProjectExporterService
         sw.Write("  m_GameObject: {fileID: ");
         sw.Write(comp.OwnerGameObjectFileId.ToString(CultureInfo.InvariantCulture));
         sw.WriteLine("}");
+        var localRot = node.OverrideLocalRotation ?? tr.m_LocalRotation;
+        var localPos = node.OverrideLocalPosition ?? tr.m_LocalPosition;
+        var localScale = node.OverrideLocalScale ?? tr.m_LocalScale;
         sw.Write("  m_LocalRotation: {x: ");
-        sw.Write(FormatFloat(tr.m_LocalRotation.X));
+        sw.Write(FormatFloat(localRot.X));
         sw.Write(", y: ");
-        sw.Write(FormatFloat(tr.m_LocalRotation.Y));
+        sw.Write(FormatFloat(localRot.Y));
         sw.Write(", z: ");
-        sw.Write(FormatFloat(tr.m_LocalRotation.Z));
+        sw.Write(FormatFloat(localRot.Z));
         sw.Write(", w: ");
-        sw.Write(FormatFloat(tr.m_LocalRotation.W, 1f));
+        sw.Write(FormatFloat(localRot.W, 1f));
         sw.WriteLine("}");
         sw.Write("  m_LocalPosition: {x: ");
-        sw.Write(FormatFloat(tr.m_LocalPosition.X));
+        sw.Write(FormatFloat(localPos.X));
         sw.Write(", y: ");
-        sw.Write(FormatFloat(tr.m_LocalPosition.Y));
+        sw.Write(FormatFloat(localPos.Y));
         sw.Write(", z: ");
-        sw.Write(FormatFloat(tr.m_LocalPosition.Z));
+        sw.Write(FormatFloat(localPos.Z));
         sw.WriteLine("}");
         sw.Write("  m_LocalScale: {x: ");
-        sw.Write(FormatFloat(tr.m_LocalScale.X, 1f));
+        sw.Write(FormatFloat(localScale.X, 1f));
         sw.Write(", y: ");
-        sw.Write(FormatFloat(tr.m_LocalScale.Y, 1f));
+        sw.Write(FormatFloat(localScale.Y, 1f));
         sw.Write(", z: ");
-        sw.Write(FormatFloat(tr.m_LocalScale.Z, 1f));
+        sw.Write(FormatFloat(localScale.Z, 1f));
         sw.WriteLine("}");
 
         var childIds = new List<long>();
@@ -3009,6 +2886,10 @@ public sealed class UnityProjectExporterService
                     childIds.Add(childId);
                 }
             }
+        }
+        if (node.ExtraChildTransformFileIds is { Count: > 0 })
+        {
+            childIds.AddRange(node.ExtraChildTransformFileIds);
         }
 
         if (childIds.Count == 0)
@@ -3028,7 +2909,11 @@ public sealed class UnityProjectExporterService
 
         bool isPrefabRoot = state.PrefabRootObject != null && ReferenceEquals(node.GameObject, state.PrefabRootObject);
         long fatherId = 0;
-        if (!isPrefabRoot && tr.m_Father != null && !tr.m_Father.IsNull)
+        if (node.OverrideFatherFileId.HasValue)
+        {
+            fatherId = node.OverrideFatherFileId.Value;
+        }
+        else if (!isPrefabRoot && tr.m_Father != null && !tr.m_Father.IsNull)
         {
             TryLookupLocalFileId(tr.assetsFile, tr.m_Father.m_FileID, tr.m_Father.m_PathID, state, out fatherId);
         }
@@ -3129,18 +3014,43 @@ public sealed class UnityProjectExporterService
         }
         else
         {
-            sw.WriteLine("  m_Bones:");
+            // Align m_Bones 1:1 with FbxSharpieExporter's active skin clusters (omitting zero-weight bones
+            // that FBXImporter strips from Mesh.bindposes) so SkinnedMeshRenderer binds cleanly in Unity.
+            var activeMask = comp.ResolvedMesh != null && comp.ResolvedMesh.RequiresSkinning
+                ? FbxSharpieExporter.ComputeActiveSkinBoneMask(comp.ResolvedMesh.Mesh, smr.m_Bones.Length)
+                : null;
+            bool useActiveMask = activeMask != null && Array.IndexOf(activeMask, true) >= 0;
+
+            var emittedBones = new List<long>(smr.m_Bones.Length);
             for (int i = 0; i < smr.m_Bones.Length; i++)
             {
+                if (useActiveMask && !activeMask![i])
+                {
+                    continue;
+                }
+
                 var bonePtr = smr.m_Bones[i];
                 long boneId = 0;
                 if (bonePtr != null && !bonePtr.IsNull)
                 {
                     TryLookupLocalFileId(smr.assetsFile, bonePtr.m_FileID, bonePtr.m_PathID, state, out boneId);
                 }
-                sw.Write("  - {fileID: ");
-                sw.Write(boneId.ToString(CultureInfo.InvariantCulture));
-                sw.WriteLine("}");
+                emittedBones.Add(boneId);
+            }
+
+            if (emittedBones.Count == 0)
+            {
+                sw.WriteLine("  m_Bones: []");
+            }
+            else
+            {
+                sw.WriteLine("  m_Bones:");
+                for (int i = 0; i < emittedBones.Count; i++)
+                {
+                    sw.Write("  - {fileID: ");
+                    sw.Write(emittedBones[i].ToString(CultureInfo.InvariantCulture));
+                    sw.WriteLine("}");
+                }
             }
         }
 
@@ -3439,7 +3349,7 @@ public sealed class UnityProjectExporterService
         sw.Write("  m_LastLODIsBillboard: ");
         sw.WriteLine(lodGroup.m_LastLODIsBillboard ? "1" : "0");
 
-        var lodLevels = ExtractLodLevels(lodGroup);
+        var lodLevels = ModelConverter.ExtractLodLevels(lodGroup);
         if (lodLevels.Count == 0)
         {
             sw.WriteLine("  m_LODs: []");
@@ -3653,6 +3563,21 @@ public sealed class UnityProjectExporterService
         var fields = ReadMonoBehaviourFields(mb, state);
         if (fields != null && fields.Count > 0)
         {
+            var assetName = !string.IsNullOrWhiteSpace(mb.m_Name)
+                ? mb.m_Name
+                : (mb.m_Script != null && mb.m_Script.TryGet(out var ms) && !string.IsNullOrWhiteSpace(ms?.m_ClassName)
+                    ? ms.m_ClassName
+                    : $"MonoBehaviour_{mb.m_PathID}");
+            var ctx = new YamlSerializationContext(
+                assetName,
+                mb.assetsFile?.fileName ?? string.Empty,
+                mb.m_PathID,
+                mb.assetsFile,
+                state.Options.MaxYamlSerializationDepth > 0 ? state.Options.MaxYamlSerializationDepth : 64,
+                Math.Max(0, state.Options.MaxYamlCollectionElements),
+                Math.Max(0, state.Options.MaxYamlByteArrayLength),
+                state);
+
             foreach (DictionaryEntry entry in fields)
             {
                 var key = entry.Key?.ToString();
@@ -3661,14 +3586,97 @@ public sealed class UnityProjectExporterService
                     continue;
                 }
 
-                WriteYamlProperty(sw, key, entry.Value, indentSpaces: 2, depth: 0, mb.assetsFile, state);
+                WriteYamlProperty(sw, key, entry.Value, indentSpaces: 2, depth: 0, fieldPath: key, ctx);
             }
         }
     }
 
     // =========================================================================
-    // Recursive Unity YAML Serializer for MonoBehaviour TypeTree Fields
+    // Incremental Unity YAML Serializer for MonoBehaviour TypeTree Fields
     // =========================================================================
+
+    private readonly struct YamlSerializationContext
+    {
+        public string AssetName { get; }
+        public string SourceFile { get; }
+        public long PathId { get; }
+        public SerializedFile? OwnerFile { get; }
+        public int MaxDepth { get; }
+        public int MaxCollectionElements { get; }
+        public int MaxByteArrayLength { get; }
+        public ExportState State { get; }
+
+        public YamlSerializationContext(
+            string assetName,
+            string sourceFile,
+            long pathId,
+            SerializedFile? ownerFile,
+            int maxDepth,
+            int maxCollectionElements,
+            int maxByteArrayLength,
+            ExportState state)
+        {
+            AssetName = assetName;
+            SourceFile = sourceFile;
+            PathId = pathId;
+            OwnerFile = ownerFile;
+            MaxDepth = maxDepth;
+            MaxCollectionElements = maxCollectionElements;
+            MaxByteArrayLength = maxByteArrayLength;
+            State = state;
+        }
+
+        public void RecordTruncation(string fieldPath, string limitKind, int limitValue, int totalCount, int omittedCount)
+        {
+            State.TruncationDiagnostics.Add(new UnityProjectTruncationDiagnostic
+            {
+                AssetName = AssetName,
+                AssetType = "MonoBehaviour",
+                SourceFile = SourceFile,
+                PathId = PathId,
+                FieldPath = fieldPath,
+                LimitKind = limitKind,
+                LimitValue = limitValue,
+                TotalCount = totalCount,
+                OmittedCount = omittedCount
+            });
+        }
+    }
+
+    private static void WriteYamlByteArrayHex(StreamWriter sw, byte[] bytes, string fieldPath, in YamlSerializationContext ctx)
+    {
+        if (bytes.Length == 0)
+        {
+            sw.WriteLine(" []");
+            return;
+        }
+
+        int count = ctx.MaxByteArrayLength > 0 && bytes.Length > ctx.MaxByteArrayLength
+            ? ctx.MaxByteArrayLength
+            : bytes.Length;
+
+        sw.Write(' ');
+        for (int offset = 0; offset < count; offset += YamlHexChunkBytes)
+        {
+            int chunk = Math.Min(YamlHexChunkBytes, count - offset);
+            sw.Write(Convert.ToHexString(bytes.AsSpan(offset, chunk)).ToLowerInvariant());
+        }
+
+        if (count < bytes.Length)
+        {
+            int omitted = bytes.Length - count;
+            ctx.RecordTruncation(fieldPath, "MaxByteArrayLength", ctx.MaxByteArrayLength, bytes.Length, omitted);
+            sw.Write(" # [AssetStudio] Truncated byte[] (");
+            sw.Write(omitted.ToString(CultureInfo.InvariantCulture));
+            sw.Write(" of ");
+            sw.Write(bytes.Length.ToString(CultureInfo.InvariantCulture));
+            sw.WriteLine(" bytes omitted)");
+        }
+        else
+        {
+            sw.WriteLine();
+        }
+    }
 
     private static void WriteYamlProperty(
         StreamWriter sw,
@@ -3676,11 +3684,17 @@ public sealed class UnityProjectExporterService
         object? value,
         int indentSpaces,
         int depth,
-        SerializedFile? ownerFile,
-        ExportState state)
+        string fieldPath,
+        in YamlSerializationContext ctx)
     {
-        if (depth > MaxYamlSerializationDepth)
+        if (depth > ctx.MaxDepth)
         {
+            ctx.RecordTruncation(fieldPath, "MaxDepth", ctx.MaxDepth, totalCount: 1, omittedCount: 1);
+            WriteIndent(sw, indentSpaces);
+            sw.Write("# [AssetStudio] Truncated field '");
+            sw.Write(fieldPath);
+            sw.Write("' at MaxDepth=");
+            sw.WriteLine(ctx.MaxDepth.ToString(CultureInfo.InvariantCulture));
             return;
         }
 
@@ -3694,7 +3708,7 @@ public sealed class UnityProjectExporterService
             return;
         }
 
-        if (TryFormatInlineScalarOrStruct(value, ownerFile, state, out var inlineText))
+        if (TryFormatInlineScalarOrStruct(value, ctx.OwnerFile, ctx.State, out var inlineText))
         {
             sw.Write(' ');
             sw.WriteLine(inlineText);
@@ -3703,16 +3717,7 @@ public sealed class UnityProjectExporterService
 
         if (value is byte[] bytes)
         {
-            int count = Math.Min(bytes.Length, MaxYamlCollectionElements);
-            if (count == 0)
-            {
-                sw.WriteLine(" []");
-            }
-            else
-            {
-                sw.Write(' ');
-                sw.WriteLine(Convert.ToHexString(bytes.AsSpan(0, count)).ToLowerInvariant());
-            }
+            WriteYamlByteArrayHex(sw, bytes, fieldPath, ctx);
             return;
         }
 
@@ -3724,49 +3729,105 @@ public sealed class UnityProjectExporterService
                 return;
             }
 
+            if (depth + 1 > ctx.MaxDepth)
+            {
+                ctx.RecordTruncation(fieldPath, "MaxDepth", ctx.MaxDepth, totalCount: dict.Count, omittedCount: dict.Count);
+                sw.Write(" {} # [AssetStudio] Truncated dictionary at MaxDepth=");
+                sw.WriteLine(ctx.MaxDepth.ToString(CultureInfo.InvariantCulture));
+                return;
+            }
+
             sw.WriteLine();
             int written = 0;
+            int totalNonEmpty = 0;
             foreach (DictionaryEntry child in dict)
             {
-                if (written >= MaxYamlCollectionElements)
-                {
-                    break;
-                }
-
                 var childKey = child.Key?.ToString();
                 if (string.IsNullOrWhiteSpace(childKey))
                 {
                     continue;
                 }
 
-                WriteYamlProperty(sw, childKey, child.Value, indentSpaces + 2, depth + 1, ownerFile, state);
+                totalNonEmpty++;
+                if (ctx.MaxCollectionElements > 0 && written >= ctx.MaxCollectionElements)
+                {
+                    continue;
+                }
+
+                WriteYamlProperty(sw, childKey, child.Value, indentSpaces + 2, depth + 1, $"{fieldPath}.{childKey}", ctx);
                 written++;
+            }
+
+            if (totalNonEmpty > written)
+            {
+                int omitted = totalNonEmpty - written;
+                ctx.RecordTruncation(fieldPath, "MaxCollectionElements", ctx.MaxCollectionElements, totalNonEmpty, omitted);
+                WriteIndent(sw, indentSpaces + 2);
+                sw.Write("# [AssetStudio] Truncated dictionary '");
+                sw.Write(fieldPath);
+                sw.Write("' (");
+                sw.Write(omitted.ToString(CultureInfo.InvariantCulture));
+                sw.Write(" of ");
+                sw.Write(totalNonEmpty.ToString(CultureInfo.InvariantCulture));
+                sw.WriteLine(" entries omitted)");
             }
             return;
         }
 
         if (value is IEnumerable enumerable && value is not string)
         {
-            var items = new List<object?>();
-            foreach (var item in enumerable)
+            var enumerator = enumerable.GetEnumerator();
+            try
             {
-                if (items.Count >= MaxYamlCollectionElements)
+                if (!enumerator.MoveNext())
                 {
-                    break;
+                    sw.WriteLine(" []");
+                    return;
                 }
-                items.Add(item);
-            }
 
-            if (items.Count == 0)
-            {
-                sw.WriteLine(" []");
-                return;
-            }
+                if (depth + 1 > ctx.MaxDepth)
+                {
+                    int total = 1;
+                    while (enumerator.MoveNext()) total++;
+                    ctx.RecordTruncation(fieldPath, "MaxDepth", ctx.MaxDepth, totalCount: total, omittedCount: total);
+                    sw.Write(" [] # [AssetStudio] Truncated collection at MaxDepth=");
+                    sw.WriteLine(ctx.MaxDepth.ToString(CultureInfo.InvariantCulture));
+                    return;
+                }
 
-            sw.WriteLine();
-            for (int i = 0; i < items.Count; i++)
+                sw.WriteLine();
+                int written = 0;
+                int totalCount = 0;
+                do
+                {
+                    totalCount++;
+                    if (ctx.MaxCollectionElements > 0 && written >= ctx.MaxCollectionElements)
+                    {
+                        continue;
+                    }
+
+                    WriteYamlListItem(sw, enumerator.Current, indentSpaces, depth + 1, $"{fieldPath}[{written}]", ctx);
+                    written++;
+                }
+                while (enumerator.MoveNext());
+
+                if (totalCount > written)
+                {
+                    int omitted = totalCount - written;
+                    ctx.RecordTruncation(fieldPath, "MaxCollectionElements", ctx.MaxCollectionElements, totalCount, omitted);
+                    WriteIndent(sw, indentSpaces);
+                    sw.Write("# [AssetStudio] Truncated collection '");
+                    sw.Write(fieldPath);
+                    sw.Write("' (");
+                    sw.Write(omitted.ToString(CultureInfo.InvariantCulture));
+                    sw.Write(" of ");
+                    sw.Write(totalCount.ToString(CultureInfo.InvariantCulture));
+                    sw.WriteLine(" elements omitted)");
+                }
+            }
+            finally
             {
-                WriteYamlListItem(sw, items[i], indentSpaces, depth + 1, ownerFile, state);
+                (enumerator as IDisposable)?.Dispose();
             }
             return;
         }
@@ -3780,11 +3841,15 @@ public sealed class UnityProjectExporterService
         object? item,
         int indentSpaces,
         int depth,
-        SerializedFile? ownerFile,
-        ExportState state)
+        string itemPath,
+        in YamlSerializationContext ctx)
     {
-        if (depth > MaxYamlSerializationDepth)
+        if (depth > ctx.MaxDepth)
         {
+            ctx.RecordTruncation(itemPath, "MaxDepth", ctx.MaxDepth, totalCount: 1, omittedCount: 1);
+            WriteIndent(sw, indentSpaces);
+            sw.Write("- {} # [AssetStudio] Truncated list item at MaxDepth=");
+            sw.WriteLine(ctx.MaxDepth.ToString(CultureInfo.InvariantCulture));
             return;
         }
 
@@ -3795,10 +3860,17 @@ public sealed class UnityProjectExporterService
             return;
         }
 
-        if (TryFormatInlineScalarOrStruct(item, ownerFile, state, out var inlineText))
+        if (TryFormatInlineScalarOrStruct(item, ctx.OwnerFile, ctx.State, out var inlineText))
         {
             sw.Write("- ");
             sw.WriteLine(inlineText);
+            return;
+        }
+
+        if (item is byte[] itemBytes)
+        {
+            sw.Write('-');
+            WriteYamlByteArrayHex(sw, itemBytes, itemPath, ctx);
             return;
         }
 
@@ -3806,25 +3878,28 @@ public sealed class UnityProjectExporterService
         {
             bool first = true;
             int written = 0;
+            int totalNonEmpty = 0;
             foreach (DictionaryEntry child in dict)
             {
-                if (written >= MaxYamlCollectionElements)
-                {
-                    break;
-                }
-
                 var childKey = child.Key?.ToString();
                 if (string.IsNullOrWhiteSpace(childKey))
                 {
                     continue;
                 }
 
+                totalNonEmpty++;
+                if (ctx.MaxCollectionElements > 0 && written >= ctx.MaxCollectionElements)
+                {
+                    continue;
+                }
+
+                var childPath = $"{itemPath}.{childKey}";
                 if (first)
                 {
                     sw.Write("- ");
                     sw.Write(FormatYamlKey(childKey));
                     sw.Write(':');
-                    if (child.Value != null && TryFormatInlineScalarOrStruct(child.Value, ownerFile, state, out var firstInline))
+                    if (child.Value != null && TryFormatInlineScalarOrStruct(child.Value, ctx.OwnerFile, ctx.State, out var firstInline))
                     {
                         sw.Write(' ');
                         sw.WriteLine(firstInline);
@@ -3833,16 +3908,26 @@ public sealed class UnityProjectExporterService
                     {
                         sw.WriteLine(" ");
                     }
+                    else if (child.Value is byte[] nestedBytes)
+                    {
+                        WriteYamlByteArrayHex(sw, nestedBytes, childPath, ctx);
+                    }
+                    else if (depth + 1 > ctx.MaxDepth)
+                    {
+                        ctx.RecordTruncation(childPath, "MaxDepth", ctx.MaxDepth, totalCount: 1, omittedCount: 1);
+                        sw.Write(" {} # [AssetStudio] Truncated nested field at MaxDepth=");
+                        sw.WriteLine(ctx.MaxDepth.ToString(CultureInfo.InvariantCulture));
+                    }
                     else
                     {
                         sw.WriteLine();
-                        WriteYamlNestedValue(sw, child.Value, indentSpaces + 4, depth + 1, ownerFile, state);
+                        WriteYamlNestedValue(sw, child.Value, indentSpaces + 4, depth + 1, childPath, ctx);
                     }
                     first = false;
                 }
                 else
                 {
-                    WriteYamlProperty(sw, childKey, child.Value, indentSpaces + 2, depth + 1, ownerFile, state);
+                    WriteYamlProperty(sw, childKey, child.Value, indentSpaces + 2, depth + 1, childPath, ctx);
                 }
 
                 written++;
@@ -3852,6 +3937,34 @@ public sealed class UnityProjectExporterService
             {
                 sw.WriteLine("- {}");
             }
+            else if (totalNonEmpty > written)
+            {
+                int omitted = totalNonEmpty - written;
+                ctx.RecordTruncation(itemPath, "MaxCollectionElements", ctx.MaxCollectionElements, totalNonEmpty, omitted);
+                WriteIndent(sw, indentSpaces + 2);
+                sw.Write("# [AssetStudio] Truncated dictionary '");
+                sw.Write(itemPath);
+                sw.Write("' (");
+                sw.Write(omitted.ToString(CultureInfo.InvariantCulture));
+                sw.Write(" of ");
+                sw.Write(totalNonEmpty.ToString(CultureInfo.InvariantCulture));
+                sw.WriteLine(" entries omitted)");
+            }
+            return;
+        }
+
+        if (item is IEnumerable nestedEnum && item is not string)
+        {
+            if (depth + 1 > ctx.MaxDepth)
+            {
+                ctx.RecordTruncation(itemPath, "MaxDepth", ctx.MaxDepth, totalCount: 1, omittedCount: 1);
+                sw.Write("- [] # [AssetStudio] Truncated nested collection at MaxDepth=");
+                sw.WriteLine(ctx.MaxDepth.ToString(CultureInfo.InvariantCulture));
+                return;
+            }
+
+            sw.WriteLine("-");
+            WriteYamlNestedValue(sw, nestedEnum, indentSpaces + 2, depth + 1, itemPath, ctx);
             return;
         }
 
@@ -3864,34 +3977,72 @@ public sealed class UnityProjectExporterService
         object value,
         int indentSpaces,
         int depth,
-        SerializedFile? ownerFile,
-        ExportState state)
+        string fieldPath,
+        in YamlSerializationContext ctx)
     {
-        if (depth > MaxYamlSerializationDepth)
+        if (depth > ctx.MaxDepth)
         {
+            ctx.RecordTruncation(fieldPath, "MaxDepth", ctx.MaxDepth, totalCount: 1, omittedCount: 1);
+            WriteIndent(sw, indentSpaces);
+            sw.Write("# [AssetStudio] Truncated nested value '");
+            sw.Write(fieldPath);
+            sw.Write("' at MaxDepth=");
+            sw.WriteLine(ctx.MaxDepth.ToString(CultureInfo.InvariantCulture));
             return;
         }
 
         if (value is IDictionary dict)
         {
             int written = 0;
+            int totalNonEmpty = 0;
             foreach (DictionaryEntry entry in dict)
             {
-                if (written >= MaxYamlCollectionElements) break;
                 var k = entry.Key?.ToString();
                 if (string.IsNullOrWhiteSpace(k)) continue;
-                WriteYamlProperty(sw, k, entry.Value, indentSpaces, depth + 1, ownerFile, state);
+                totalNonEmpty++;
+                if (ctx.MaxCollectionElements > 0 && written >= ctx.MaxCollectionElements) continue;
+                WriteYamlProperty(sw, k, entry.Value, indentSpaces, depth + 1, $"{fieldPath}.{k}", ctx);
                 written++;
+            }
+
+            if (totalNonEmpty > written)
+            {
+                int omitted = totalNonEmpty - written;
+                ctx.RecordTruncation(fieldPath, "MaxCollectionElements", ctx.MaxCollectionElements, totalNonEmpty, omitted);
+                WriteIndent(sw, indentSpaces);
+                sw.Write("# [AssetStudio] Truncated nested dictionary '");
+                sw.Write(fieldPath);
+                sw.Write("' (");
+                sw.Write(omitted.ToString(CultureInfo.InvariantCulture));
+                sw.Write(" of ");
+                sw.Write(totalNonEmpty.ToString(CultureInfo.InvariantCulture));
+                sw.WriteLine(" entries omitted)");
             }
         }
         else if (value is IEnumerable enumerable && value is not string)
         {
             int written = 0;
+            int totalCount = 0;
             foreach (var elem in enumerable)
             {
-                if (written >= MaxYamlCollectionElements) break;
-                WriteYamlListItem(sw, elem, indentSpaces, depth + 1, ownerFile, state);
+                totalCount++;
+                if (ctx.MaxCollectionElements > 0 && written >= ctx.MaxCollectionElements) continue;
+                WriteYamlListItem(sw, elem, indentSpaces, depth + 1, $"{fieldPath}[{written}]", ctx);
                 written++;
+            }
+
+            if (totalCount > written)
+            {
+                int omitted = totalCount - written;
+                ctx.RecordTruncation(fieldPath, "MaxCollectionElements", ctx.MaxCollectionElements, totalCount, omitted);
+                WriteIndent(sw, indentSpaces);
+                sw.Write("# [AssetStudio] Truncated nested collection '");
+                sw.Write(fieldPath);
+                sw.Write("' (");
+                sw.Write(omitted.ToString(CultureInfo.InvariantCulture));
+                sw.Write(" of ");
+                sw.Write(totalCount.ToString(CultureInfo.InvariantCulture));
+                sw.WriteLine(" elements omitted)");
             }
         }
     }
@@ -4138,6 +4289,8 @@ public sealed class UnityProjectExporterService
                 ? options.MissingDependencies.Where(static d => !string.IsNullOrWhiteSpace(d)).OrderBy(static d => d, StringComparer.Ordinal).ToList()
                 : new List<string>(),
             MissingAssets = missingAssetsSorted,
+            IsPartial = state.TruncationDiagnostics.Count > 0,
+            TruncationDiagnostics = new List<UnityProjectTruncationDiagnostic>(state.TruncationDiagnostics),
             ScriptExportSummary = scriptSummary
         };
     }
@@ -4594,25 +4747,6 @@ public sealed class UnityProjectExporterService
         {
             return manager.assetsFileList.ToArray();
         }
-    }
-
-    private static bool IsNormalMapPropertyName(string propName)
-    {
-        return propName.Contains("Bump", StringComparison.OrdinalIgnoreCase)
-            || propName.Contains("Normal", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool LooksLikeNormalMapName(string? name)
-    {
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            return false;
-        }
-
-        return name.EndsWith("_NRM", StringComparison.OrdinalIgnoreCase)
-            || name.EndsWith("_Normal", StringComparison.OrdinalIgnoreCase)
-            || name.EndsWith("_Bump", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("_NormalMap", StringComparison.OrdinalIgnoreCase);
     }
 
     // =========================================================================

@@ -15,6 +15,37 @@ namespace AssetStudio
         AllLods = 1
     }
 
+    public sealed class LodGroupExclusionResult
+    {
+        public HashSet<Renderer> ExcludedRenderers { get; } = new HashSet<Renderer>();
+        public HashSet<(string FileName, long PathId)> ExcludedRendererIds { get; } = new HashSet<(string FileName, long PathId)>();
+        public int FilteredLodGroupCount { get; set; }
+
+        public bool IsExcluded(Renderer? renderer)
+        {
+            if (renderer == null || (ExcludedRenderers.Count == 0 && ExcludedRendererIds.Count == 0))
+            {
+                return false;
+            }
+
+            if (ExcludedRenderers.Contains(renderer))
+            {
+                return true;
+            }
+
+            if (renderer.m_PathID != 0)
+            {
+                var key = (renderer.assetsFile?.fileName ?? string.Empty, renderer.m_PathID);
+                if (ExcludedRendererIds.Contains(key))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
     public sealed class SceneScriptSpawnAttachment
     {
         public Transform? AnchorTransform { get; init; }
@@ -533,11 +564,36 @@ namespace AssetStudio
             bool includeInactive,
             CancellationToken cancellationToken)
         {
+            var lodResult = ComputeLodGroupExclusions(rootGameObjects, targetLodLevel: 0, includeInactive: includeInactive, cancellationToken: cancellationToken);
+            _excludedLodRenderers.UnionWith(lodResult.ExcludedRenderers);
+            _excludedLodRendererIds.UnionWith(lodResult.ExcludedRendererIds);
+        }
+
+        /// <summary>
+        /// Single shared LODGroup filter used by both scene .glb conversion and Unity project/package export.
+        /// Keeps all renderers belonging to the resolved target LOD tier (including renderers shared with other tiers)
+        /// and excludes renderers unique to non-target tiers. Supports both binary LODGroup and TypeTree fallback.
+        /// </summary>
+        public static LodGroupExclusionResult ComputeLodGroupExclusions(
+            IReadOnlyList<GameObject> rootGameObjects,
+            int targetLodLevel = 0,
+            bool includeInactive = false,
+            CancellationToken cancellationToken = default)
+        {
+            var result = new LodGroupExclusionResult();
+            if (rootGameObjects == null || rootGameObjects.Count == 0)
+            {
+                return result;
+            }
+
+            int requestedLod = Math.Max(0, targetLodLevel);
             var visited = new HashSet<Transform>();
             var keptRenderers = new HashSet<Renderer>();
             var keptIds = new HashSet<(string FileName, long PathId)>();
+            var perGroupCandidates = new List<(List<Renderer> Rends, List<(string FileName, long PathId)> Keys)>();
 
-            for (int i = 0; i < rootGameObjects.Count; i++)
+            var stack = new Stack<Transform>();
+            for (int i = rootGameObjects.Count - 1; i >= 0; i--)
             {
                 var rootGo = rootGameObjects[i];
                 if (rootGo?.m_Transform == null || (!includeInactive && !rootGo.m_IsActive))
@@ -545,74 +601,111 @@ namespace AssetStudio
                     continue;
                 }
 
-                CollectLodGroupExclusionsRecursive(rootGo.m_Transform, visited, keptRenderers, keptIds, includeInactive, cancellationToken);
+                stack.Push(rootGo.m_Transform);
             }
 
-            _excludedLodRenderers.ExceptWith(keptRenderers);
-            _excludedLodRendererIds.ExceptWith(keptIds);
-        }
-
-        private void CollectLodGroupExclusionsRecursive(
-            Transform trans,
-            HashSet<Transform> visited,
-            HashSet<Renderer> keptRenderers,
-            HashSet<(string FileName, long PathId)> keptIds,
-            bool includeInactive,
-            CancellationToken cancellationToken)
-        {
-            if (trans == null || !visited.Add(trans))
+            while (stack.Count > 0)
             {
-                return;
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (TryResolveTransformGameObject(trans, out var go) && go != null)
-            {
-                if (!includeInactive && !go.m_IsActive)
-                {
-                    return;
-                }
-
-                CollectLodExclusionsFromGameObject(go, keptRenderers, keptIds);
-            }
-
-            if (trans.m_Children == null)
-            {
-                return;
-            }
-
-            for (int i = 0; i < trans.m_Children.Length; i++)
-            {
-                var childPtr = trans.m_Children[i];
-                if (childPtr == null || childPtr.IsNull)
+                cancellationToken.ThrowIfCancellationRequested();
+                var trans = stack.Pop();
+                if (trans == null || !visited.Add(trans))
                 {
                     continue;
                 }
 
-                if (!childPtr.TryGet(out var child))
+                if (TryResolveTransformGameObject(trans, out var go) && go != null)
                 {
-                    foreach (var sf in SnapshotAssetsFiles(trans.assetsFile?.assetsManager))
+                    if (!includeInactive && !go.m_IsActive)
                     {
-                        if (sf.TryGetObject(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        continue;
+                    }
+
+                    CollectLodExclusionsFromGameObjectStatic(
+                        go,
+                        requestedLod,
+                        keptRenderers,
+                        keptIds,
+                        result.ExcludedRenderers,
+                        result.ExcludedRendererIds,
+                        perGroupCandidates);
+                }
+
+                if (trans.m_Children == null || trans.m_Children.Length == 0)
+                {
+                    continue;
+                }
+
+                for (int i = trans.m_Children.Length - 1; i >= 0; i--)
+                {
+                    var childPtr = trans.m_Children[i];
+                    if (childPtr == null || childPtr.IsNull)
+                    {
+                        continue;
+                    }
+
+                    if (!childPtr.TryGet(out var child))
+                    {
+                        foreach (var sf in SnapshotAssetsFiles(trans.assetsFile?.assetsManager))
                         {
-                            child = foundChild;
+                            if (sf.TryGetObject(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                            {
+                                child = foundChild;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (child != null)
+                    {
+                        stack.Push(child);
+                    }
+                }
+            }
+
+            result.ExcludedRenderers.ExceptWith(keptRenderers);
+            result.ExcludedRendererIds.ExceptWith(keptIds);
+
+            for (int i = 0; i < perGroupCandidates.Count; i++)
+            {
+                var (rends, keys) = perGroupCandidates[i];
+                bool anyExcluded = false;
+                for (int r = 0; r < rends.Count; r++)
+                {
+                    if (result.ExcludedRenderers.Contains(rends[r]))
+                    {
+                        anyExcluded = true;
+                        break;
+                    }
+                }
+                if (!anyExcluded)
+                {
+                    for (int k = 0; k < keys.Count; k++)
+                    {
+                        if (result.ExcludedRendererIds.Contains(keys[k]))
+                        {
+                            anyExcluded = true;
                             break;
                         }
                     }
                 }
 
-                if (child != null)
+                if (anyExcluded)
                 {
-                    CollectLodGroupExclusionsRecursive(child, visited, keptRenderers, keptIds, includeInactive, cancellationToken);
+                    result.FilteredLodGroupCount++;
                 }
             }
+
+            return result;
         }
 
-        private void CollectLodExclusionsFromGameObject(
+        private static void CollectLodExclusionsFromGameObjectStatic(
             GameObject go,
+            int requestedLod,
             HashSet<Renderer> keptRenderers,
-            HashSet<(string FileName, long PathId)> keptIds)
+            HashSet<(string FileName, long PathId)> keptIds,
+            HashSet<Renderer> excludedRenderers,
+            HashSet<(string FileName, long PathId)> excludedIds,
+            List<(List<Renderer> Rends, List<(string FileName, long PathId)> Keys)> perGroupCandidates)
         {
             if (go.m_Components == null)
             {
@@ -632,29 +725,29 @@ namespace AssetStudio
                     continue;
                 }
 
-                if (!lodGroup.m_Enabled || lodGroup.m_LODs == null || lodGroup.m_LODs.Length == 0)
+                if (!lodGroup.m_Enabled)
                 {
                     continue;
                 }
 
-                int selectedLodIndex = -1;
-                for (int l = 0; l < lodGroup.m_LODs.Length; l++)
+                var lods = ExtractLodLevelsForFiltering(lodGroup);
+                if (lods.Count == 0)
                 {
-                    if (lodGroup.m_LODs[l]?.renderers is { Length: > 0 })
-                    {
-                        selectedLodIndex = l;
-                        break;
-                    }
+                    continue;
                 }
 
+                int selectedLodIndex = SelectTargetLodLevelIndex(lods, requestedLod);
                 if (selectedLodIndex < 0)
                 {
                     continue;
                 }
 
-                for (int l = 0; l < lodGroup.m_LODs.Length; l++)
+                var groupExcludedRends = new List<Renderer>();
+                var groupExcludedKeys = new List<(string FileName, long PathId)>();
+
+                for (int l = 0; l < lods.Count; l++)
                 {
-                    var lod = lodGroup.m_LODs[l];
+                    var lod = lods[l];
                     if (lod?.renderers == null)
                     {
                         continue;
@@ -680,18 +773,168 @@ namespace AssetStudio
                             }
                             else
                             {
-                                _excludedLodRenderers.Add(rend);
-                                if (key.HasValue) _excludedLodRendererIds.Add(key.Value);
+                                excludedRenderers.Add(rend);
+                                groupExcludedRends.Add(rend);
+                                if (key.HasValue)
+                                {
+                                    excludedIds.Add(key.Value);
+                                    groupExcludedKeys.Add(key.Value);
+                                }
                             }
                         }
                         else if (!isSelectedTier && rendPtr.m_PathID != 0)
                         {
                             var fileKey = ResolvePPtrFileName(lodGroup.assetsFile, rendPtr.m_FileID);
-                            _excludedLodRendererIds.Add((fileKey, rendPtr.m_PathID));
+                            var pair = (fileKey, rendPtr.m_PathID);
+                            excludedIds.Add(pair);
+                            groupExcludedKeys.Add(pair);
                         }
                     }
                 }
+
+                if (groupExcludedRends.Count > 0 || groupExcludedKeys.Count > 0)
+                {
+                    perGroupCandidates.Add((groupExcludedRends, groupExcludedKeys));
+                }
             }
+        }
+
+        private static int SelectTargetLodLevelIndex(IReadOnlyList<LOD> lods, int requestedLod)
+        {
+            static bool HasRenderers(LOD? lod)
+            {
+                if (lod?.renderers == null || lod.renderers.Length == 0)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < lod.renderers.Length; i++)
+                {
+                    if (lod.renderers[i] != null && !lod.renderers[i].IsNull)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            if (requestedLod >= 0 && requestedLod < lods.Count && HasRenderers(lods[requestedLod]))
+            {
+                return requestedLod;
+            }
+
+            for (int i = Math.Min(requestedLod + 1, lods.Count); i < lods.Count; i++)
+            {
+                if (HasRenderers(lods[i]))
+                {
+                    return i;
+                }
+            }
+
+            for (int i = Math.Min(requestedLod - 1, lods.Count - 1); i >= 0; i--)
+            {
+                if (HasRenderers(lods[i]))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        public static List<LOD> ExtractLodLevels(LODGroup lodGroup)
+        {
+            return ExtractLodLevelsForFiltering(lodGroup);
+        }
+
+        private static List<LOD> ExtractLodLevelsForFiltering(LODGroup lodGroup)
+        {
+            if (lodGroup == null)
+            {
+                return new List<LOD>();
+            }
+
+            if (lodGroup.m_LODs is { Length: > 0 })
+            {
+                var list = new List<LOD>(lodGroup.m_LODs.Length);
+                for (int i = 0; i < lodGroup.m_LODs.Length; i++)
+                {
+                    if (lodGroup.m_LODs[i] != null)
+                    {
+                        list.Add(lodGroup.m_LODs[i]);
+                    }
+                }
+                if (list.Count > 0)
+                {
+                    return list;
+                }
+            }
+
+            if (lodGroup.serializedType?.m_Type?.m_Nodes is { Count: > 0 })
+            {
+                try
+                {
+                    var dict = lodGroup.ToType(lodGroup.serializedType.m_Type);
+                    if (dict != null && dict.Contains("m_LODs") && dict["m_LODs"] is System.Collections.IEnumerable lodItems && dict["m_LODs"] is not string)
+                    {
+                        var result = new List<LOD>();
+                        foreach (var lodItem in lodItems)
+                        {
+                            if (lodItem is not System.Collections.IDictionary lodDict)
+                            {
+                                continue;
+                            }
+
+                            var renderers = new List<PPtr<Renderer>>();
+                            if (lodDict.Contains("renderers") && lodDict["renderers"] is System.Collections.IEnumerable rendItems && lodDict["renderers"] is not string)
+                            {
+                                foreach (var rendItem in rendItems)
+                                {
+                                    if (rendItem is not System.Collections.IDictionary rendDict)
+                                    {
+                                        continue;
+                                    }
+
+                                    var pptrDict = rendDict.Contains("renderer") && rendDict["renderer"] is System.Collections.IDictionary inner
+                                        ? inner
+                                        : rendDict;
+                                    if (pptrDict.Contains("m_FileID") && pptrDict.Contains("m_PathID")
+                                        && pptrDict["m_FileID"] != null && pptrDict["m_PathID"] != null)
+                                    {
+                                        int fId = Convert.ToInt32(pptrDict["m_FileID"], System.Globalization.CultureInfo.InvariantCulture);
+                                        long pId = Convert.ToInt64(pptrDict["m_PathID"], System.Globalization.CultureInfo.InvariantCulture);
+                                        if (pId != 0)
+                                        {
+                                            renderers.Add(new PPtr<Renderer>(fId, pId, lodGroup.assetsFile));
+                                        }
+                                    }
+                                }
+                            }
+
+                            float screenRel = lodDict.Contains("screenRelativeHeight") && lodDict["screenRelativeHeight"] != null
+                                ? Convert.ToSingle(lodDict["screenRelativeHeight"], System.Globalization.CultureInfo.InvariantCulture)
+                                : 0f;
+                            float fadeWidth = lodDict.Contains("fadeTransitionWidth") && lodDict["fadeTransitionWidth"] != null
+                                ? Convert.ToSingle(lodDict["fadeTransitionWidth"], System.Globalization.CultureInfo.InvariantCulture)
+                                : 0f;
+
+                            result.Add(new LOD
+                            {
+                                screenRelativeHeight = screenRel,
+                                fadeTransitionWidth = fadeWidth,
+                                renderers = renderers.ToArray()
+                            });
+                        }
+                        return result;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return new List<LOD>();
         }
 
         private bool IsExcludedByLodGroup(Renderer renderer)
@@ -4446,7 +4689,7 @@ namespace AssetStudio
             return tokens;
         }
 
-        private static bool IsLikelyNormalMapTextureAssetName(string? textureName)
+        public static bool IsLikelyNormalMapTextureAssetName(string? textureName)
         {
             if (string.IsNullOrWhiteSpace(textureName))
             {
@@ -4811,7 +5054,7 @@ namespace AssetStudio
             return false;
         }
 
-        private static int GetTextureDestination(string propertyName)
+        public static int GetTextureDestination(string propertyName)
         {
             if (string.IsNullOrWhiteSpace(propertyName))
             {
@@ -5004,7 +5247,7 @@ namespace AssetStudio
             return -1;
         }
 
-        private static int GetDiffuseSlotPriority(string propertyName)
+        public static int GetDiffuseSlotPriority(string propertyName)
         {
             return propertyName switch
             {
@@ -6327,6 +6570,164 @@ namespace AssetStudio
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Thread-safe factory converting a single Unity <see cref="Mesh"/> (including all submeshes,
+        /// UV0..UV7, normals, tangents, vertex colors, BlendShapes, and optional bindposes/skinning)
+        /// into an <see cref="IImported"/> ready for <see cref="ModelExporter.ExportFbx"/>.
+        /// Assigns distinct submesh slot material names so Unity's FBXImporter preserves every submesh natively.
+        /// </summary>
+        public static ModelConverter CreateForUnityMeshAsset(
+            Mesh mesh,
+            string meshName,
+            bool includeBindPoses = false)
+        {
+            ArgumentNullException.ThrowIfNull(mesh);
+            var cleanName = !string.IsNullOrWhiteSpace(meshName)
+                ? meshName.Trim()
+                : (!string.IsNullOrWhiteSpace(mesh.m_Name) ? mesh.m_Name.Trim() : $"Mesh_{mesh.m_PathID}");
+
+            var converter = new ModelConverter(ImageFormat.Png, textureResolver: null);
+            var rootFrame = CreateFrame(cleanName + "_Root", Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One);
+            converter.SetRootFrame(rootFrame);
+
+            var meshFrame = CreateFrame(cleanName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One);
+            rootFrame.AddChild(meshFrame);
+
+            converter.ConvertModelGroupMeshPart(mesh, meshFrame.Path, fallbackMaterials: null, renderer: null);
+
+            if (converter.MeshList.Count > 0)
+            {
+                var iMesh = converter.MeshList[0];
+
+                // Ensure distinct material slot names per submesh so Unity's FBXImporter never collapses
+                // multi-material submeshes into a single submesh.
+                if (iMesh.SubmeshList != null && iMesh.SubmeshList.Count > 1)
+                {
+                    converter.MaterialList.Clear();
+                    for (int s = 0; s < iMesh.SubmeshList.Count; s++)
+                    {
+                        var slotMatName = $"mat_{s}";
+                        iMesh.SubmeshList[s].Material = slotMatName;
+                        converter.MaterialList.Add(new ImportedMaterial
+                        {
+                            Name = slotMatName,
+                            Diffuse = new Color(0.8f, 0.8f, 0.8f, 1f),
+                            Ambient = new Color(0.2f, 0.2f, 0.2f, 1f),
+                            Specular = new Color(0.2f, 0.2f, 0.2f, 1f),
+                            Emissive = new Color(0f, 0f, 0f, 1f),
+                            Reflection = new Color(0f, 0f, 0f, 1f)
+                        });
+                    }
+                }
+
+                // Populate synthetic bone frames + exact bindpose matrices directly from Mesh.m_BindPose
+                // so SkinnedMeshRenderer meshes export with 100% intact bindposes & boneWeights without
+                // walking external scene transform hierarchies (fully thread-safe for parallel export).
+                if (includeBindPoses
+                    && mesh.m_BindPose is { Length: > 0 }
+                    && mesh.m_Skin is { Length: > 0 }
+                    && (iMesh.BoneList == null || iMesh.BoneList.Count == 0))
+                {
+                    int boneCount = mesh.m_BindPose.Length;
+                    var convertMat = Matrix4x4.Scale(new Vector3(-1f, 1f, 1f));
+                    iMesh.BoneList = new List<ImportedBone>(boneCount);
+                    for (int b = 0; b < boneCount; b++)
+                    {
+                        var boneFrame = CreateFrame($"Bone_{b}", Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One);
+                        rootFrame.AddChild(boneFrame);
+                        iMesh.BoneList.Add(new ImportedBone
+                        {
+                            Path = boneFrame.Path,
+                            Matrix = convertMat * mesh.m_BindPose[b] * convertMat
+                        });
+                    }
+                }
+            }
+
+            return converter;
+        }
+
+        /// <summary>
+        /// Thread-safe factory converting <see cref="TerrainMeshData"/> into an <see cref="IImported"/>
+        /// ready for <see cref="ModelExporter.ExportFbx"/> using the exact X-mirror/winding convention
+        /// of <see cref="TerrainMeshConverter"/>.
+        /// </summary>
+        public static ModelConverter CreateForTerrainMeshData(TerrainMeshData meshData, string meshName)
+        {
+            ArgumentNullException.ThrowIfNull(meshData);
+            var cleanName = !string.IsNullOrWhiteSpace(meshName) ? meshName.Trim() : "Terrain";
+
+            var converter = new ModelConverter(ImageFormat.Png, textureResolver: null);
+            var rootFrame = CreateFrame(cleanName + "_Root", Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One);
+            converter.SetRootFrame(rootFrame);
+
+            var meshFrame = CreateFrame(cleanName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One);
+            rootFrame.AddChild(meshFrame);
+
+            int vertCount = meshData.Positions.Length;
+            var vertices = new List<ImportedVertex>(vertCount);
+            for (int i = 0; i < vertCount; i++)
+            {
+                var p = meshData.Positions[i];
+                var n = meshData.Normals[i];
+                var uv = meshData.UVs[i];
+                var uvs = new float[8][];
+                uvs[0] = new[] { uv.X, uv.Y };
+                vertices.Add(new ImportedVertex
+                {
+                    Vertex = new Vector3(-p.X, p.Y, p.Z),
+                    Normal = new Vector3(-n.X, n.Y, n.Z),
+                    UV = uvs
+                });
+            }
+
+            int triCount = meshData.Indices.Length / 3;
+            var faces = new List<ImportedFace>(triCount);
+            for (int t = 0; t < triCount; t++)
+            {
+                int idx = t * 3;
+                faces.Add(new ImportedFace
+                {
+                    VertexIndices = new[]
+                    {
+                        meshData.Indices[idx + 2],
+                        meshData.Indices[idx + 1],
+                        meshData.Indices[idx]
+                    }
+                });
+            }
+
+            var matName = "Terrain_Mat";
+            converter.MaterialList.Add(new ImportedMaterial
+            {
+                Name = matName,
+                Diffuse = new Color(0.8f, 0.8f, 0.8f, 1f),
+                Ambient = new Color(0.2f, 0.2f, 0.2f, 1f),
+                Specular = new Color(0.2f, 0.2f, 0.2f, 1f),
+                Emissive = new Color(0f, 0f, 0f, 1f),
+                Reflection = new Color(0f, 0f, 0f, 1f)
+            });
+
+            converter.MeshList.Add(new ImportedMesh
+            {
+                Path = meshFrame.Path,
+                hasNormal = true,
+                hasUV = new[] { true, false, false, false, false, false, false, false },
+                VertexList = vertices,
+                SubmeshList = new List<ImportedSubmesh>
+                {
+                    new ImportedSubmesh
+                    {
+                        Material = matName,
+                        BaseVertex = 0,
+                        FaceList = faces
+                    }
+                }
+            });
+
+            return converter;
         }
 
         public static ModelConverter CreateFromModelGroup(

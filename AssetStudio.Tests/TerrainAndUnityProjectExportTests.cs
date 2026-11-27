@@ -723,22 +723,16 @@ namespace AssetStudio.Tests
                 Assert.Contains($"guid: {expectedAlbedoGuid}", matAText);
                 Assert.Contains($"guid: {expectedNormalGuid}", matAText);
 
-                // 6) Multi-submesh .obj + companion .mtl + .obj.meta (Unity 6 internalIDToNameTable + legacy recycle table)
-                var meshPath = Path.Combine(tempRoot, "Assets", "Meshes", "SM_Tower.obj");
-                var mtlPath = Path.Combine(tempRoot, "Assets", "Meshes", "SM_Tower.mtl");
+                // 6) Multi-submesh binary .fbx + .fbx.meta via shared ModelConverter/ModelExporter pipeline
+                var meshPath = Path.Combine(tempRoot, "Assets", "Meshes", "SM_Tower.fbx");
                 Assert.True(File.Exists(meshPath));
                 Assert.True(File.Exists(meshPath + ".meta"));
-                Assert.True(File.Exists(mtlPath));
-                Assert.True(File.Exists(mtlPath + ".meta"));
-                var objText = File.ReadAllText(meshPath);
-                Assert.Contains("mtllib SM_Tower.mtl", objText);
-                Assert.Contains("g SM_Tower", objText);
-                Assert.DoesNotContain("g submesh_", objText);
-                Assert.Contains("usemtl mat_0", objText);
-                Assert.Contains("usemtl mat_1", objText);
-                var mtlText = File.ReadAllText(mtlPath);
-                Assert.Contains("newmtl mat_0", mtlText);
-                Assert.Contains("newmtl mat_1", mtlText);
+                Assert.False(File.Exists(Path.Combine(tempRoot, "Assets", "Meshes", "SM_Tower.mtl")));
+                Assert.False(File.Exists(Path.Combine(tempRoot, "Assets", "Meshes", "SM_Tower.fbx-export-report.txt")));
+                var fbxBytes = File.ReadAllBytes(meshPath);
+                Assert.StartsWith("Kaydara FBX Binary", Encoding.ASCII.GetString(fbxBytes, 0, Math.Min(fbxBytes.Length, 20)));
+                // Binary FBX MUST use the fixed Autodesk/Blender epoch timestamp matching hardcoded FileId/FootId!
+                Assert.Contains("1970-01-01 10:00:00:000", Encoding.Latin1.GetString(fbxBytes));
                 var meshMetaText = File.ReadAllText(meshPath + ".meta");
                 Assert.Contains("internalIDToNameTable:", meshMetaText);
                 Assert.Contains("43: 4300000", meshMetaText);
@@ -832,7 +826,7 @@ namespace AssetStudio.Tests
                     Assert.StartsWith(fullProjectPrefix, Path.GetFullPath(f), StringComparison.OrdinalIgnoreCase);
                 }
 
-                Assert.True(File.Exists(Path.Combine(projectDir, "Assets", "Meshes", "_CON.obj")));
+                Assert.True(File.Exists(Path.Combine(projectDir, "Assets", "Meshes", "_CON.fbx")));
                 Assert.True(File.Exists(Path.Combine(projectDir, "Assets", "Materials", "_NUL.mat")));
                 Assert.True(File.Exists(Path.Combine(projectDir, "Assets", "Textures", "_COM1.png")));
                 Assert.True(File.Exists(Path.Combine(projectDir, "Assets", "Scenes", "evil.unity")));
@@ -988,6 +982,334 @@ namespace AssetStudio.Tests
                 Assert.Single(metaFiles);
                 var scriptMeta = File.ReadAllText(metaFiles[0]);
                 Assert.Contains($"guid: {expectedGuid}", scriptMeta, StringComparison.Ordinal);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void UnityProjectExporter_SharedFbxPipeline_AliasedUrpMaterials_SkinnedBoneAlignment_AndScriptSpawns()
+        {
+            var tempRoot = CreateTempDirectory("unity_proj_shared_fbx_pipeline");
+            try
+            {
+                using var am = new AssetsManager();
+                var sf = CreateSyntheticSerializedFile(am, "level0", "6000.3.18f1");
+
+                // 1) URP Lit material with _BaseMap, _BumpMap, _BaseColor and out-of-range queue 4500
+                var urpShader = CreateSyntheticShader(sf, 10, "Universal Render Pipeline/Lit");
+                var baseMapTex = CreateSolidRgbaTexture2D(sf, 20, "T_Hero_BaseColor", 220, 180, 120, 255);
+                var normalTex = CreateSolidRgbaTexture2D(sf, 21, "T_Hero_Normal", 128, 128, 255, 255);
+                var urpMat = CreateSyntheticMaterial(
+                    sf, 30, "Mat_HeroUrp", urpShader,
+                    texEnvs: new[] { ("_BaseMap", baseMapTex), ("_BumpMap", normalTex) },
+                    colors: new[] { ("_BaseColor", new Color(0.8f, 0.6f, 0.4f, 1f)) },
+                    floats: new[] { ("_Smoothness", 0.7f) },
+                    renderQueue: 4500);
+
+                // 2) Rigged mesh with 3 bones where bone #1 has zero weight (tests ComputeActiveSkinBoneMask + bindposes!)
+                var riggedMesh = CreateSyntheticTwoSubmeshMesh(sf, 40, "SK_Hero");
+                riggedMesh.m_BindPose = new[]
+                {
+                    new Matrix4x4(new float[] { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1 }),
+                    new Matrix4x4(new float[] { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, -1, 0, 1 }),
+                    new Matrix4x4(new float[] { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, -2, 0, 1 })
+                };
+                riggedMesh.m_Skin = new[]
+                {
+                    new BoneWeights4 { weight = new[] { 1f, 0f, 0f, 0f }, boneIndex = new[] { 0, 0, 0, 0 } },
+                    new BoneWeights4 { weight = new[] { 0.5f, 0.5f, 0f, 0f }, boneIndex = new[] { 0, 2, 0, 0 } },
+                    new BoneWeights4 { weight = new[] { 1f, 0f, 0f, 0f }, boneIndex = new[] { 2, 0, 0, 0 } },
+                    new BoneWeights4 { weight = new[] { 1f, 0f, 0f, 0f }, boneIndex = new[] { 2, 0, 0, 0 } }
+                };
+
+                var mask = FbxSharpieExporter.ComputeActiveSkinBoneMask(riggedMesh, 3);
+                Assert.Equal(new[] { true, false, true }, mask);
+
+                var rootGo = CreateSyntheticGameObject(sf, 100, "SceneRoot", true, 0);
+                var rootTr = CreateSyntheticTransform(sf, 101, rootGo, null, Vector3.Zero);
+
+                var bone0Go = CreateSyntheticGameObject(sf, 110, "Bone_Pelvis", true, 0);
+                var bone0Tr = CreateSyntheticTransform(sf, 111, bone0Go, rootTr, Vector3.Zero);
+                AttachComponents(bone0Go, bone0Tr);
+
+                var bone1Go = CreateSyntheticGameObject(sf, 120, "Bone_Unused", true, 0);
+                var bone1Tr = CreateSyntheticTransform(sf, 121, bone1Go, bone0Tr, new Vector3(0f, 1f, 0f));
+                AttachComponents(bone1Go, bone1Tr);
+
+                var bone2Go = CreateSyntheticGameObject(sf, 130, "Bone_Chest", true, 0);
+                var bone2Tr = CreateSyntheticTransform(sf, 131, bone2Go, bone1Tr, new Vector3(0f, 1f, 0f));
+                AttachComponents(bone2Go, bone2Tr);
+
+                bone0Tr.m_Children = new[] { CreatePPtr<Transform>(sf, 0, bone1Tr.m_PathID) };
+                bone1Tr.m_Children = new[] { CreatePPtr<Transform>(sf, 0, bone2Tr.m_PathID) };
+
+                var heroGo = CreateSyntheticGameObject(sf, 140, "HeroMesh", true, 0);
+                var heroTr = CreateSyntheticTransform(sf, 141, heroGo, rootTr, Vector3.Zero);
+                var smr = CreateSyntheticObject<SkinnedMeshRenderer>(sf, 142, ClassIDType.SkinnedMeshRenderer);
+                smr.m_GameObject = CreatePPtr<GameObject>(sf, 0, heroGo.m_PathID);
+                smr.m_Enabled = true;
+                smr.m_Mesh = CreatePPtr<Mesh>(sf, 0, riggedMesh.m_PathID);
+                smr.m_Materials = new[] { CreatePPtr<Material>(sf, 0, urpMat.m_PathID), CreatePPtr<Material>(sf, 0, urpMat.m_PathID) };
+                smr.m_Bones = new[]
+                {
+                    CreatePPtr<Transform>(sf, 0, bone0Tr.m_PathID),
+                    CreatePPtr<Transform>(sf, 0, bone1Tr.m_PathID),
+                    CreatePPtr<Transform>(sf, 0, bone2Tr.m_PathID)
+                };
+                smr.m_RootBone = CreatePPtr<Transform>(sf, 0, bone0Tr.m_PathID);
+                AttachComponents(heroGo, heroTr, smr);
+
+                // 3) Two anchor nodes for script-spawned prefab instances (same prefab spawned twice!)
+                var anchorAGo = CreateSyntheticGameObject(sf, 150, "SpawnAnchorA", true, 0);
+                var anchorATr = CreateSyntheticTransform(sf, 151, anchorAGo, rootTr, new Vector3(5f, 0f, 0f));
+                AttachComponents(anchorAGo, anchorATr);
+
+                var anchorBGo = CreateSyntheticGameObject(sf, 160, "SpawnAnchorB", true, 0);
+                var anchorBTr = CreateSyntheticTransform(sf, 161, anchorBGo, rootTr, new Vector3(-5f, 0f, 0f));
+                AttachComponents(anchorBGo, anchorBTr);
+
+                rootTr.m_Children = new[]
+                {
+                    CreatePPtr<Transform>(sf, 0, bone0Tr.m_PathID),
+                    CreatePPtr<Transform>(sf, 0, heroTr.m_PathID),
+                    CreatePPtr<Transform>(sf, 0, anchorATr.m_PathID),
+                    CreatePPtr<Transform>(sf, 0, anchorBTr.m_PathID)
+                };
+                AttachComponents(rootGo, rootTr);
+
+                // External prefab (not in rootGo hierarchy!) spawned at both anchors
+                var propMesh = CreateSyntheticTwoSubmeshMesh(sf, 200, "SM_SpawnedCrate");
+                var crateGo = CreateSyntheticGameObject(sf, 210, "PF_Crate", true, 0);
+                var crateTr = CreateSyntheticTransform(sf, 211, crateGo, null, Vector3.Zero);
+                var crateMf = CreateSyntheticMeshFilter(sf, 212, crateGo, 0, propMesh.m_PathID);
+                var crateMr = CreateSyntheticMeshRenderer(sf, 213, crateGo, true, new[] { CreatePPtr<Material>(sf, 0, urpMat.m_PathID) });
+                AttachComponents(crateGo, crateTr, crateMf, crateMr);
+
+                var exporter = new UnityProjectExporterService();
+                var result = exporter.ExportSceneToUnityProject(
+                    new[] { rootGo },
+                    new UnityProjectExportOptions
+                    {
+                        OutputDirectory = tempRoot,
+                        SceneName = "SharedPipelineScene",
+                        WriteManifest = true,
+                        ScriptSpawnAttachments = new[]
+                        {
+                            new SceneScriptSpawnAttachment
+                            {
+                                AnchorTransform = anchorATr,
+                                OwnerGameObject = anchorAGo,
+                                PrefabRoot = crateGo,
+                                LocalPositionOffset = new Vector3(1f, 2f, 3f)
+                            },
+                            new SceneScriptSpawnAttachment
+                            {
+                                AnchorTransform = anchorBTr,
+                                OwnerGameObject = anchorBGo,
+                                PrefabRoot = crateGo,
+                                LocalPositionOffset = new Vector3(-1f, 0.5f, 4f)
+                            }
+                        }
+                    });
+
+                Assert.True(result.Success, result.ErrorMessage);
+
+                // A) Rigged FBX exists, starts with binary magic, has 1970 epoch timestamp, has skin deformer, no stray report!
+                var heroFbxPath = Path.Combine(tempRoot, "Assets", "Meshes", "SK_Hero.fbx");
+                Assert.True(File.Exists(heroFbxPath));
+                Assert.False(File.Exists(heroFbxPath + "-export-report.txt"));
+                Assert.False(File.Exists(Path.Combine(tempRoot, "Assets", "Meshes", "SK_Hero.fbx-export-report.txt")));
+                var heroFbxBytes = File.ReadAllBytes(heroFbxPath);
+                Assert.StartsWith("Kaydara FBX Binary", Encoding.ASCII.GetString(heroFbxBytes, 0, Math.Min(heroFbxBytes.Length, 20)));
+                var heroFbxLatin1 = Encoding.Latin1.GetString(heroFbxBytes);
+                Assert.Contains("1970-01-01 10:00:00:000", heroFbxLatin1);
+                Assert.Contains("Deformer", heroFbxLatin1);
+                Assert.Contains("Bone_0", heroFbxLatin1);
+                Assert.Contains("Bone_2", heroFbxLatin1);
+
+                // B) Spawned prefab's mesh was registered and exported as FBX!
+                Assert.True(File.Exists(Path.Combine(tempRoot, "Assets", "Meshes", "SM_SpawnedCrate.fbx")));
+
+                // C) URP material aliased _BaseMap -> _MainTex, _BaseColor -> _Color while keeping originals, and clamped queue 4500 -> -1!
+                var matPath = Path.Combine(tempRoot, "Assets", "Materials", "Mat_HeroUrp.mat");
+                Assert.True(File.Exists(matPath));
+                var matText = File.ReadAllText(matPath);
+                var expectedBaseMapGuid = UnityProjectExporterService.ComputeUnityAssetGuid("texture2d", "level0", baseMapTex.m_PathID, "T_Hero_BaseColor");
+                Assert.Contains("- _BaseMap:", matText);
+                Assert.Contains("- _MainTex:", matText);
+                Assert.Contains($"guid: {expectedBaseMapGuid}", matText);
+                Assert.Contains("- _BaseColor:", matText);
+                Assert.Contains("- _Color:", matText);
+                Assert.Contains("m_CustomRenderQueue: -1", matText);
+
+                // D) SkinnedMeshRenderer YAML contains EXACTLY 2 active bones (Bone_Pelvis + Bone_Chest, omitting zero-weight Bone_Unused)
+                //    AND both script-spawned PF_Crate instances exist with distinct positions!
+                var sceneText = File.ReadAllText(result.SceneFilePath);
+                int smrIdx = sceneText.IndexOf("SkinnedMeshRenderer:", StringComparison.Ordinal);
+                Assert.True(smrIdx >= 0);
+                var smrSection = sceneText.Substring(smrIdx, Math.Min(1500, sceneText.Length - smrIdx));
+                int bonesIdx = smrSection.IndexOf("  m_Bones:", StringComparison.Ordinal);
+                int rootBoneIdx = smrSection.IndexOf("  m_RootBone:", StringComparison.Ordinal);
+                Assert.True(bonesIdx > 0 && rootBoneIdx > bonesIdx);
+                var bonesBlock = smrSection.Substring(bonesIdx, rootBoneIdx - bonesIdx);
+                int boneEntryCount = bonesBlock.Split("- {fileID:", StringSplitOptions.None).Length - 1;
+                Assert.Equal(2, boneEntryCount);
+
+                // Verify both PF_Crate spawned instances appear in scene YAML with their offsets
+                int crateNameCount = sceneText.Split("m_Name: PF_Crate", StringSplitOptions.None).Length - 1;
+                Assert.Equal(2, crateNameCount);
+                Assert.Contains("m_LocalPosition: {x: 1, y: 2, z: 3}", sceneText);
+                Assert.Contains("m_LocalPosition: {x: -1, y: 0.5, z: 4}", sceneText);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void UnityProjectExporter_COR01_MonoBehaviourYaml_ExportsFullCollectionsAndDeepTreesAndDiagnosesConfiguredGuardrails()
+        {
+            var tempRoot = CreateTempDirectory("unity_proj_cor01");
+            try
+            {
+                using var am = new AssetsManager();
+                var sf = CreateSyntheticSerializedFile(am, "level0", "6000.3.18f1");
+
+                var script = CreateSyntheticMonoScript(sf, 10, "Game.Data", "InventoryTable", "Assembly-CSharp");
+                var rootGo = CreateSyntheticGameObject(sf, 100, "DataHolder", true, 0);
+                var rootTr = CreateSyntheticTransform(sf, 101, rootGo, null, Vector3.Zero);
+                var mb = CreateSyntheticObject<MonoBehaviour>(sf, 102, ClassIDType.MonoBehaviour);
+                mb.m_GameObject = CreatePPtr<GameObject>(sf, 0, rootGo.m_PathID);
+                mb.m_Enabled = 1;
+                mb.m_Script = CreatePPtr<MonoScript>(sf, 0, script.m_PathID);
+                mb.m_Name = "InventoryTable";
+                AttachComponents(rootGo, rootTr, mb);
+
+                static OrderedDictionary BuildNestedChain(int depth)
+                {
+                    var leaf = new OrderedDictionary { ["leafMarker"] = $"DEPTH_{depth}_VALUE" };
+                    var current = leaf;
+                    for (int d = depth - 1; d >= 1; d--)
+                    {
+                        current = new OrderedDictionary { [$"level_{d}"] = current };
+                    }
+                    return current;
+                }
+
+                var list255 = Enumerable.Range(0, 255).Select(i => (object)i).ToArray();
+                var list256 = Enumerable.Range(0, 256).Select(i => (object)i).ToArray();
+                var list257 = Enumerable.Range(0, 257).Select(i => (object)i).ToArray();
+                var list600 = Enumerable.Range(0, 600).Select(i => (object)$"entry_{i}").ToArray();
+                var bigDict = new OrderedDictionary();
+                for (int i = 0; i < 300; i++) bigDict[$"k_{i:D3}"] = i * 10;
+                var payloadBytes = new byte[1024];
+                for (int i = 0; i < payloadBytes.Length; i++) payloadBytes[i] = (byte)(i & 0xFF);
+
+                var fullFields = new OrderedDictionary
+                {
+                    ["list255"] = list255,
+                    ["list256"] = list256,
+                    ["list257"] = list257,
+                    ["list600"] = list600,
+                    ["bigDict"] = bigDict,
+                    ["rawBlob"] = payloadBytes,
+                    ["chain11"] = BuildNestedChain(11),
+                    ["chain12"] = BuildNestedChain(12),
+                    ["chain13"] = BuildNestedChain(13),
+                    ["chain20"] = BuildNestedChain(20)
+                };
+
+                var exporter = new UnityProjectExporterService();
+
+                // 1) Default full export: ZERO silent truncation across 255/256/257/600 items, 300-entry dict, 1024-byte blob, and depths 11..20!
+                var fullDir = Path.Combine(tempRoot, "FullExport");
+                var fullRes = exporter.ExportSceneToUnityProject(
+                    new[] { rootGo },
+                    new UnityProjectExportOptions
+                    {
+                        OutputDirectory = fullDir,
+                        SceneName = "FullMonoScene",
+                        WriteManifest = true,
+                        MonoBehaviourFieldProvider = o => ReferenceEquals(o, mb) ? fullFields : null
+                    });
+
+                Assert.True(fullRes.Success, fullRes.ErrorMessage);
+                Assert.False(fullRes.IsPartial);
+                Assert.Empty(fullRes.TruncationDiagnostics);
+                Assert.NotNull(fullRes.Manifest);
+                Assert.False(fullRes.Manifest!.IsPartial);
+                Assert.Empty(fullRes.Manifest.TruncationDiagnostics);
+
+                var fullYaml = File.ReadAllText(fullRes.SceneFilePath);
+                // Roundtrip check: verify exact counts and boundary values recovered from YAML
+                Assert.Contains("  - 254\n", fullYaml.Replace("\r\n", "\n"));
+                Assert.Contains("  - 255\n", fullYaml.Replace("\r\n", "\n"));
+                Assert.Contains("  - 256\n", fullYaml.Replace("\r\n", "\n"));
+                Assert.Contains("  - entry_0\n", fullYaml.Replace("\r\n", "\n"));
+                Assert.Contains("  - entry_256\n", fullYaml.Replace("\r\n", "\n"));
+                Assert.Contains("  - entry_599\n", fullYaml.Replace("\r\n", "\n"));
+                Assert.Contains("k_299: 2990", fullYaml);
+                Assert.Contains("rawBlob: " + Convert.ToHexString(payloadBytes).ToLowerInvariant(), fullYaml);
+                Assert.Contains("leafMarker: DEPTH_11_VALUE", fullYaml);
+                Assert.Contains("leafMarker: DEPTH_12_VALUE", fullYaml);
+                Assert.Contains("leafMarker: DEPTH_13_VALUE", fullYaml);
+                Assert.Contains("leafMarker: DEPTH_20_VALUE", fullYaml);
+
+                // Count exact items emitted under list600 section
+                var normalizedYaml = fullYaml.Replace("\r\n", "\n");
+                int idx600 = normalizedYaml.IndexOf("  list600:\n", StringComparison.Ordinal);
+                int idxDict = normalizedYaml.IndexOf("  bigDict:\n", StringComparison.Ordinal);
+                Assert.True(idx600 > 0 && idxDict > idx600);
+                var list600Lines = normalizedYaml.Substring(idx600, idxDict - idx600)
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Where(l => l.StartsWith("  - entry_", StringComparison.Ordinal))
+                    .ToList();
+                Assert.Equal(600, list600Lines.Count);
+
+                // 2) Guardrail export: explicit limits MUST produce IsPartial=true + exact structured diagnostics in Result AND ExportManifest.json!
+                var cappedDir = Path.Combine(tempRoot, "CappedExport");
+                var cappedRes = exporter.ExportSceneToUnityProject(
+                    new[] { rootGo },
+                    new UnityProjectExportOptions
+                    {
+                        OutputDirectory = cappedDir,
+                        SceneName = "CappedMonoScene",
+                        WriteManifest = true,
+                        MaxYamlCollectionElements = 10,
+                        MaxYamlByteArrayLength = 16,
+                        MaxYamlSerializationDepth = 3,
+                        MonoBehaviourFieldProvider = o => ReferenceEquals(o, mb) ? fullFields : null
+                    });
+
+                Assert.True(cappedRes.Success, cappedRes.ErrorMessage);
+                Assert.True(cappedRes.IsPartial);
+                Assert.Contains("PARTIAL:", cappedRes.SummaryMessage);
+                Assert.NotEmpty(cappedRes.TruncationDiagnostics);
+
+                // Verify all 3 limit kinds are explicitly diagnosed with exact asset/field/omitted counts
+                var list600Diag = Assert.Single(cappedRes.TruncationDiagnostics, d => d.FieldPath == "list600" && d.LimitKind == "MaxCollectionElements");
+                Assert.Equal("InventoryTable", list600Diag.AssetName);
+                Assert.Equal(mb.m_PathID, list600Diag.PathId);
+                Assert.Equal(10, list600Diag.LimitValue);
+                Assert.Equal(600, list600Diag.TotalCount);
+                Assert.Equal(590, list600Diag.OmittedCount);
+
+                var blobDiag = Assert.Single(cappedRes.TruncationDiagnostics, d => d.FieldPath == "rawBlob" && d.LimitKind == "MaxByteArrayLength");
+                Assert.Equal(16, blobDiag.LimitValue);
+                Assert.Equal(1024, blobDiag.TotalCount);
+                Assert.Equal(1008, blobDiag.OmittedCount);
+
+                Assert.Contains(cappedRes.TruncationDiagnostics, d => d.FieldPath.StartsWith("chain20", StringComparison.Ordinal) && d.LimitKind == "MaxDepth" && d.LimitValue == 3);
+
+                // Verify ExportManifest.json persists isPartial + truncationDiagnostics faithfully
+                Assert.NotNull(cappedRes.ManifestPath);
+                using var manifestDoc = JsonDocument.Parse(File.ReadAllText(cappedRes.ManifestPath!));
+                Assert.True(manifestDoc.RootElement.GetProperty("isPartial").GetBoolean());
+                Assert.True(manifestDoc.RootElement.GetProperty("truncationDiagnostics").GetArrayLength() >= 6);
             }
             finally
             {

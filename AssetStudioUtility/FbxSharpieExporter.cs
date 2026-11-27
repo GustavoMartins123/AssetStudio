@@ -24,6 +24,7 @@ namespace AssetStudio
         private bool _exportBlendShape;
         private bool _castToBone;
         private bool _exportMeshes;
+        private bool _writeExportReport;
         private float _boneSize;
         private string? _exportDirectory;
         private ImportedFrame? _rootFrame;
@@ -92,7 +93,7 @@ namespace AssetStudio
         private List<MeshDiagnosticInfo> _meshDiagnostics = new List<MeshDiagnosticInfo>();
 
         public FbxSharpieExporter(string fileName, float scaleFactor, int versionIndex, bool isAscii, bool is60Fps,
-            bool exportSkins = true, bool exportAnimations = true, bool exportBlendShape = true, bool castToBone = false, float boneSize = 10f, bool exportMeshes = true)
+            bool exportSkins = true, bool exportAnimations = true, bool exportBlendShape = true, bool castToBone = false, float boneSize = 10f, bool exportMeshes = true, bool writeExportReport = true)
         {
             _scaleFactor = scaleFactor;
             _versionIndex = versionIndex;
@@ -104,6 +105,7 @@ namespace AssetStudio
             _castToBone = castToBone;
             _boneSize = boneSize;
             _exportMeshes = exportMeshes;
+            _writeExportReport = writeExportReport;
             _document = new FbxDocument();
             _document.Version = versionIndex >= 5 ? (FbxVersion)7500 : FbxVersion.v7_4;
 
@@ -180,7 +182,8 @@ namespace AssetStudio
                 UpdateGlobalSettingsTiming(convert);
                 UpdateDefinitionsCounts();
                 BuildTakes();
-                WriteExportReport(exportPath, convert);
+                if (_writeExportReport)
+                    WriteExportReport(exportPath, convert);
                 if (_isAscii) FbxIO.WriteAscii(_document, exportPath); else AutodeskBinaryWriter.Write(_document, exportPath);
             }
             finally
@@ -860,6 +863,49 @@ namespace AssetStudio
             }
 
             return materials;
+        }
+
+        /// <summary>
+        /// Computes the exact active bone mask matching <see cref="ExportSkin"/> so Unity scene/prefab
+        /// SkinnedMeshRenderer m_Bones arrays align 1:1 with the bindposes written into the exported FBX mesh.
+        /// </summary>
+        public static bool[] ComputeActiveSkinBoneMask(Mesh? mesh, int boneCount)
+        {
+            if (boneCount <= 0)
+            {
+                return Array.Empty<bool>();
+            }
+
+            var active = new bool[boneCount];
+            if (mesh?.m_Skin == null || mesh.m_Skin.Length == 0)
+            {
+                return active;
+            }
+
+            var skin = mesh.m_Skin;
+            for (int v = 0; v < skin.Length; v++)
+            {
+                var inf = skin[v];
+                var boneIndices = inf?.boneIndex;
+                var weights = inf?.weight;
+                if (boneIndices == null || weights == null)
+                {
+                    continue;
+                }
+
+                int slots = Math.Min(boneIndices.Length, weights.Length);
+                for (int w = 0; w < slots; w++)
+                {
+                    float weight = weights[w];
+                    int bIdx = boneIndices[w];
+                    if (weight > 0f && float.IsFinite(weight) && (uint)bIdx < (uint)boneCount)
+                    {
+                        active[bIdx] = true;
+                    }
+                }
+            }
+
+            return active;
         }
 
         private void ExportSkin(ImportedMesh mesh, long geoId)
@@ -2252,7 +2298,12 @@ namespace AssetStudio
 
         private void BuildHeader()
         {
-            var now = DateTime.UtcNow;
+            // Autodesk FBX SDK validates the binary footer FootId against FileId + CreationTime.
+            // Use the canonical Blender/Autodesk paired timestamp ("1970-01-01 10:00:00:000") for binary FBX
+            // so Unity's FBXImporter and Autodesk tools accept the binary stream without "File is corrupted".
+            var now = _isAscii
+                ? DateTime.UtcNow
+                : new DateTime(1970, 1, 1, 10, 0, 0, 0, DateTimeKind.Utc);
             var header = N("FBXHeaderExtension");
 
             var ver = N("FBXHeaderVersion"); ver.AddProperty(new IntegerToken(1003));
