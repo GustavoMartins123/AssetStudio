@@ -12,37 +12,24 @@ namespace AssetStudio.Avalonia;
 
 internal sealed class AsyncPreviewRequestCoordinator : IDisposable
 {
-    private readonly object _gate = new();
-    private CancellationTokenSource? _activeCts;
-    private long _currentRequestId;
-    private long _cancelledRequestCount;
+    private readonly GenerationCancellationGate _gate = new();
 
-    public long CurrentRequestId => Interlocked.Read(ref _currentRequestId);
-    public long CancelledRequestCount => Interlocked.Read(ref _cancelledRequestCount);
+    public long CurrentRequestId => _gate.CurrentGeneration;
+    public long CancelledRequestCount => _gate.CancelledGenerationCount;
 
     public CancellationToken BeginNewRequest(out long requestId)
     {
-        lock (_gate)
-        {
-            CancelAndDisposeActiveLocked();
-            _activeCts = new CancellationTokenSource();
-            requestId = Interlocked.Increment(ref _currentRequestId);
-            return _activeCts.Token;
-        }
+        return _gate.BeginNext(out requestId);
     }
 
     public void CancelCurrent()
     {
-        lock (_gate)
-        {
-            Interlocked.Increment(ref _currentRequestId);
-            CancelAndDisposeActiveLocked();
-        }
+        _gate.CancelAll();
     }
 
     public bool IsCurrent(long requestId)
     {
-        return Interlocked.Read(ref _currentRequestId) == requestId;
+        return _gate.IsCurrent(requestId);
     }
 
     public async Task<(bool Applied, long RequestId, T? Result)> RunLatestAsync<T>(
@@ -67,32 +54,9 @@ internal sealed class AsyncPreviewRequestCoordinator : IDisposable
         }
     }
 
-    private void CancelAndDisposeActiveLocked()
-    {
-        if (_activeCts == null)
-        {
-            return;
-        }
-
-        if (!_activeCts.IsCancellationRequested)
-        {
-            Interlocked.Increment(ref _cancelledRequestCount);
-            try
-            {
-                _activeCts.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-        }
-
-        _activeCts.Dispose();
-        _activeCts = null;
-    }
-
     public void Dispose()
     {
-        CancelCurrent();
+        _gate.Dispose();
     }
 }
 
@@ -245,7 +209,7 @@ public partial class MainWindow : Window
 
     private void CancelPendingPreview()
     {
-        previewDebounce?.Cancel();
+        _previewResolutionCoordinator.ClearActivePreview();
         CancelVideoPreviewLoad();
         PreviewSession.CancelPendingPreview();
         var nextVersion = Interlocked.Increment(ref texturePreviewIdCounter);
@@ -266,16 +230,12 @@ public partial class MainWindow : Window
 
     private void QueuePreviewAsset(AssetItem assetItem, bool immediate = false)
     {
-        if (RightTabControl.SelectedIndex != 0)
+        if (RightTabControl.SelectedIndex != 0 || IsWindowClosingOrClosed)
         {
             return;
         }
 
         PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
-        previewDebounce?.Cancel();
-        previewDebounce?.Dispose();
-        previewDebounce = new CancellationTokenSource();
-        var token = previewDebounce.Token;
         _previewRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         OnPreviewAssetQueuedForVideo(assetItem);
@@ -287,45 +247,75 @@ public partial class MainWindow : Window
             PreviewLabel.Text = ViewModel.Options.DisplayInfo ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
         }
 
-        _ = Task.Run(async () =>
+        _ = RunQueuedPreviewResolutionAsync(assetItem, previewId, immediate);
+    }
+
+    private async Task RunQueuedPreviewResolutionAsync(AssetItem assetItem, long previewId, bool immediate)
+    {
+        var assetKey = assetItem.Handle != null ? assetItem.Handle.UniqueID : assetItem.UniqueID;
+        var debounceDelay = immediate ? TimeSpan.Zero : TimeSpan.FromMilliseconds(PreviewDebounceMilliseconds);
+
+        try
         {
-            try
-            {
-                if (!immediate)
+            var resolution = await _previewResolutionCoordinator.ResolveLatestAsync(
+                assetKey,
+                async context =>
                 {
-                    await Task.Delay(PreviewDebounceMilliseconds, token);
-                }
+                    PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
+                    return await Task.Run(() => ResolveAssetForPreview(assetItem), context.CancellationToken).ConfigureAwait(false);
+                },
+                debounceDelay).ConfigureAwait(false);
 
-                PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
-                var resolvedAsset = await Task.Run(() => ResolveAssetForPreview(assetItem), token);
+            if (resolution.IsCancelled || IsWindowClosingOrClosed)
+            {
+                return;
+            }
 
-                await Dispatcher.UIThread.InvokeAsync(() =>
-                {
-                    if (!token.IsCancellationRequested
-                        && previewId == Volatile.Read(ref texturePreviewIdCounter)
-                        && RightTabControl.SelectedIndex == 0
-                        && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
-                    {
-                        PreviewAsset(assetItem, resolvedAsset, assetResolutionAttempted: true);
-                    }
-                });
-            }
-            catch (OperationCanceledException)
+            if (resolution.IsFailed)
             {
-            }
-            catch (Exception ex)
-            {
-                logger.Log(LoggerEvent.Error, $"Preview queue failed for {assetItem.Name}: {ex}");
+                var errorMessage = resolution.Diagnostics.Count > 0
+                    ? resolution.Diagnostics[0].Message
+                    : resolution.Summary;
+                logger.Log(LoggerEvent.Error, $"Preview queue failed for {assetItem.Name}: {errorMessage}");
                 Dispatcher.UIThread.Post(() =>
                 {
-                    if (previewId == Volatile.Read(ref texturePreviewIdCounter)
+                    if (!IsWindowClosingOrClosed
+                        && previewId == Volatile.Read(ref texturePreviewIdCounter)
                         && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
                     {
-                        StatusStripUpdate($"Preview error: {ex.Message}");
+                        StatusStripUpdate($"Preview error: {errorMessage}");
                     }
                 });
+                return;
             }
-        }, token);
+
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (!IsWindowClosingOrClosed
+                    && previewId == Volatile.Read(ref texturePreviewIdCounter)
+                    && RightTabControl.SelectedIndex == 0
+                    && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                {
+                    PreviewAsset(assetItem, resolution.Value, assetResolutionAttempted: true);
+                }
+            });
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"Preview queue failed for {assetItem.Name}: {ex}");
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (!IsWindowClosingOrClosed
+                    && previewId == Volatile.Read(ref texturePreviewIdCounter)
+                    && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                {
+                    StatusStripUpdate($"Preview error: {ex.Message}");
+                }
+            });
+        }
     }
 
     private void SetTextWithTruncation(TextBox textBox, string? text, string fallbackText = "")

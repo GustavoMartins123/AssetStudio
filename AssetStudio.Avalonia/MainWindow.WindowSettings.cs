@@ -13,7 +13,7 @@ public partial class MainWindow
 {
     private void ResetForm()
     {
-        lazyIndexingSessionId++;
+        BeginProjectSessionTransition(projectContext?.Project.ProjectRoot);
         ViewModel.LoadingService.StopIndexing();
         CancelProjectAnalysis();
         HideProjectAnalysisBanner();
@@ -208,9 +208,7 @@ public partial class MainWindow
         _previewRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         Interlocked.Increment(ref texturePreviewIdCounter); // Cancel any running background image decoding task
-        previewDebounce?.Cancel();
-        previewDebounce?.Dispose();
-        previewDebounce = null;
+        _previewResolutionCoordinator.ClearActivePreview();
         for (int i = 0; i < 4; i++)
         {
             textureChannels[i] = true;

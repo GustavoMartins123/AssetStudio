@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using AssetStudio;
@@ -7,6 +8,23 @@ namespace AssetStudio.Avalonia
 {
     public partial class MainWindow
     {
+        internal ProjectSessionCoordinatorService ProjectSessionCoordinator => _projectSessionCoordinator;
+
+        internal PreviewResolutionCoordinatorService PreviewResolutionCoordinator => _previewResolutionCoordinator;
+
+        private ProjectSessionActivation BeginProjectSessionTransition(string? projectKey = null)
+        {
+            var activation = _projectSessionCoordinator.BeginSessionTransition(projectKey);
+            lazyIndexingSessionId = activation.Generation;
+            return activation;
+        }
+
+        private void TeardownActiveProjectSession()
+        {
+            _projectSessionCoordinator.TeardownCurrentSession();
+            lazyIndexingSessionId = _projectSessionCoordinator.ActiveGeneration;
+        }
+
         private struct BuildAssetStructuresResult
         {
             public string? ProductName;

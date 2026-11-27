@@ -48,7 +48,8 @@ public partial class MainWindow : Window
     private bool useGpuTexturePreview = true;
     private readonly bool[] textureChannels = new bool[4] { true, true, true, true };
     private long texturePreviewIdCounter;
-    private CancellationTokenSource? previewDebounce;
+    private readonly ProjectSessionCoordinatorService _projectSessionCoordinator = new();
+    private readonly PreviewResolutionCoordinatorService _previewResolutionCoordinator = new();
     private const int PreviewDebounceMilliseconds = 180;
     private const int MaxInlinePreviewTextureDimension = 1024;
     private const int MaxCachedPreviewTextureDimension = 512;
@@ -1355,6 +1356,18 @@ public partial class MainWindow : Window
                             {
                                 await BuildLazyConnectionsIfNeededAsync(paths, force: true);
                             }
+                            else if (HasSavedSemanticRelations(folderPath, incScanSnapshot))
+                            {
+                                await BuildLazyConnectionsIfNeededAsync(
+                                    paths,
+                                    force: true,
+                                    incrementalSourcePaths: coldPlanResult.DeltaPlan.AffectedSemanticFilePaths,
+                                    replaceExisting: false);
+                            }
+                            else
+                            {
+                                await BuildLazyConnectionsIfNeededAsync(paths);
+                            }
 
                             if (sessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
                             {
@@ -1577,7 +1590,22 @@ public partial class MainWindow : Window
                                 return;
                             }
 
-                            await BuildLazyConnectionsIfNeededAsync(paths, force: true);
+                            if (incrementalDeltaPlan != null
+                                && !incrementalDeltaPlan.RequiresFullSemanticRebuild
+                                && currentScanResult != null
+                                && hasDirectoryTarget
+                                && HasSavedSemanticRelations(paths[0], currentScanResult))
+                            {
+                                await BuildLazyConnectionsIfNeededAsync(
+                                    paths,
+                                    force: true,
+                                    incrementalSourcePaths: incrementalDeltaPlan.AffectedSemanticFilePaths,
+                                    replaceExisting: false);
+                            }
+                            else
+                            {
+                                await BuildLazyConnectionsIfNeededAsync(paths, force: true);
+                            }
                             if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
                             {
                                 return;
@@ -2496,7 +2524,7 @@ public partial class MainWindow : Window
 
     private async Task StopActiveBackgroundWorkForNavigationAsync()
     {
-        lazyIndexingSessionId++;
+        TeardownActiveProjectSession();
         CancelLazySceneHierarchyOperations();
         CancelProgressiveScan();
         ViewModel.LoadingService.StopIndexing();
@@ -2540,7 +2568,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        lazyIndexingSessionId++;
+        TeardownActiveProjectSession();
         CancelLazySceneHierarchyOperations();
         CancelProgressiveScan();
         ViewModel.LoadingService.StopIndexing();
@@ -2705,6 +2733,8 @@ public partial class MainWindow : Window
 
         ViewModel.ResetSession();
         ViewModel.Dispose();
+        _previewResolutionCoordinator.Dispose();
+        _projectSessionCoordinator.Dispose();
         _sqliteCache.Dispose();
         assetsManager.Dispose();
     }
