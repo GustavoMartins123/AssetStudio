@@ -10,6 +10,7 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using AssetStudio.Avalonia.Services;
 using Microsoft.Data.Sqlite;
 
 namespace AssetStudio.Avalonia
@@ -46,6 +47,10 @@ namespace AssetStudio.Avalonia
         private long _physicalReadConnectionsOpened;
         private long _readPoolHits;
         private int _disposed;
+        private const int MaxRecentDiagnostics = 64;
+        private readonly object _diagnosticsLock = new object();
+        private readonly Queue<CacheDiagnosticEvent> _recentDiagnostics = new();
+        private CacheDiagnosticEvent? _lastDiagnostic;
 
         public SQLiteProjectIndexCache()
             : this(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache"))
@@ -68,9 +73,297 @@ namespace AssetStudio.Avalonia
             Directory.CreateDirectory(_cacheDir);
         }
 
+        internal string CacheDirectory => _cacheDir;
         internal bool CaseSensitivePaths => _caseSensitivePaths;
         internal long PhysicalReadConnectionsOpened => Interlocked.Read(ref _physicalReadConnectionsOpened);
         internal long ReadPoolHits => Interlocked.Read(ref _readPoolHits);
+
+        public CacheDiagnosticEvent? LastDiagnostic
+        {
+            get
+            {
+                lock (_diagnosticsLock)
+                {
+                    return _lastDiagnostic;
+                }
+            }
+        }
+
+        public IReadOnlyList<CacheDiagnosticEvent> GetRecentDiagnostics()
+        {
+            lock (_diagnosticsLock)
+            {
+                return _recentDiagnostics.ToArray();
+            }
+        }
+
+        internal void RecordDiagnostic(
+            CacheFailureKind failureKind,
+            string category,
+            string targetPath,
+            string message,
+            bool recoveredAutomatically = false,
+            Exception? exception = null)
+        {
+            int? errorCode = null;
+            if (exception is SqliteException sqliteEx)
+            {
+                errorCode = sqliteEx.SqliteErrorCode;
+            }
+            else if (exception != null)
+            {
+                errorCode = exception.HResult;
+            }
+
+            var evt = new CacheDiagnosticEvent(
+                DateTime.UtcNow,
+                failureKind,
+                category,
+                targetPath ?? string.Empty,
+                message ?? string.Empty,
+                recoveredAutomatically,
+                exception?.GetType().Name,
+                errorCode);
+
+            lock (_diagnosticsLock)
+            {
+                _lastDiagnostic = evt;
+                while (_recentDiagnostics.Count >= MaxRecentDiagnostics)
+                {
+                    _recentDiagnostics.Dequeue();
+                }
+
+                _recentDiagnostics.Enqueue(evt);
+            }
+        }
+
+        internal void RecordClassifiedException(string category, string targetPath, Exception exception, bool recoveredAutomatically = false)
+        {
+            var classified = CacheObservabilityService.ClassifyException(exception);
+            RecordDiagnostic(
+                classified.Kind,
+                category,
+                targetPath,
+                classified.Summary,
+                recoveredAutomatically,
+                exception);
+        }
+
+        internal static bool IsSqliteCorruptionException(SqliteException ex)
+        {
+            return CacheObservabilityService.IsSqliteCorruption(ex);
+        }
+
+        internal static bool HasValidSqliteHeader(string dbPath)
+        {
+            if (string.IsNullOrWhiteSpace(dbPath) || !File.Exists(dbPath))
+            {
+                return true;
+            }
+
+            try
+            {
+                using var fs = new FileStream(dbPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                if (fs.Length == 0)
+                {
+                    return true;
+                }
+
+                if (fs.Length < 100)
+                {
+                    return false;
+                }
+
+                Span<byte> header = stackalloc byte[16];
+                var read = fs.Read(header);
+                if (read < 16)
+                {
+                    return false;
+                }
+
+                return header.SequenceEqual("SQLite format 3\0"u8);
+            }
+            catch
+            {
+                // Let SQLite report read/access errors without misclassifying locked/unreadable files as corruption.
+                return true;
+            }
+        }
+
+        internal static bool TryCheckDatabaseQuickIntegrity(SqliteConnection conn, out string? failureReason)
+        {
+            failureReason = null;
+            if (conn == null || conn.State != ConnectionState.Open)
+            {
+                failureReason = "SQLite connection is not open.";
+                return false;
+            }
+
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "PRAGMA quick_check(1);";
+                var result = cmd.ExecuteScalar()?.ToString();
+                if (string.Equals(result, "ok", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                failureReason = string.IsNullOrWhiteSpace(result) ? "PRAGMA quick_check returned empty result." : result;
+                return false;
+            }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                failureReason = ex.Message;
+                return false;
+            }
+        }
+
+        internal void ForgetInitializedDatabase(string dbPath)
+        {
+            if (string.IsNullOrWhiteSpace(dbPath))
+            {
+                return;
+            }
+
+            lock (_initLock)
+            {
+                _initializedDbs.Remove(dbPath);
+            }
+        }
+
+        internal void ClearInitializedDatabaseTracking()
+        {
+            lock (_initLock)
+            {
+                _initializedDbs.Clear();
+            }
+
+            _projectIdCache.Clear();
+            _semanticStatusCache.Clear();
+        }
+
+        internal bool TryRecoverCorruptSidecar(string idxPath, string reason)
+        {
+            if (string.IsNullOrWhiteSpace(idxPath) || !File.Exists(idxPath))
+            {
+                return false;
+            }
+
+            if (!CacheObservabilityService.IsPathStrictlyInsideCacheRoot(_cacheDir, idxPath, allowEqualRoot: false, _caseSensitivePaths))
+            {
+                RecordDiagnostic(
+                    CacheFailureKind.BoundaryViolation,
+                    "MmapSidecar",
+                    idxPath,
+                    "Refused to remove corrupt sidecar outside cache directory.",
+                    recoveredAutomatically: false);
+                return false;
+            }
+
+            MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+            MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
+            var removed = !File.Exists(idxPath);
+            RecordDiagnostic(
+                CacheFailureKind.Corruption,
+                "MmapSidecar",
+                idxPath,
+                reason,
+                recoveredAutomatically: removed);
+            Logger.Warning($"Recovered corrupt or mismatched mmap .idx sidecar '{idxPath}': {reason}");
+            return removed;
+        }
+
+        internal bool TryRecoverCorruptDatabase(string dbPath, string reason, Exception? cause = null)
+        {
+            if (string.IsNullOrWhiteSpace(dbPath))
+            {
+                return false;
+            }
+
+            if (!CacheObservabilityService.IsPathStrictlyInsideCacheRoot(_cacheDir, dbPath, allowEqualRoot: false, _caseSensitivePaths))
+            {
+                RecordDiagnostic(
+                    CacheFailureKind.BoundaryViolation,
+                    "SqliteIndex",
+                    dbPath,
+                    "Refused to quarantine or remove database outside cache directory.",
+                    recoveredAutomatically: false,
+                    exception: cause);
+                return false;
+            }
+
+            bool recovered;
+            lock (WriteGate)
+            {
+                recovered = RecoverCorruptDatabaseLocked(dbPath, reason, cause);
+            }
+
+            ForgetInitializedDatabase(dbPath);
+            return recovered;
+        }
+
+        private bool RecoverCorruptDatabaseLocked(string dbPath, string reason, Exception? cause)
+        {
+            if (!CacheObservabilityService.IsPathStrictlyInsideCacheRoot(_cacheDir, dbPath, allowEqualRoot: false, _caseSensitivePaths))
+            {
+                RecordDiagnostic(
+                    CacheFailureKind.BoundaryViolation,
+                    "SqliteIndex",
+                    dbPath,
+                    "Refused to recover database outside configured cache directory.",
+                    recoveredAutomatically: false,
+                    exception: cause);
+                return false;
+            }
+
+            InvalidateReadConnectionPool(dbPath);
+            ClearConnectionPoolsForDb(dbPath);
+            InvalidateProjectIdCacheForDb(dbPath);
+            NotifyDatabaseMutated(dbPath);
+            MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
+
+            var removedAll = true;
+            foreach (var file in new[] { dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + "-journal" })
+            {
+                if (!File.Exists(file))
+                {
+                    continue;
+                }
+
+                if (!CacheObservabilityService.IsPathStrictlyInsideCacheRoot(_cacheDir, file, allowEqualRoot: false, _caseSensitivePaths))
+                {
+                    removedAll = false;
+                    continue;
+                }
+
+                try
+                {
+                    var attrs = File.GetAttributes(file);
+                    if ((attrs & FileAttributes.ReadOnly) != 0)
+                    {
+                        File.SetAttributes(file, attrs & ~FileAttributes.ReadOnly);
+                    }
+
+                    File.Delete(file);
+                }
+                catch (Exception deleteEx)
+                {
+                    removedAll = false;
+                    Logger.Warning($"Failed to remove corrupt SQLite cache file '{file}': {deleteEx.Message}");
+                }
+            }
+
+            RecordDiagnostic(
+                CacheFailureKind.Corruption,
+                "SqliteIndex",
+                dbPath,
+                reason,
+                recoveredAutomatically: removedAll,
+                exception: cause);
+            Logger.Warning($"Recovered corrupt SQLite index database '{dbPath}': {reason}");
+            return removedAll;
+        }
 
         private sealed class CachedFolderSignature
         {
@@ -472,8 +765,20 @@ namespace AssetStudio.Avalonia
             }
 
             var dbPath = GetDbPath(folderPath);
+            if (!CacheObservabilityService.IsPathStrictlyInsideCacheRoot(_cacheDir, dbPath, allowEqualRoot: false, _caseSensitivePaths))
+            {
+                RecordDiagnostic(
+                    CacheFailureKind.BoundaryViolation,
+                    "SqliteIndex",
+                    dbPath,
+                    "Refused to delete SQLite index cache outside configured cache directory.",
+                    recoveredAutomatically: false);
+                return;
+            }
+
             var walPath = dbPath + "-wal";
             var shmPath = dbPath + "-shm";
+            var journalPath = dbPath + "-journal";
 
             try
             {
@@ -497,15 +802,17 @@ namespace AssetStudio.Avalonia
                     {
                         File.Delete(shmPath);
                     }
-
-                    lock (_initLock)
+                    if (File.Exists(journalPath))
                     {
-                        _initializedDbs.Remove(dbPath);
+                        File.Delete(journalPath);
                     }
                 }
+
+                ForgetInitializedDatabase(dbPath);
             }
             catch (Exception ex)
             {
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to delete SQLite index cache files for {folderPath}: {ex.Message}");
             }
         }
@@ -789,8 +1096,10 @@ namespace AssetStudio.Avalonia
                     return;
                 }
 
-                InitializeDatabaseByPath(dbPath);
-                _initializedDbs.Add(dbPath);
+                if (InitializeDatabaseByPath(dbPath))
+                {
+                    _initializedDbs.Add(dbPath);
+                }
             }
         }
 
@@ -1194,45 +1503,69 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private void InitializeDatabaseByPath(string dbPath)
+        private bool InitializeDatabaseByPath(string dbPath)
         {
             try
             {
                 lock (WriteGate)
                 {
-                    if (HasReadConnectionPoolBucket(dbPath))
+                    for (var attempt = 0; attempt < 2; attempt++)
                     {
-                        InvalidateReadConnectionPool(dbPath);
+                        try
+                        {
+                            if (HasReadConnectionPoolBucket(dbPath))
+                            {
+                                InvalidateReadConnectionPool(dbPath);
+                            }
+
+                            if (File.Exists(dbPath) && !HasValidSqliteHeader(dbPath))
+                            {
+                                RecoverCorruptDatabaseLocked(dbPath, "SQLite database header is truncated or invalid.", cause: null);
+                            }
+
+                            var isNewOrEmptyDb = !File.Exists(dbPath) || new FileInfo(dbPath).Length == 0;
+                            using (var conn = CreateConnectionByDbPath(dbPath, initializePageSize: isNewOrEmptyDb))
+                            {
+                                using (var pragma = conn.CreateCommand())
+                                {
+                                    pragma.CommandText = @"
+                                        PRAGMA journal_mode = WAL;
+                                        PRAGMA synchronous = NORMAL;
+                                        PRAGMA wal_autocheckpoint = 1000;";
+                                    pragma.ExecuteNonQuery();
+                                }
+
+                                if (TryUpgradeOrRebuildSchema(conn, _caseSensitivePaths))
+                                {
+                                    InvalidateProjectIdCacheForDb(dbPath);
+                                    NotifyDatabaseMutated(dbPath);
+                                    InvalidateReadConnectionPool(dbPath);
+                                    MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
+                                }
+
+                                CreateSchema(conn, _caseSensitivePaths);
+                                TryOptimizeDatabase(conn, "database initialization");
+                            }
+
+                            return true;
+                        }
+                        catch (SqliteException ex) when (IsSqliteCorruptionException(ex) && attempt == 0)
+                        {
+                            RecoverCorruptDatabaseLocked(
+                                dbPath,
+                                $"SQLite database corruption detected during initialization (code {ex.SqliteErrorCode}): {ex.Message}",
+                                ex);
+                        }
                     }
 
-                    var isNewOrEmptyDb = !File.Exists(dbPath) || new FileInfo(dbPath).Length == 0;
-                    using (var conn = CreateConnectionByDbPath(dbPath, initializePageSize: isNewOrEmptyDb))
-                    {
-                        using (var pragma = conn.CreateCommand())
-                        {
-                            pragma.CommandText = @"
-                                PRAGMA journal_mode = WAL;
-                                PRAGMA synchronous = NORMAL;
-                                PRAGMA wal_autocheckpoint = 1000;";
-                            pragma.ExecuteNonQuery();
-                        }
-
-                        if (TryUpgradeOrRebuildSchema(conn, _caseSensitivePaths))
-                        {
-                            InvalidateProjectIdCacheForDb(dbPath);
-                            NotifyDatabaseMutated(dbPath);
-                            InvalidateReadConnectionPool(dbPath);
-                            MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
-                        }
-
-                        CreateSchema(conn, _caseSensitivePaths);
-                        TryOptimizeDatabase(conn, "database initialization");
-                    }
+                    return false;
                 }
             }
             catch (Exception ex)
             {
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Error($"Failed to initialize SQLite database cache at {dbPath}: {ex.Message}", ex);
+                return false;
             }
         }
 
@@ -1281,6 +1614,25 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to set SQLite PRAGMA synchronous = {mode}: {ex.Message}");
+            }
+        }
+
+        private static void SetForeignKeysMode(SqliteConnection conn, bool enabled)
+        {
+            if (conn.State != ConnectionState.Open)
+            {
+                return;
+            }
+
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = enabled ? "PRAGMA foreign_keys = ON;" : "PRAGMA foreign_keys = OFF;";
+                cmd.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to set SQLite PRAGMA foreign_keys = {(enabled ? "ON" : "OFF")}: {ex.Message}");
             }
         }
 

@@ -15,5 +15,7 @@ internal sealed class ProjectIndexingState
     public DateTime? StartedAt { get; init; }
     public DateTime? UpdatedAt { get; init; }
     public DateTime? CompletedAt { get; init; }
+    public int ReadFileCount { get; init; }
     public List<string> ReadFiles { get; } = new();
+    public int EffectiveReadFileCount => ReadFiles.Count > 0 ? ReadFiles.Count : ReadFileCount;
 }

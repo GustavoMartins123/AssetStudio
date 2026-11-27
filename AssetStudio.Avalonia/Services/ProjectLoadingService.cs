@@ -1681,7 +1681,8 @@ namespace AssetStudio.Avalonia.Services
             string folderPath,
             ProjectScanResult? scanResult,
             SQLiteProjectIndexCache.SemanticStagingSession? stagingSession,
-            Action<IndexingProgressUpdate, int>? showProgressPanel = null)
+            Action<IndexingProgressUpdate, int>? showProgressPanel = null,
+            bool replaceExisting = true)
         {
             if (sqliteCache == null
                 || stagingSession == null
@@ -1694,7 +1695,7 @@ namespace AssetStudio.Avalonia.Services
 
             try
             {
-                // PERF-11: Guard semantic commit against mid-index scan/signature drift.
+                // Guard semantic commit against mid-index scan/signature drift.
                 var expectedSignature = sqliteCache.GetFolderSignature(scanResult);
                 if (!string.Equals(stagingSession.ProjectSignature, expectedSignature, StringComparison.Ordinal))
                 {
@@ -1724,7 +1725,8 @@ namespace AssetStudio.Avalonia.Services
                         total,
                         stage,
                         persist: false,
-                        showProgressPanel));
+                        showProgressPanel),
+                    replaceExisting: replaceExisting);
 
                 if (saved)
                 {
@@ -1974,7 +1976,7 @@ namespace AssetStudio.Avalonia.Services
                 || string.Equals(status, "connections_failed", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase);
 
-            if (processedFiles == 0 || processedFiles == safeTotal || isTerminal || elapsedMs >= 2000)
+            if (processedFiles == 0 || processedFiles == safeTotal || isTerminal || elapsedMs >= 5000)
             {
                 lastConnectionDbWriteTicks = nowTicks;
                 if (sqliteCache != null && scanResult != null)

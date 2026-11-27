@@ -288,13 +288,13 @@ namespace AssetStudio.Avalonia
                 }
             }
 
-            public Task<bool> CommitAsync(Action<int, int, string>? progress = null, CancellationToken cancellationToken = default)
+            public Task<bool> CommitAsync(Action<int, int, string>? progress = null, CancellationToken cancellationToken = default, bool replaceExisting = true)
             {
                 EnsureActive();
-                return Task.Run(() => Commit(progress), cancellationToken);
+                return Task.Run(() => Commit(progress, replaceExisting), cancellationToken);
             }
 
-            public bool Commit(Action<int, int, string>? progress = null)
+            public bool Commit(Action<int, int, string>? progress = null, bool replaceExisting = true)
             {
                 EnsureActive();
 
@@ -306,9 +306,10 @@ namespace AssetStudio.Avalonia
 
                 try
                 {
-                    // 11 clear steps + 10 staged promotion steps + 1 pre-anim index build + 1 derived cache backfill
+                    // Full replace: 11 clear steps + 10 staged promotion steps + 1 pre-anim index build + 1 derived cache backfill
                     // + 4 animation promotion sub-steps + 1 post-anim index build + 1 staging cleanup = 29 steps
-                    const int totalWork = 29;
+                    // Incremental merge: skips table clear and index drop/rebuild = 17 steps
+                    var totalWork = replaceExisting ? 29 : 17;
                     var reporter = new ThrottledProgressReporter(totalWork, progress);
                     reporter.Report("Waiting for SQLite writer", force: true);
 
@@ -350,14 +351,20 @@ namespace AssetStudio.Avalonia
                                 "Preparing staged semantic relation commit",
                                 completed: false);
 
-                            DropSemanticBulkSecondaryIndexes(conn, transaction);
-                            ClearSemanticRelationTablesForProject(conn, transaction, projectId, reporter.Advance);
+                            if (replaceExisting)
+                            {
+                                DropSemanticBulkSecondaryIndexes(conn, transaction);
+                                ClearSemanticRelationTablesForProject(conn, transaction, projectId, reporter.Advance, createSecondaryIndexes: false);
+                            }
 
                             PromoteStagedSemanticRelationsToLive(conn, transaction, projectId, reporter.Advance);
 
-                            reporter.Report("Rebuilding remaining semantic relation indexes", force: true);
-                            CreateSemanticBulkSecondaryIndexes(conn, transaction);
-                            reporter.Advance("Rebuilt semantic relation indexes");
+                            if (replaceExisting)
+                            {
+                                reporter.Report("Rebuilding remaining semantic relation indexes", force: true);
+                                CreateSemanticBulkSecondaryIndexes(conn, transaction);
+                                reporter.Advance("Rebuilt semantic relation indexes");
+                            }
 
                             DropSemanticStagingTables(conn, transaction);
                             reporter.Advance("Cleaned semantic staging tables");
@@ -383,8 +390,15 @@ namespace AssetStudio.Avalonia
                         }
 
                         _owner.NotifyDatabaseMutated(_dbPath);
-                        reporter.Report("Analyzing SQLite statistics", force: true);
-                        TryAnalyzeSemanticTables(conn, "staged semantic relations");
+                        if (replaceExisting)
+                        {
+                            reporter.Report("Analyzing SQLite statistics", force: true);
+                            TryAnalyzeSemanticTables(conn, "staged semantic relations");
+                        }
+                        else
+                        {
+                            TryOptimizeDatabase(conn, "incremental semantic relations");
+                        }
                         _owner.InvalidateReadConnectionPool(_dbPath);
                         reporter.Report("Checkpointing SQLite WAL", force: true);
                         TryCheckpointWal(conn, "staged semantic relations");
@@ -600,7 +614,7 @@ namespace AssetStudio.Avalonia
                     "Preparing semantic relation save",
                     completed: false);
 
-                ClearSemanticRelationTablesForProject(conn, transaction, projectId, reporter.Advance);
+                ClearSemanticRelationTablesForProject(conn, transaction, projectId, reporter.Advance, createSecondaryIndexes: false);
                 DropSemanticBulkSecondaryIndexes(conn, transaction);
 
                 InsertSemanticSourceFiles(conn, transaction, projectId, relations.SourceFiles, reporter.Advance);
@@ -801,8 +815,23 @@ namespace AssetStudio.Avalonia
             SqliteConnection conn,
             SqliteTransaction transaction,
             long projectId,
-            Action<string>? advanceProgress = null)
+            Action<string>? advanceProgress = null,
+            bool createSecondaryIndexes = true)
         {
+            if (IsSingleProjectDatabase(conn, transaction, projectId))
+            {
+                RecreateSemanticTablesInTransaction(
+                    conn,
+                    transaction,
+                    dropExistingFirst: true,
+                    createSecondaryIndexes: createSecondaryIndexes);
+                for (var i = 0; i < 11; i++)
+                {
+                    advanceProgress?.Invoke("Resetting semantic relation tables (O(1))");
+                }
+                return;
+            }
+
             var tables = new[]
             {
                 "AnimationClipTargets",

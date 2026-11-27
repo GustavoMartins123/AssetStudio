@@ -18,80 +18,124 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
-            EnsureInitialized(folderPath);
             var dbPath = GetDbPath(folderPath);
-            try
+            for (var attempt = 0; attempt < 2; attempt++)
             {
-                lock (WriteGate)
+                EnsureInitialized(folderPath);
+                try
                 {
-                    using var conn = CreateConnectionByDbPath(dbPath);
-                    InvalidateProjectIdCacheForDb(dbPath);
-                    using var transaction = conn.BeginTransaction();
-                    var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, _caseSensitivePaths, out _);
-
-                    if (update.ProcessedFiles == 0
-                        && update.NewlyReadFiles.Count == 0
-                        && string.Equals(update.Status, "running", StringComparison.OrdinalIgnoreCase))
+                    lock (WriteGate)
                     {
-                        using var clearCmd = conn.CreateCommand();
-                        clearCmd.Transaction = transaction;
-                        clearCmd.CommandText = "DELETE FROM IndexingReadFiles WHERE ProjectId = @projectId";
-                        clearCmd.Parameters.AddWithValue("@projectId", projectId);
-                        clearCmd.ExecuteNonQuery();
-                    }
+                        using var conn = CreateConnectionByDbPath(dbPath);
+                        using var transaction = conn.BeginTransaction();
+                        var isLightweightProgressUpdate = update.NewlyReadFiles.Count == 0
+                            && !IsTerminalIndexingStatus(update.Status)
+                            && (string.Equals(update.Status, "connecting", StringComparison.OrdinalIgnoreCase)
+                                || string.Equals(update.Status, "saving_connections", StringComparison.OrdinalIgnoreCase)
+                                || string.Equals(update.Status, "building_structure", StringComparison.OrdinalIgnoreCase)
+                                || string.Equals(update.Status, "saving_index", StringComparison.OrdinalIgnoreCase));
 
-                    UpsertProjectIndexingStateRow(
-                        conn,
-                        transaction,
-                        projectId,
-                        update.Status ?? string.Empty,
-                        update.TotalFiles,
-                        update.ProcessedFiles,
-                        update.PendingFiles,
-                        update.PercentComplete,
-                        update.CurrentFile ?? string.Empty,
-                        update.LastReadFile ?? string.Empty,
-                        IsTerminalIndexingStatus(update.Status));
-
-                    if (update.NewlyReadFiles.Count > 0)
-                    {
-                        using var cmd = conn.CreateCommand();
-                        cmd.Transaction = transaction;
-                        cmd.CommandText = @"
-                            INSERT INTO IndexingReadFiles (ProjectId, FilePath, FileName, ReadOrder, Status)
-                            VALUES (@projectId, @filePath, @fileName, @readOrder, 'read')
-                            ON CONFLICT(ProjectId, FilePath)
-                            DO UPDATE SET
-                                FileName = excluded.FileName,
-                                ReadOrder = excluded.ReadOrder,
-                                ReadAt = CURRENT_TIMESTAMP,
-                                Status = excluded.Status";
-
-                        var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
-                        var pFilePath = cmd.Parameters.Add("@filePath", SqliteType.Text);
-                        var pFileName = cmd.Parameters.Add("@fileName", SqliteType.Text);
-                        var pReadOrder = cmd.Parameters.Add("@readOrder", SqliteType.Integer);
-                        pProjectId.Value = projectId;
-
-                        var firstReadOrder = Math.Max(1, update.ProcessedFiles - update.NewlyReadFiles.Count + 1);
-                        for (var i = 0; i < update.NewlyReadFiles.Count; i++)
+                        long projectId;
+                        var signatureChanged = false;
+                        if (isLightweightProgressUpdate)
                         {
-                            var filePath = update.NewlyReadFiles[i] ?? string.Empty;
-                            pFilePath.Value = filePath;
-                            pFileName.Value = Path.GetFileName(filePath);
-                            pReadOrder.Value = firstReadOrder + i;
-                            cmd.ExecuteNonQuery();
+                            var existingId = FindProjectId(conn, transaction, folderPath, signature, _caseSensitivePaths);
+                            if (existingId.HasValue)
+                            {
+                                projectId = existingId.Value;
+                            }
+                            else
+                            {
+                                InvalidateProjectIdCacheForDb(dbPath);
+                                projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, _caseSensitivePaths, out signatureChanged);
+                            }
                         }
-                    }
+                        else
+                        {
+                            InvalidateProjectIdCacheForDb(dbPath);
+                            projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, _caseSensitivePaths, out signatureChanged);
+                        }
 
-                    transaction.Commit();
-                    CacheProjectId(dbPath, folderPath, signature, projectId);
-                    NotifyDatabaseMutated(dbPath);
+                        if (signatureChanged)
+                        {
+                            MmapProjectIndexSidecar.TryDeleteFileQuietly(MmapProjectIndexSidecar.GetSidecarPath(dbPath));
+                            InvalidateStalePreviewsForChangedProject(conn, transaction, projectId, folderPath, scanResult, signatureChanged: true);
+                        }
+
+                        if (update.ProcessedFiles == 0
+                            && update.NewlyReadFiles.Count == 0
+                            && string.Equals(update.Status, "running", StringComparison.OrdinalIgnoreCase))
+                        {
+                            using var clearCmd = conn.CreateCommand();
+                            clearCmd.Transaction = transaction;
+                            clearCmd.CommandText = "DELETE FROM IndexingReadFiles WHERE ProjectId = @projectId";
+                            clearCmd.Parameters.AddWithValue("@projectId", projectId);
+                            clearCmd.ExecuteNonQuery();
+                        }
+
+                        UpsertProjectIndexingStateRow(
+                            conn,
+                            transaction,
+                            projectId,
+                            update.Status ?? string.Empty,
+                            update.TotalFiles,
+                            update.ProcessedFiles,
+                            update.PendingFiles,
+                            update.PercentComplete,
+                            update.CurrentFile ?? string.Empty,
+                            update.LastReadFile ?? string.Empty,
+                            IsTerminalIndexingStatus(update.Status));
+
+                        if (update.NewlyReadFiles.Count > 0)
+                        {
+                            using var cmd = conn.CreateCommand();
+                            cmd.Transaction = transaction;
+                            cmd.CommandText = @"
+                                INSERT INTO IndexingReadFiles (ProjectId, FilePath, FileName, ReadOrder, Status)
+                                VALUES (@projectId, @filePath, @fileName, @readOrder, 'read')
+                                ON CONFLICT(ProjectId, FilePath)
+                                DO UPDATE SET
+                                    FileName = excluded.FileName,
+                                    ReadOrder = excluded.ReadOrder,
+                                    ReadAt = CURRENT_TIMESTAMP,
+                                    Status = excluded.Status";
+
+                            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+                            var pFilePath = cmd.Parameters.Add("@filePath", SqliteType.Text);
+                            var pFileName = cmd.Parameters.Add("@fileName", SqliteType.Text);
+                            var pReadOrder = cmd.Parameters.Add("@readOrder", SqliteType.Integer);
+                            pProjectId.Value = projectId;
+
+                            var firstReadOrder = Math.Max(1, update.ProcessedFiles - update.NewlyReadFiles.Count + 1);
+                            for (var i = 0; i < update.NewlyReadFiles.Count; i++)
+                            {
+                                var filePath = update.NewlyReadFiles[i] ?? string.Empty;
+                                pFilePath.Value = filePath;
+                                pFileName.Value = Path.GetFileName(filePath);
+                                pReadOrder.Value = firstReadOrder + i;
+                                cmd.ExecuteNonQuery();
+                            }
+                        }
+
+                        transaction.Commit();
+                        CacheProjectId(dbPath, folderPath, signature, projectId);
+                        if (!isLightweightProgressUpdate || signatureChanged)
+                        {
+                            NotifyDatabaseMutated(dbPath);
+                        }
+                        return;
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"Failed to save indexing progress: {ex.Message}");
+                catch (SqliteException ex) when (IsSqliteCorruptionException(ex) && attempt == 0)
+                {
+                    TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while saving indexing progress: {ex.Message}", ex);
+                }
+                catch (Exception ex)
+                {
+                    RecordClassifiedException("SqliteIndex", dbPath, ex);
+                    Logger.Warning($"Failed to save indexing progress: {ex.Message}");
+                    return;
+                }
             }
         }
 
@@ -143,9 +187,17 @@ namespace AssetStudio.Avalonia
             {
                 return null;
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while loading indexing state: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return null;
+            }
             catch (Exception ex)
             {
                 EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to load indexing progress: {ex.Message}");
                 return null;
             }
@@ -158,10 +210,22 @@ namespace AssetStudio.Avalonia
                 return null;
             }
 
-            EnsureInitialized(folderPath);
             var dbPath = GetDbPath(folderPath);
+            // Fast, read-only lookup for project list cards: never create empty DBs, take WriteGate,
+            // run schema DDL, or scan full B-trees when displaying saved project metadata.
+            if (!File.Exists(dbPath))
+            {
+                return null;
+            }
+
             try
             {
+                var info = new FileInfo(dbPath);
+                if (info.Length == 0 || !HasValidSqliteHeader(dbPath))
+                {
+                    return null;
+                }
+
                 using var lease = RentReadConnection(dbPath);
                 var conn = lease.Connection;
                 try
@@ -172,7 +236,7 @@ namespace AssetStudio.Avalonia
                         return null;
                     }
 
-                    return LoadIndexingState(conn, null, projectId.Value);
+                    return LoadIndexingState(conn, null, projectId.Value, includeReadFilePaths: false);
                 }
                 catch
                 {
@@ -184,14 +248,29 @@ namespace AssetStudio.Avalonia
             {
                 return null;
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
+                return null;
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode == 1)
+            {
+                // Older/incomplete DB missing v16 columns/tables; defer schema upgrade until the project is opened.
+                return null;
+            }
             catch (Exception ex)
             {
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to load latest indexing progress: {ex.Message}");
                 return null;
             }
         }
 
-        private static ProjectIndexingState? LoadIndexingState(SqliteConnection conn, SqliteTransaction? transaction, long projectId)
+        private static ProjectIndexingState? LoadIndexingState(
+            SqliteConnection conn,
+            SqliteTransaction? transaction,
+            long projectId,
+            bool includeReadFilePaths = true)
         {
             ProjectIndexingState? state = null;
             using (var cmd = conn.CreateCommand())
@@ -246,8 +325,9 @@ namespace AssetStudio.Avalonia
                 };
             }
 
-            using (var cmd = conn.CreateCommand())
+            if (includeReadFilePaths)
             {
+                using var cmd = conn.CreateCommand();
                 cmd.Transaction = transaction;
                 cmd.CommandText = @"
                     SELECT FilePath
@@ -260,6 +340,35 @@ namespace AssetStudio.Avalonia
                 {
                     state.ReadFiles.Add(reader.IsDBNull(0) ? string.Empty : reader.GetString(0));
                 }
+
+                return state;
+            }
+
+            var readFileCount = 0;
+            using (var countCmd = conn.CreateCommand())
+            {
+                countCmd.Transaction = transaction;
+                countCmd.CommandText = "SELECT COUNT(*) FROM IndexingReadFiles WHERE ProjectId = @projectId";
+                countCmd.Parameters.AddWithValue("@projectId", projectId);
+                readFileCount = Convert.ToInt32(countCmd.ExecuteScalar() ?? 0);
+            }
+
+            if (readFileCount > 0)
+            {
+                state = new ProjectIndexingState
+                {
+                    Status = state.Status,
+                    TotalFiles = state.TotalFiles,
+                    ProcessedFiles = state.ProcessedFiles,
+                    PendingFiles = state.PendingFiles,
+                    PercentComplete = state.PercentComplete,
+                    CurrentFile = state.CurrentFile,
+                    LastReadFile = state.LastReadFile,
+                    StartedAt = state.StartedAt,
+                    UpdatedAt = state.UpdatedAt,
+                    CompletedAt = state.CompletedAt,
+                    ReadFileCount = readFileCount
+                };
             }
 
             return state;
@@ -350,10 +459,19 @@ namespace AssetStudio.Avalonia
             {
                 return default;
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                _semanticStatusCache.TryRemove(cacheKey, out _);
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while inspecting semantic relation cache status: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return default;
+            }
             catch (Exception ex)
             {
                 EvictProjectIdCacheEntry(dbPath, folderPath, signature);
                 _semanticStatusCache.TryRemove(cacheKey, out _);
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to inspect semantic relation cache status: {ex.Message}");
                 return default;
             }
@@ -496,6 +614,163 @@ namespace AssetStudio.Avalonia
             }
             catch
             {
+                return false;
+            }
+        }
+
+        internal static bool IsInterruptedOrIncompleteIndexingStatus(string? status)
+        {
+            return IsIncompleteIndexCacheStatus(status);
+        }
+
+        internal bool HasInterruptedIndexingState(
+            string folderPath,
+            string? expectedSignature,
+            out ProjectIndexingState? state,
+            out bool signatureMismatched)
+        {
+            state = null;
+            signatureMismatched = false;
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return false;
+            }
+
+            var dbPath = GetDbPath(folderPath);
+            if (!File.Exists(dbPath))
+            {
+                return false;
+            }
+
+            EnsureInitialized(folderPath);
+            if (!File.Exists(dbPath))
+            {
+                return false;
+            }
+
+            try
+            {
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
+                {
+                    var latestProjectId = FindLatestProjectId(conn, null, folderPath, _caseSensitivePaths);
+                    if (latestProjectId == null)
+                    {
+                        return false;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(expectedSignature))
+                    {
+                        using var sigCmd = conn.CreateCommand();
+                        sigCmd.CommandText = "SELECT SignatureHash FROM Projects WHERE Id = @projectId LIMIT 1;";
+                        sigCmd.Parameters.AddWithValue("@projectId", latestProjectId.Value);
+                        var storedSignature = sigCmd.ExecuteScalar()?.ToString() ?? string.Empty;
+                        signatureMismatched = !string.Equals(storedSignature, expectedSignature, StringComparison.Ordinal);
+                    }
+
+                    state = LoadIndexingState(conn, null, latestProjectId.Value);
+                    return state != null && IsIncompleteIndexCacheStatus(state.Status);
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
+            }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while inspecting interrupted indexing state: {ex.Message}", ex);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
+                return false;
+            }
+        }
+
+        internal bool TryRecoverInterruptedIndexing(string folderPath, string? expectedSignature = null)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return false;
+            }
+
+            if (!HasInterruptedIndexingState(folderPath, expectedSignature, out var state, out var signatureMismatched))
+            {
+                return false;
+            }
+
+            var dbPath = GetDbPath(folderPath);
+            var idxPath = MmapProjectIndexSidecar.GetSidecarPath(dbPath);
+            try
+            {
+                lock (WriteGate)
+                {
+                    InvalidateReadConnectionPool(dbPath);
+                    InvalidateProjectIdCacheForDb(dbPath);
+                    MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
+
+                    using var conn = CreateConnectionByDbPath(dbPath);
+                    using var tx = conn.BeginTransaction();
+                    var projectId = FindLatestProjectId(conn, tx, folderPath, _caseSensitivePaths);
+                    if (projectId == null)
+                    {
+                        return false;
+                    }
+
+                    DropSemanticStagingTables(conn, tx);
+                    ClearIndexTablesForProject(conn, tx, projectId.Value, preserveSemanticRelations: false);
+
+                    using (var clearPrevCmd = conn.CreateCommand())
+                    {
+                        clearPrevCmd.Transaction = tx;
+                        clearPrevCmd.CommandText = @"
+                            DELETE FROM PreviewCacheEntries WHERE ProjectId = @projectId;
+                            DELETE FROM IndexingReadFiles WHERE ProjectId = @projectId;";
+                        clearPrevCmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                        clearPrevCmd.ExecuteNonQuery();
+                    }
+
+                    UpsertProjectIndexingStateRow(
+                        conn,
+                        tx,
+                        projectId.Value,
+                        "failed",
+                        Math.Max(0, state?.TotalFiles ?? 0),
+                        0,
+                        Math.Max(0, state?.TotalFiles ?? 0),
+                        0.0,
+                        signatureMismatched
+                            ? "Recovered interrupted indexing with mismatched signature; rebuild required"
+                            : "Recovered interrupted indexing; rebuild required",
+                        string.Empty,
+                        completed: false);
+
+                    tx.Commit();
+                    NotifyDatabaseMutated(dbPath);
+                }
+
+                RecordDiagnostic(
+                    CacheFailureKind.InterruptedIndexing,
+                    "SqliteIndex",
+                    dbPath,
+                    $"Cleared partial index and stale sidecar after interrupted indexing state '{state?.Status ?? "unknown"}'"
+                        + (signatureMismatched ? " (signature mismatch)" : string.Empty)
+                        + ".",
+                    recoveredAutomatically: true);
+                MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
+                return true;
+            }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                return TryRecoverCorruptDatabase(dbPath, $"SQLite corruption during interrupted indexing recovery: {ex.Message}", ex);
+            }
+            catch (Exception ex)
+            {
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
+                Logger.Warning($"Failed to recover interrupted indexing for '{folderPath}': {ex.Message}");
                 return false;
             }
         }

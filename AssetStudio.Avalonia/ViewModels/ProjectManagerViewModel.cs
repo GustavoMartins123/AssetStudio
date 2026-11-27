@@ -256,9 +256,9 @@ namespace AssetStudio.Avalonia.ViewModels
                 lines.Add("Completed: " + FormatDate(state.CompletedAt.Value));
             }
 
-            if (state.ReadFiles.Count > 0)
+            if (state.EffectiveReadFileCount > 0)
             {
-                lines.Add($"Read file list saved: {state.ReadFiles.Count:N0}");
+                lines.Add($"Read file list saved: {state.EffectiveReadFileCount:N0}");
             }
 
             return string.Join(Environment.NewLine, lines);

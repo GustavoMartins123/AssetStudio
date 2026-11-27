@@ -20,6 +20,15 @@ public partial class MainWindow : Window
     private static string GetFolderCacheKey(string folderPath) =>
         ProjectLoadingService.GetFolderCacheKey(folderPath);
 
+    private CacheObservabilityService CreateCacheObservabilityService() =>
+        new(_sqliteCache.CacheDirectory);
+
+    internal CacheDiskUsageReport InspectCacheDiskUsageAndHealth() =>
+        CreateCacheObservabilityService().InspectDiskUsageAndHealth(_sqliteCache);
+
+    internal CacheRecoveryReport InspectAndRecoverProjectCaches() =>
+        CreateCacheObservabilityService().InspectAndRecoverCache(_sqliteCache);
+
     private async Task ClearCurrentProjectCacheCommandHandlerAsync()
     {
         var folderPath = GetCurrentCacheFolderPath();
@@ -31,7 +40,9 @@ public partial class MainWindow : Window
 
         try
         {
-            ProjectLoadingService.ClearProjectCache(_sqliteCache, folderPath);
+            var clearResult = CreateCacheObservabilityService().SafeClearProjectCache(_sqliteCache, folderPath);
+            SpriteHelper.ClearAtlasCache();
+            AssetExportHelper.ClearShaderGuidCache();
 
             lock (previewCacheLock)
             {
@@ -44,7 +55,7 @@ public partial class MainWindow : Window
             }
             _animationRigPreviewCache.Clear();
 
-            StatusStripUpdate($"Cleared project cache for: {folderPath}");
+            StatusStripUpdate($"Cleared project cache for: {folderPath} ({CacheObservabilityService.FormatBytes(clearResult.ReclaimedBytes)} freed)");
         }
         catch (Exception ex)
         {
@@ -171,7 +182,11 @@ public partial class MainWindow : Window
     private bool CanUseLazySemanticRelationCache(string folderPath) =>
         ProjectLoadingService.CanUseLazySemanticRelationCache(_sqliteCache, folderPath, currentScanResult);
 
-    private async Task BuildLazyConnectionsIfNeededAsync(string[] paths, bool force = false)
+    private async Task BuildLazyConnectionsIfNeededAsync(
+        string[] paths,
+        bool force = false,
+        IReadOnlyList<string>? incrementalSourcePaths = null,
+        bool replaceExisting = true)
     {
         if (!assetsManager.LazyLoading || currentScanResult == null || paths.Length != 1 || !Directory.Exists(paths[0]))
         {
@@ -185,7 +200,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        await BuildLazyConnectionsAsync(folderPath, currentScanResult);
+        await BuildLazyConnectionsAsync(folderPath, currentScanResult, incrementalSourcePaths, replaceExisting);
     }
 
     private bool ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(string[] paths) =>
@@ -197,7 +212,11 @@ public partial class MainWindow : Window
             state => ShowIndexingProgressPanel(state),
             StatusStripUpdate);
 
-    private async Task BuildLazyConnectionsAsync(string folderPath, ProjectScanResult scanResult)
+    private async Task BuildLazyConnectionsAsync(
+        string folderPath,
+        ProjectScanResult scanResult,
+        IReadOnlyList<string>? incrementalSourcePaths = null,
+        bool replaceExisting = true)
     {
         if (isBuildingLazyConnections || IsWindowClosingOrClosed || _isReturningToProjectManager)
         {
@@ -222,14 +241,68 @@ public partial class MainWindow : Window
         var lastSourcePath = string.Empty;
         var lastProcessedFiles = 0;
         var sourcePaths = new List<string>();
+        var isIncrementalMerge = incrementalSourcePaths != null && !replaceExisting;
 
         try
         {
             StatusStripUpdate("Preparing connection build...");
-            sourcePaths = await Task.Run(GetLazyConnectionSourcePaths);
+            var allCandidatePaths = await Task.Run(GetLazyConnectionSourcePaths);
             if (IsConnectionAborted())
             {
                 return;
+            }
+
+            if (isIncrementalMerge)
+            {
+                var comparer = OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+                var targetSet = new HashSet<string>(comparer);
+                for (var idx = 0; idx < incrementalSourcePaths!.Count; idx++)
+                {
+                    var p = incrementalSourcePaths[idx];
+                    if (string.IsNullOrWhiteSpace(p))
+                    {
+                        continue;
+                    }
+
+                    targetSet.Add(p);
+                    try
+                    {
+                        targetSet.Add(Path.GetFullPath(p));
+                    }
+                    catch
+                    {
+                        // Keep raw path if normalization fails.
+                    }
+                }
+
+                for (var idx = 0; idx < allCandidatePaths.Count; idx++)
+                {
+                    if (targetSet.Contains(allCandidatePaths[idx]))
+                    {
+                        sourcePaths.Add(allCandidatePaths[idx]);
+                    }
+                }
+
+                if (sourcePaths.Count == 0)
+                {
+                    if (HasSavedSemanticRelations(folderPath, scanResult))
+                    {
+                        PublishLazyConnectionProgress(folderPath, scanResult, "connections_completed", 0, 0, string.Empty, string.Empty);
+                        ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
+                        StatusStripUpdate($"Connections up to date (preserved cached relations for unchanged files).{FormatPartialCoverageSuffix()}");
+                        TriggerAutoRefreshActivePreviewIfNeeded();
+                        return;
+                    }
+
+                    // No prior saved relations exist yet; fall back to full connection build.
+                    isIncrementalMerge = false;
+                    replaceExisting = true;
+                    sourcePaths = allCandidatePaths;
+                }
+            }
+            else
+            {
+                sourcePaths = allCandidatePaths;
             }
 
             if (sourcePaths.Count == 0)
@@ -240,7 +313,9 @@ public partial class MainWindow : Window
                 return;
             }
 
-            StatusStripUpdate($"Building connections... 0/{sourcePaths.Count:N0} files");
+            StatusStripUpdate(isIncrementalMerge
+                ? $"Updating connections incrementally... 0/{sourcePaths.Count:N0} affected file(s)"
+                : $"Building connections... 0/{sourcePaths.Count:N0} files");
             PublishLazyConnectionProgress(folderPath, scanResult, "connecting", 0, sourcePaths.Count, string.Empty, string.Empty);
 
             var signature = _sqliteCache.GetFolderSignature(scanResult);
@@ -300,12 +375,21 @@ public partial class MainWindow : Window
             if (!stagingSession.HasStagedMaterialRelations)
             {
                 stagingSession.Abort();
+                if (isIncrementalMerge && HasSavedSemanticRelations(folderPath, scanResult))
+                {
+                    PublishLazyConnectionProgress(folderPath, scanResult, "connections_completed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
+                    ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
+                    StatusStripUpdate($"Connections updated incrementally ({sourcePaths.Count:N0} file(s) checked; cached relations preserved).{FormatPartialCoverageSuffix()}");
+                    TriggerAutoRefreshActivePreviewIfNeeded();
+                    return;
+                }
+
                 PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, diagnosticSummary, lastSourcePath);
                 StatusStripUpdate($"Connections build produced no mesh/material/texture relations. {diagnosticSummary}");
                 return;
             }
 
-            var saved = await Task.Run(() => TryCommitSemanticStagingSession(folderPath, scanResult, stagingSession));
+            var saved = await Task.Run(() => TryCommitSemanticStagingSession(folderPath, scanResult, stagingSession, replaceExisting));
             if (IsConnectionAborted())
             {
                 return;
@@ -419,13 +503,15 @@ public partial class MainWindow : Window
     private bool TryCommitSemanticStagingSession(
         string folderPath,
         ProjectScanResult scanResult,
-        SQLiteProjectIndexCache.SemanticStagingSession stagingSession) =>
+        SQLiteProjectIndexCache.SemanticStagingSession stagingSession,
+        bool replaceExisting = true) =>
         ProjectLoadingService.TryCommitSemanticStagingSession(
             _sqliteCache,
             folderPath,
             scanResult,
             stagingSession,
-            ShowIndexingProgressPanel);
+            ShowIndexingProgressPanel,
+            replaceExisting);
 
     internal Task<LazyConnectionBuildResult> BuildLazySemanticRelationsForSourcesAsync(
         IReadOnlyList<string> sourcePaths,

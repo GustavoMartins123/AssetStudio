@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using AssetStudio.Avalonia.Services;
 using Microsoft.Data.Sqlite;
 
 namespace AssetStudio.Avalonia
@@ -107,24 +108,33 @@ namespace AssetStudio.Avalonia
                         return false;
                     }
 
-                    if (allowMmapSidecar
-                        && MmapProjectIndexSidecar.TryLoadIntoArena(
+                    if (allowMmapSidecar)
+                    {
+                        if (MmapProjectIndexSidecar.TryLoadIntoArena(
                             idxPath,
                             signature,
                             SemanticSchemaVersion,
                             targetIndex,
                             out var mmapSourceFiles,
                             out hasMissingOriginalPaths))
-                    {
-                        if (targetIndex.Count == 0)
                         {
-                            sourceFiles = null;
-                            hasMissingOriginalPaths = false;
-                            return false;
+                            if (targetIndex.Count == 0)
+                            {
+                                sourceFiles = null;
+                                hasMissingOriginalPaths = false;
+                                return false;
+                            }
+
+                            sourceFiles = mmapSourceFiles;
+                            return true;
                         }
 
-                        sourceFiles = mmapSourceFiles;
-                        return true;
+                        if (File.Exists(idxPath))
+                        {
+                            TryRecoverCorruptSidecar(
+                                idxPath,
+                                "Mmap .idx sidecar failed validation or load while SQLite index was valid; removed corrupt/stale sidecar and fell back to SQLite.");
+                        }
                     }
 
                     var loaded = LoadAssetRecordsIntoProjectIndex(
@@ -151,12 +161,23 @@ namespace AssetStudio.Avalonia
                     throw;
                 }
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                targetIndex.Clear();
+                sourceFiles = null;
+                hasMissingOriginalPaths = false;
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while loading index into arena: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return false;
+            }
             catch (Exception ex)
             {
                 targetIndex.Clear();
                 sourceFiles = null;
                 hasMissingOriginalPaths = false;
                 EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to load SQLite index cache into arena: {ex.Message}");
                 return false;
             }
@@ -325,10 +346,19 @@ namespace AssetStudio.Avalonia
                         return null;
                     }
 
-                    if (allowMmapSidecar
-                        && MmapProjectIndexSidecar.TryLoadHandles(idxPath, signature, SemanticSchemaVersion, out var mmapHandles))
+                    if (allowMmapSidecar)
                     {
-                        return mmapHandles.Count == 0 ? null : mmapHandles;
+                        if (MmapProjectIndexSidecar.TryLoadHandles(idxPath, signature, SemanticSchemaVersion, out var mmapHandles))
+                        {
+                            return mmapHandles.Count == 0 ? null : mmapHandles;
+                        }
+
+                        if (File.Exists(idxPath))
+                        {
+                            TryRecoverCorruptSidecar(
+                                idxPath,
+                                "Mmap .idx sidecar failed validation or load while SQLite index was valid; removed corrupt/stale sidecar and fell back to SQLite.");
+                        }
                     }
 
                     var handles = LoadAssetHandlesForProject(conn, projectId.Value, out var incomplete);
@@ -345,9 +375,17 @@ namespace AssetStudio.Avalonia
                     throw;
                 }
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while loading index cache: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return null;
+            }
             catch (Exception ex)
             {
                 EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to load SQLite index cache: {ex.Message}");
                 return null;
             }
@@ -454,208 +492,226 @@ namespace AssetStudio.Avalonia
             bool markIndexingCompleted,
             Action<string>? beforeSidecarValidateHook)
         {
-            EnsureInitialized(folderPath);
             var dbPath = GetDbPath(folderPath);
             var idxPath = MmapProjectIndexSidecar.GetSidecarPath(dbPath);
             var stagedIdxPath = string.Empty;
-            try
+            for (var attempt = 0; attempt < 2; attempt++)
             {
-                var handleCollection = handles as IReadOnlyCollection<AssetHandle> ?? handles?.ToList() ?? new List<AssetHandle>();
-                // v16 writes every handle once (unified Assets table) plus source file fingerprint metadata.
-                var totalWork = Math.Max(1, handleCollection.Count + Math.Max(1, scanResult.TotalFiles));
-                var reporter = new ThrottledProgressReporter(totalWork, progress);
-
-                // Sort & deduplicate once by UniqueID (Ordinal) so both the WITHOUT ROWID SQLite B-tree insert
-                // and the post-commit mmap .idx sidecar write reuse the same ordered list without holding a
-                // ~500MB sidecar buffer in LOH memory or dirtying disk pages during the SQLite transaction.
-                reporter.Report("Sorting & deduplicating handles", force: true);
-                var orderedHandles = MmapProjectIndexSidecar.NormalizeAndDeduplicateHandles(handleCollection);
-
-                reporter.Report("Waiting for SQLite writer", force: true);
-                lock (WriteGate)
+                EnsureInitialized(folderPath);
+                stagedIdxPath = string.Empty;
+                try
                 {
-                    reporter.Report("Opening SQLite connection", force: true);
-                    using (var conn = CreateConnectionByDbPath(dbPath))
+                    var handleCollection = handles as IReadOnlyCollection<AssetHandle> ?? handles?.ToList() ?? new List<AssetHandle>();
+                    // Write every handle once into the unified Assets table plus source file fingerprint metadata.
+                    var totalWork = Math.Max(1, handleCollection.Count + Math.Max(1, scanResult.TotalFiles));
+                    var reporter = new ThrottledProgressReporter(totalWork, progress);
+
+                    // Sort & deduplicate once by UniqueID (Ordinal) so both the WITHOUT ROWID SQLite B-tree insert
+                    // and the post-commit mmap .idx sidecar write reuse the same ordered list without holding a
+                    // large sidecar buffer in LOH memory or dirtying disk pages during the SQLite transaction.
+                    reporter.Report("Sorting & deduplicating handles", force: true);
+                    var orderedHandles = MmapProjectIndexSidecar.NormalizeAndDeduplicateHandles(handleCollection);
+
+                    reporter.Report("Waiting for SQLite writer", force: true);
+                    lock (WriteGate)
                     {
-                        InvalidateProjectIdCacheForDb(dbPath);
-                        long committedProjectId;
-                        var scanLookup = BuildScanFileLookup(folderPath, scanResult, _caseSensitivePaths);
-
-                        SetSynchronousMode(conn, "OFF");
-                        try
+                        reporter.Report("Opening SQLite connection", force: true);
+                        using (var conn = CreateConnectionByDbPath(dbPath))
                         {
-                            using (var transaction = conn.BeginTransaction())
+                            InvalidateProjectIdCacheForDb(dbPath);
+                            long committedProjectId;
+                            var scanLookup = BuildScanFileLookup(folderPath, scanResult, _caseSensitivePaths);
+
+                            SetSynchronousMode(conn, "OFF");
+                            SetForeignKeysMode(conn, enabled: false);
+                            try
                             {
-                                reporter.Report("Preparing SQLite project row", force: true);
-                                var projectId = EnsureProject(
-                                    conn,
-                                    transaction,
-                                    folderPath,
-                                    signature,
-                                    scanResult,
-                                    _caseSensitivePaths,
-                                    out var signatureChanged,
-                                    unityVersion);
-
-                                var existingSources = LoadStoredSourceFiles(conn, transaction, projectId);
-                                var canApplyIncremental = signatureChanged
-                                    && existingSources.Count > 0
-                                    && scanResult.Files.Count > 0
-                                    && HasV16SourceFileMetadata(existingSources);
-
-                                if (canApplyIncremental)
+                                using (var transaction = conn.BeginTransaction())
                                 {
-                                    reporter.Report("Computing incremental bundle delta", force: true);
-                                    PartitionStoredSourcesForDelta(
+                                    reporter.Report("Preparing SQLite project row", force: true);
+                                    var projectId = EnsureProject(
+                                        conn,
+                                        transaction,
                                         folderPath,
-                                        existingSources,
-                                        scanLookup,
+                                        signature,
+                                        scanResult,
                                         _caseSensitivePaths,
-                                        out var unchangedSourceIds,
-                                        out var dirtySourceIds,
-                                        out var dirtyRatio);
+                                        out var signatureChanged,
+                                        unityVersion);
 
-                                    if (unchangedSourceIds.Count > 0)
+                                    var existingSources = LoadStoredSourceFiles(conn, transaction, projectId);
+                                    var canApplyIncremental = signatureChanged
+                                        && existingSources.Count > 0
+                                        && scanResult.Files.Count > 0
+                                        && HasV16SourceFileMetadata(existingSources);
+
+                                    if (canApplyIncremental)
                                     {
-                                        var requiresFullSemanticClear = !preserveSemanticRelations && dirtyRatio > 0.25;
-                                        DeleteDirtySourceRowsAndAffectedData(
-                                            conn,
-                                            transaction,
-                                            projectId,
-                                            dirtySourceIds,
-                                            preserveSemanticRelations,
-                                            requiresFullSemanticClear);
+                                        reporter.Report("Computing incremental bundle delta", force: true);
+                                        PartitionStoredSourcesForDelta(
+                                            folderPath,
+                                            existingSources,
+                                            scanLookup,
+                                            _caseSensitivePaths,
+                                            out var unchangedSourceIds,
+                                            out var dirtySourceIds,
+                                            out var dirtyRatio);
 
-                                        // Keep unchanged SourceFiles (preserving SourceFiles.Id) and unchanged Assets;
-                                        // upsert incoming handles for modified/added files and prune any removed handles.
-                                        UpsertSourceFilesAndAssetsIncremental(
+                                        // Only switch to O(1) table recreate + ordered bulk insert for very large changes
+                                        // where row-by-row DELETE/UPSERT would rewrite hundreds of thousands of rows.
+                                        var useBulkRecreate = orderedHandles.Count >= 250_000 && dirtyRatio > 0.40;
+                                        if (unchangedSourceIds.Count > 0 && !useBulkRecreate)
+                                        {
+                                            var requiresFullSemanticClear = !preserveSemanticRelations && dirtyRatio > 0.25;
+                                            DeleteDirtySourceRowsAndAffectedData(
+                                                conn,
+                                                transaction,
+                                                projectId,
+                                                dirtySourceIds,
+                                                preserveSemanticRelations,
+                                                requiresFullSemanticClear);
+
+                                            // Keep unchanged SourceFiles (preserving SourceFiles.Id) and unchanged Assets;
+                                            // upsert incoming handles for modified/added files and prune any removed handles.
+                                            UpsertSourceFilesAndAssetsIncremental(
+                                                conn,
+                                                transaction,
+                                                projectId,
+                                                folderPath,
+                                                scanLookup,
+                                                existingSources,
+                                                unchangedSourceIds,
+                                                orderedHandles,
+                                                _caseSensitivePaths,
+                                                reporter.Advance);
+                                        }
+                                        else
+                                        {
+                                            DeleteDirtyPreviewCacheEntries(conn, transaction, projectId, dirtySourceIds);
+                                            reporter.Report("Clearing previous index rows", force: true);
+                                            ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
+                                            InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, orderedHandles, _caseSensitivePaths, reporter.Advance, isAlreadyOrderedByUniqueId: true, isFreshInsert: true);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // Always invalidate stale preview cache entries for modified/replaced/removed sources,
+                                        // even if an earlier progress update already updated Projects.SignatureHash.
+                                        InvalidateStalePreviewsForChangedProject(
                                             conn,
                                             transaction,
                                             projectId,
                                             folderPath,
-                                            scanLookup,
+                                            scanResult,
+                                            signatureChanged,
                                             existingSources,
-                                            unchangedSourceIds,
-                                            orderedHandles,
-                                            _caseSensitivePaths,
-                                            reporter.Advance);
+                                            scanLookup);
+
+                                        reporter.Report("Clearing previous index rows", force: true);
+                                        ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
+
+                                        // Single write pass into the unified clustered Assets table (no secondary indexes to rebuild).
+                                        InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, orderedHandles, _caseSensitivePaths, reporter.Advance, isAlreadyOrderedByUniqueId: true, isFreshInsert: true);
                                     }
-                                    else
+
+                                    if (markIndexingCompleted)
                                     {
-                                        DeleteDirtySourceRowsAndAffectedData(
+                                        var completedFiles = Math.Max(1, scanResult.TotalFiles);
+                                        SaveProjectIndexingState(
                                             conn,
                                             transaction,
                                             projectId,
-                                            dirtySourceIds,
-                                            preserveSemanticRelations,
-                                            requiresFullSemanticClear: !preserveSemanticRelations);
-                                        ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
-                                        InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, orderedHandles, _caseSensitivePaths, reporter.Advance, isAlreadyOrderedByUniqueId: true, isFreshInsert: true);
+                                            "completed",
+                                            completedFiles,
+                                            completedFiles,
+                                            "SQLite index cache saved",
+                                            completed: true);
                                     }
+
+                                    // Remove any prior .idx right before SQLite commit so a crash between commit and
+                                    // sidecar publish can never leave a stale .idx paired with updated DB rows.
+                                    MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+
+                                    reporter.Report("Committing SQLite transaction", force: true);
+                                    transaction.Commit();
+                                    committedProjectId = projectId;
+                                }
+                            }
+                            finally
+                            {
+                                SetForeignKeysMode(conn, enabled: true);
+                                SetSynchronousMode(conn, "NORMAL");
+                            }
+
+                            CacheProjectId(dbPath, folderPath, signature, committedProjectId);
+                            NotifyDatabaseMutated(dbPath);
+                            reporter.Report("Analyzing SQLite statistics", force: true);
+                            TryAnalyzeDatabase(conn, "index cache");
+                            reporter.Report("Checkpointing SQLite WAL", force: true);
+                            TryCheckpointWal(conn, "index cache");
+
+                            reporter.Report("Staging mmap .idx sidecar", force: true);
+                            var stagedOk = MmapProjectIndexSidecar.TryStageSidecar(
+                                idxPath,
+                                signature,
+                                SemanticSchemaVersion,
+                                orderedHandles,
+                                _caseSensitivePaths,
+                                out stagedIdxPath,
+                                out _,
+                                beforeSidecarValidateHook,
+                                isAlreadyNormalizedAndOrdered: true);
+                            reporter.Report("Publishing mmap .idx sidecar cache", force: true);
+                            if (stagedOk)
+                            {
+                                if (!MmapProjectIndexSidecar.TryPublishStagedSidecar(stagedIdxPath, idxPath))
+                                {
+                                    MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                                    Logger.Warning($"Failed to publish verified mmap .idx sidecar for '{folderPath}'; deleted stale sidecar.");
                                 }
                                 else
                                 {
-                                    if (signatureChanged && existingSources.Count > 0)
-                                    {
-                                        var allExistingSourceIds = existingSources.Select(static s => s.Id).ToList();
-                                        DeleteDirtyPreviewCacheEntries(conn, transaction, projectId, allExistingSourceIds);
-                                    }
-
-                                    reporter.Report("Clearing previous index rows", force: true);
-                                    ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
-
-                                    // Single write pass into the unified clustered Assets table (no secondary indexes to rebuild).
-                                    InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, orderedHandles, _caseSensitivePaths, reporter.Advance, isAlreadyOrderedByUniqueId: true, isFreshInsert: true);
+                                    stagedIdxPath = string.Empty;
                                 }
-
-                                if (markIndexingCompleted)
-                                {
-                                    var completedFiles = Math.Max(1, scanResult.TotalFiles);
-                                    SaveProjectIndexingState(
-                                        conn,
-                                        transaction,
-                                        projectId,
-                                        "completed",
-                                        completedFiles,
-                                        completedFiles,
-                                        "SQLite index cache saved",
-                                        completed: true);
-                                }
-
-                                // PERF-05: Remove any prior .idx right before SQLite commit so a crash between commit and
-                                // sidecar publish can never leave a stale .idx paired with updated DB rows.
-                                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
-
-                                reporter.Report("Committing SQLite transaction", force: true);
-                                transaction.Commit();
-                                committedProjectId = projectId;
-                            }
-                        }
-                        finally
-                        {
-                            SetSynchronousMode(conn, "NORMAL");
-                        }
-
-                        CacheProjectId(dbPath, folderPath, signature, committedProjectId);
-                        NotifyDatabaseMutated(dbPath);
-                        reporter.Report("Analyzing SQLite statistics", force: true);
-                        TryAnalyzeDatabase(conn, "index cache");
-                        reporter.Report("Checkpointing SQLite WAL", force: true);
-                        TryCheckpointWal(conn, "index cache");
-
-                        reporter.Report("Staging mmap .idx sidecar", force: true);
-                        var stagedOk = MmapProjectIndexSidecar.TryStageSidecar(
-                            idxPath,
-                            signature,
-                            SemanticSchemaVersion,
-                            orderedHandles,
-                            _caseSensitivePaths,
-                            out stagedIdxPath,
-                            out _,
-                            beforeSidecarValidateHook,
-                            isAlreadyNormalizedAndOrdered: true);
-                        reporter.Report("Publishing mmap .idx sidecar cache", force: true);
-                        if (stagedOk)
-                        {
-                            if (!MmapProjectIndexSidecar.TryPublishStagedSidecar(stagedIdxPath, idxPath))
-                            {
-                                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
-                                Logger.Warning($"Failed to publish verified mmap .idx sidecar for '{folderPath}'; deleted stale sidecar.");
                             }
                             else
                             {
-                                stagedIdxPath = string.Empty;
+                                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                                Logger.Warning($"Post-commit mmap .idx sidecar staging failed for '{folderPath}'; SQLite cache remains valid.");
                             }
-                        }
-                        else
-                        {
-                            MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
-                            Logger.Warning($"Post-commit mmap .idx sidecar staging failed for '{folderPath}'; SQLite cache remains valid.");
-                        }
 
-                        MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
-                        reporter.MarkCompleted("SQLite index cache saved");
-                        reporter.Report("SQLite index cache saved", force: true);
-                        Logger.Info($"Saved index cache in SQLite for: {folderPath}");
-                        return true;
+                            MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
+                            reporter.MarkCompleted("SQLite index cache saved");
+                            reporter.Report("SQLite index cache saved", force: true);
+                            Logger.Info($"Saved index cache in SQLite for: {folderPath}");
+                            return true;
+                        }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
-                Logger.Warning($"Failed to save SQLite index cache: {ex.Message}");
-                return false;
-            }
-            finally
-            {
-                if (!string.IsNullOrEmpty(stagedIdxPath))
+                catch (SqliteException ex) when (IsSqliteCorruptionException(ex) && attempt == 0)
                 {
-                    MmapProjectIndexSidecar.TryDeleteFileQuietly(stagedIdxPath);
+                    MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                    TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while saving index cache: {ex.Message}", ex);
                 }
+                catch (Exception ex)
+                {
+                    MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                    RecordClassifiedException("SqliteIndex", dbPath, ex);
+                    Logger.Warning($"Failed to save SQLite index cache: {ex.Message}");
+                    return false;
+                }
+                finally
+                {
+                    if (!string.IsNullOrEmpty(stagedIdxPath))
+                    {
+                        MmapProjectIndexSidecar.TryDeleteFileQuietly(stagedIdxPath);
+                    }
 
-                MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
+                    MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
+                }
             }
+
+            return false;
         }
 
         internal sealed class StoredSourceFileEntry
@@ -682,6 +738,7 @@ namespace AssetStudio.Avalonia
             public List<string> UnchangedFilePaths { get; } = new();
             public List<string> FilesToReindex { get; } = new();
             public List<string> DeletedFilePaths { get; } = new();
+            public List<string> AffectedSemanticFilePaths { get; } = new();
         }
 
         internal IncrementalProjectDeltaPlan PlanIncrementalDelta(string folderPath, ProjectScanResult newScanResult)
@@ -793,6 +850,33 @@ namespace AssetStudio.Avalonia
                         }
                     }
 
+                    // Collect the exact set of files whose semantic relations are affected (reindexed files +
+                    // unchanged files that reference a dirty source via SourceFileExternals) when an incremental
+                    // semantic refresh is feasible.
+                    if (!plan.RequiresFullSemanticRebuild)
+                    {
+                        var seenAffectedSemantic = new HashSet<string>(_pathComparer);
+                        for (var i = 0; i < plan.FilesToReindex.Count; i++)
+                        {
+                            if (seenAffectedSemantic.Add(plan.FilesToReindex[i]))
+                            {
+                                plan.AffectedSemanticFilePaths.Add(plan.FilesToReindex[i]);
+                            }
+                        }
+
+                        if (dirtyIds.Count > 0)
+                        {
+                            CollectDependentSemanticSourcePaths(
+                                conn,
+                                projectId.Value,
+                                storedSources,
+                                dirtyIds,
+                                unchangedIds,
+                                seenAffectedSemantic,
+                                plan.AffectedSemanticFilePaths);
+                        }
+                    }
+
                     return plan;
                 }
                 catch
@@ -801,8 +885,15 @@ namespace AssetStudio.Avalonia
                     throw;
                 }
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while planning incremental index delta: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return new IncrementalProjectDeltaPlan { CanApplyIncremental = false };
+            }
             catch (Exception ex)
             {
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to plan incremental index delta: {ex.Message}");
                 return new IncrementalProjectDeltaPlan { CanApplyIncremental = false };
             }
@@ -926,10 +1017,19 @@ namespace AssetStudio.Avalonia
                     throw;
                 }
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                targetIndex.Clear();
+                unchangedSourceFiles = null;
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while loading unchanged assets for incremental update: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return false;
+            }
             catch (Exception ex)
             {
                 targetIndex.Clear();
                 unchangedSourceFiles = null;
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to load unchanged assets for incremental update: {ex.Message}");
                 return false;
             }
@@ -956,7 +1056,24 @@ namespace AssetStudio.Avalonia
             try
             {
                 var deltaHandlesList = updatedHandles?.ToList() ?? new List<AssetHandle>();
-                var totalWork = Math.Max(1, deltaHandlesList.Count + deltaPlan.DirtySourceFileIds.Count + 2);
+                var hasLargeAssetDelta = allMergedHandles != null
+                    && allMergedHandles.Count >= 250_000
+                    && deltaHandlesList.Count >= 100_000
+                    && deltaHandlesList.Count >= allMergedHandles.Count * 0.40;
+
+                // Pre-normalize merged handles once outside WriteGate when using fast O(1) recreate + ordered bulk insert.
+                List<AssetHandle>? preOrderedMergedHandles = null;
+                if (hasLargeAssetDelta)
+                {
+                    var totalBulkWork = Math.Max(1, allMergedHandles!.Count + Math.Max(1, scanResult.TotalFiles));
+                    var prepReporter = new ThrottledProgressReporter(totalBulkWork, progress);
+                    prepReporter.Report("Sorting & deduplicating handles", force: true);
+                    preOrderedMergedHandles = MmapProjectIndexSidecar.NormalizeAndDeduplicateHandles(allMergedHandles);
+                }
+
+                var totalWork = preOrderedMergedHandles != null
+                    ? Math.Max(1, preOrderedMergedHandles.Count + Math.Max(1, scanResult.TotalFiles))
+                    : Math.Max(1, deltaHandlesList.Count + deltaPlan.DirtySourceFileIds.Count + 2);
                 var reporter = new ThrottledProgressReporter(totalWork, progress);
 
                 reporter.Report("Waiting for SQLite writer", force: true);
@@ -966,13 +1083,18 @@ namespace AssetStudio.Avalonia
                     InvalidateProjectIdCacheForDb(dbPath);
                     var scanLookup = BuildScanFileLookup(folderPath, scanResult, _caseSensitivePaths);
                     long committedProjectId;
+                    var usedBulkRecreate = false;
 
                     SetSynchronousMode(conn, "OFF");
+                    // Disable FK enforcement inside this atomic transaction so deleting dirty SourceFiles
+                    // does NOT trigger an O(M * N) full-table scan of unindexed Assets(SourceFileId) for
+                    // ON DELETE SET NULL; all dirty Assets/Externals/Scenes/Previews are explicitly deleted here.
+                    SetForeignKeysMode(conn, enabled: false);
                     try
                     {
                         using (var transaction = conn.BeginTransaction())
                         {
-                            reporter.Report("Updating changed index rows", force: true);
+                            reporter.Report("Preparing SQLite project row", force: true);
                             var projectId = EnsureProject(
                                 conn,
                                 transaction,
@@ -983,25 +1105,69 @@ namespace AssetStudio.Avalonia
                                 out _,
                                 unityVersion);
 
-                            DeleteDirtySourceRowsAndAffectedData(
-                                conn,
-                                transaction,
-                                projectId,
-                                deltaPlan.DirtySourceFileIds,
-                                preserveSemanticRelations: false,
-                                requiresFullSemanticClear: deltaPlan.RequiresFullSemanticRebuild);
+                            usedBulkRecreate = preOrderedMergedHandles != null
+                                && IsSingleProjectDatabase(conn, transaction, projectId);
 
-                            if (deltaHandlesList.Count > 0)
+                            if (usedBulkRecreate)
                             {
+                                reporter.Report("Clearing stale preview & semantic rows", force: true);
+                                DeleteDirtyPreviewCacheEntries(conn, transaction, projectId, deltaPlan.DirtySourceFileIds);
+                                if (!deltaPlan.RequiresFullSemanticRebuild && deltaPlan.DirtySourceFileIds.Count > 0)
+                                {
+                                    DeleteDirtySourceRowsAndAffectedData(
+                                        conn,
+                                        transaction,
+                                        projectId,
+                                        deltaPlan.DirtySourceFileIds,
+                                        preserveSemanticRelations: false,
+                                        requiresFullSemanticClear: false,
+                                        skipAssetsAndSourceFilesDelete: true,
+                                        skipPreviewDelete: true,
+                                        reportStage: stage => reporter.Report(stage, force: true));
+                                }
+
+                                reporter.Report("Resetting index tables (O(1))", force: true);
+                                RecreateIndexTablesInTransaction(
+                                    conn,
+                                    transaction,
+                                    includeSemanticTables: deltaPlan.RequiresFullSemanticRebuild);
+
                                 InsertSourceFilesAndAssets(
                                     conn,
                                     transaction,
                                     projectId,
                                     folderPath,
                                     scanLookup,
-                                    deltaHandlesList,
+                                    preOrderedMergedHandles!,
                                     _caseSensitivePaths,
-                                    reporter.Advance);
+                                    reporter.Advance,
+                                    isAlreadyOrderedByUniqueId: true,
+                                    isFreshInsert: true);
+                            }
+                            else
+                            {
+                                reporter.Report("Updating changed index rows", force: true);
+                                DeleteDirtySourceRowsAndAffectedData(
+                                    conn,
+                                    transaction,
+                                    projectId,
+                                    deltaPlan.DirtySourceFileIds,
+                                    preserveSemanticRelations: false,
+                                    requiresFullSemanticClear: deltaPlan.RequiresFullSemanticRebuild,
+                                    reportStage: stage => reporter.Report(stage, force: true));
+
+                                if (deltaHandlesList.Count > 0)
+                                {
+                                    InsertSourceFilesAndAssets(
+                                        conn,
+                                        transaction,
+                                        projectId,
+                                        folderPath,
+                                        scanLookup,
+                                        deltaHandlesList,
+                                        _caseSensitivePaths,
+                                        reporter.Advance);
+                                }
                             }
 
                             if (markIndexingCompleted)
@@ -1026,6 +1192,7 @@ namespace AssetStudio.Avalonia
                     }
                     finally
                     {
+                        SetForeignKeysMode(conn, enabled: true);
                         SetSynchronousMode(conn, "NORMAL");
                     }
 
@@ -1033,14 +1200,19 @@ namespace AssetStudio.Avalonia
                     NotifyDatabaseMutated(dbPath);
 
                     reporter.Report("Publishing updated .idx sidecar", force: true);
-                    var mergedHandlesForSidecar = allMergedHandles ?? LoadAssetHandlesForProject(conn, committedProjectId, out _);
+                    var mergedHandlesForSidecar = preOrderedMergedHandles
+                        ?? allMergedHandles
+                        ?? LoadAssetHandlesForProject(conn, committedProjectId, out _);
                     var stagedOk = MmapProjectIndexSidecar.TryStageSidecar(
                         idxPath,
                         newSignature,
                         SemanticSchemaVersion,
                         mergedHandlesForSidecar,
                         _caseSensitivePaths,
-                        out stagedIdxPath);
+                        out stagedIdxPath,
+                        out _,
+                        beforeValidateHook: null,
+                        isAlreadyNormalizedAndOrdered: preOrderedMergedHandles != null);
 
                     if (stagedOk && MmapProjectIndexSidecar.TryPublishStagedSidecar(stagedIdxPath, idxPath))
                     {
@@ -1054,16 +1226,31 @@ namespace AssetStudio.Avalonia
 
                     MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
                     reporter.Report("Checkpointing SQLite WAL", force: true);
-                    TryAnalyzeDatabase(conn, "incremental index cache");
+                    if (usedBulkRecreate)
+                    {
+                        TryAnalyzeDatabase(conn, "incremental index cache");
+                    }
+                    else
+                    {
+                        TryOptimizeDatabase(conn, "incremental index cache");
+                    }
                     TryCheckpointWal(conn, "incremental index cache");
                     reporter.MarkCompleted("Incremental SQLite index cache saved");
                     reporter.Report("Incremental SQLite index cache saved", force: true);
                     return true;
                 }
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while saving incremental index delta: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return false;
+            }
             catch (Exception ex)
             {
                 MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                RecordClassifiedException("SqliteIndex", dbPath, ex);
                 Logger.Warning($"Failed to save incremental SQLite index delta: {ex.Message}");
                 return false;
             }
@@ -1471,13 +1658,151 @@ namespace AssetStudio.Avalonia
             dirtyRatio = (double)(dirtySourceIds.Count + addedAssetFiles) / denominator;
         }
 
+        private void InvalidateStalePreviewsForChangedProject(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            string folderPath,
+            ProjectScanResult scanResult,
+            bool signatureChanged,
+            IReadOnlyList<StoredSourceFileEntry>? existingSourcesOverride = null,
+            ScanFileLookup? scanLookupOverride = null)
+        {
+            var existingSources = existingSourcesOverride ?? LoadStoredSourceFiles(conn, transaction, projectId);
+            if (existingSources.Count > 0)
+            {
+                if (HasV16SourceFileMetadata(existingSources))
+                {
+                    var scanLookup = scanLookupOverride ?? BuildScanFileLookup(folderPath, scanResult, _caseSensitivePaths);
+                    PartitionStoredSourcesForDelta(
+                        folderPath,
+                        existingSources,
+                        scanLookup,
+                        _caseSensitivePaths,
+                        out _,
+                        out var dirtySourceIds,
+                        out _);
+
+                    if (dirtySourceIds.Count > 0)
+                    {
+                        DeleteDirtyPreviewCacheEntries(conn, transaction, projectId, dirtySourceIds);
+                    }
+                }
+                else if (signatureChanged)
+                {
+                    var allExistingSourceIds = existingSources.Select(static s => s.Id).ToList();
+                    DeleteDirtyPreviewCacheEntries(conn, transaction, projectId, allExistingSourceIds);
+                }
+            }
+            else if (signatureChanged)
+            {
+                using var delAllCmd = conn.CreateCommand();
+                delAllCmd.Transaction = transaction;
+                delAllCmd.CommandText = "DELETE FROM PreviewCacheEntries WHERE ProjectId = @projectId;";
+                delAllCmd.Parameters.AddWithValue("@projectId", projectId);
+                delAllCmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void CollectDependentSemanticSourcePaths(
+            SqliteConnection conn,
+            long projectId,
+            IReadOnlyList<StoredSourceFileEntry> storedSources,
+            IReadOnlyList<long> dirtySourceIds,
+            HashSet<long> unchangedSourceIds,
+            HashSet<string> seenAffectedPaths,
+            List<string> affectedPaths)
+        {
+            if (dirtySourceIds.Count == 0 || unchangedSourceIds.Count == 0)
+            {
+                return;
+            }
+
+            var dirtySet = new HashSet<long>(dirtySourceIds);
+            var dirtyFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var dirtyPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sourceById = new Dictionary<long, StoredSourceFileEntry>(storedSources.Count);
+            for (var i = 0; i < storedSources.Count; i++)
+            {
+                var src = storedSources[i];
+                sourceById[src.Id] = src;
+                if (dirtySet.Contains(src.Id))
+                {
+                    if (!string.IsNullOrEmpty(src.SerializedFileName))
+                    {
+                        dirtyFileNames.Add(src.SerializedFileName);
+                    }
+                    if (!string.IsNullOrEmpty(src.OriginalPath))
+                    {
+                        dirtyPaths.Add(src.OriginalPath);
+                    }
+                    if (!string.IsNullOrEmpty(src.RelativePath))
+                    {
+                        dirtyPaths.Add(src.RelativePath);
+                    }
+                }
+            }
+
+            if (dirtyFileNames.Count == 0 && dirtyPaths.Count == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+                    SELECT SourceFileId, ExternalFileName, ExternalPathName
+                    FROM SourceFileExternals
+                    WHERE ProjectId = @projectId;";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var srcId = reader.GetInt64(0);
+                    if (!unchangedSourceIds.Contains(srcId))
+                    {
+                        continue;
+                    }
+
+                    var extName = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+                    var extPath = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+                    var referencesDirty = (!string.IsNullOrEmpty(extName) && dirtyFileNames.Contains(extName))
+                        || (!string.IsNullOrEmpty(extPath) && dirtyPaths.Contains(extPath));
+                    if (referencesDirty
+                        && sourceById.TryGetValue(srcId, out var dependentSrc)
+                        && !string.IsNullOrWhiteSpace(dependentSrc.OriginalPath)
+                        && seenAffectedPaths.Add(dependentSrc.OriginalPath))
+                    {
+                        affectedPaths.Add(dependentSrc.OriginalPath);
+                    }
+                }
+            }
+            catch (SqliteException)
+            {
+                // Older DB without SourceFileExternals; safely skip dependent path collection.
+            }
+        }
+
+        private static bool HasAnyPreviewCacheEntries(
+            SqliteConnection conn,
+            SqliteTransaction? transaction,
+            long projectId)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM PreviewCacheEntries WHERE ProjectId = @projectId LIMIT 1);";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0L) != 0;
+        }
+
         private static void DeleteDirtyPreviewCacheEntries(
             SqliteConnection conn,
             SqliteTransaction transaction,
             long projectId,
             IReadOnlyCollection<long> dirtySourceIds)
         {
-            if (dirtySourceIds.Count == 0)
+            if (dirtySourceIds.Count == 0 || !HasAnyPreviewCacheEntries(conn, transaction, projectId))
             {
                 return;
             }
@@ -1525,12 +1850,22 @@ namespace AssetStudio.Avalonia
             long projectId,
             IReadOnlyCollection<long> dirtySourceIds,
             bool preserveSemanticRelations,
-            bool requiresFullSemanticClear)
+            bool requiresFullSemanticClear,
+            bool skipAssetsAndSourceFilesDelete = false,
+            bool skipPreviewDelete = false,
+            Action<string>? reportStage = null)
         {
-            if (dirtySourceIds.Count == 0 && !requiresFullSemanticClear)
+            if (dirtySourceIds.Count == 0 && (!requiresFullSemanticClear || preserveSemanticRelations))
             {
                 return;
             }
+
+            var needsPreviewCleanup = !skipPreviewDelete
+                && dirtySourceIds.Count > 0
+                && HasAnyPreviewCacheEntries(conn, transaction, projectId);
+            var needsTargetedSemanticCleanup = !preserveSemanticRelations
+                && !requiresFullSemanticClear
+                && dirtySourceIds.Count > 0;
 
             using (var setupCmd = conn.CreateCommand())
             {
@@ -1563,16 +1898,28 @@ namespace AssetStudio.Avalonia
                         }
                     }
 
-                    using (var collectCmd = conn.CreateCommand())
+                    // Only scan Assets to build dirty/semantic UniqueID sets when previews or targeted semantic cleanup actually need them.
+                    if (needsPreviewCleanup)
                     {
-                        collectCmd.Transaction = transaction;
-                        collectCmd.CommandText = @"
+                        reportStage?.Invoke("Collecting stale preview entries");
+                        using var collectDirtyCmd = conn.CreateCommand();
+                        collectDirtyCmd.Transaction = transaction;
+                        collectDirtyCmd.CommandText = @"
                             INSERT OR IGNORE INTO temp._delta_dirty_assets (UniqueID)
                             SELECT UniqueID
                             FROM Assets
                             WHERE ProjectId = @projectId
-                              AND SourceFileId IN (SELECT Id FROM temp._delta_dirty_sources);
+                              AND SourceFileId IN (SELECT Id FROM temp._delta_dirty_sources);";
+                        collectDirtyCmd.Parameters.AddWithValue("@projectId", projectId);
+                        collectDirtyCmd.ExecuteNonQuery();
+                    }
 
+                    if (needsTargetedSemanticCleanup)
+                    {
+                        reportStage?.Invoke("Collecting affected semantic relations");
+                        using var collectSemCmd = conn.CreateCommand();
+                        collectSemCmd.Transaction = transaction;
+                        collectSemCmd.CommandText = @"
                             INSERT OR IGNORE INTO temp._delta_semantic_sources (Id)
                             SELECT Id FROM temp._delta_dirty_sources;
 
@@ -1594,20 +1941,29 @@ namespace AssetStudio.Avalonia
                             FROM Assets
                             WHERE ProjectId = @projectId
                               AND SourceFileId IN (SELECT Id FROM temp._delta_semantic_sources);";
-                        collectCmd.Parameters.AddWithValue("@projectId", projectId);
-                        collectCmd.ExecuteNonQuery();
+                        collectSemCmd.Parameters.AddWithValue("@projectId", projectId);
+                        collectSemCmd.ExecuteNonQuery();
                     }
 
                     // 1. Delete dirty PreviewCacheEntries (preserving valid entries for unchanged bundles!)
-                    // 2. Delete dirty SourceFileExternals and Scenes
-                    using (var delDirectCmd = conn.CreateCommand())
+                    if (needsPreviewCleanup)
                     {
-                        delDirectCmd.Transaction = transaction;
-                        delDirectCmd.CommandText = @"
+                        using var delPrevCmd = conn.CreateCommand();
+                        delPrevCmd.Transaction = transaction;
+                        delPrevCmd.CommandText = @"
                             DELETE FROM PreviewCacheEntries
                             WHERE ProjectId = @projectId
-                              AND AssetUniqueID IN (SELECT UniqueID FROM temp._delta_dirty_assets);
+                              AND AssetUniqueID IN (SELECT UniqueID FROM temp._delta_dirty_assets);";
+                        delPrevCmd.Parameters.AddWithValue("@projectId", projectId);
+                        delPrevCmd.ExecuteNonQuery();
+                    }
 
+                    // 2. Delete dirty SourceFileExternals and Scenes
+                    if (!skipAssetsAndSourceFilesDelete)
+                    {
+                        using var delDirectCmd = conn.CreateCommand();
+                        delDirectCmd.Transaction = transaction;
+                        delDirectCmd.CommandText = @"
                             DELETE FROM SourceFileExternals
                             WHERE ProjectId = @projectId
                               AND SourceFileId IN (SELECT Id FROM temp._delta_dirty_sources);
@@ -1620,36 +1976,45 @@ namespace AssetStudio.Avalonia
                     }
                 }
 
-                // 3. Clean semantic tables (either full clear when >25% dirty, or targeted dirty+dependent edges)
+                // 3. Clean semantic tables (O(1) recreate when >25% dirty on single-project DB, or targeted dirty+dependent edges)
                 if (!preserveSemanticRelations)
                 {
                     if (requiresFullSemanticClear)
                     {
-                        var semanticTables = new[]
+                        reportStage?.Invoke("Resetting semantic relation tables");
+                        if (IsSingleProjectDatabase(conn, transaction, projectId))
                         {
-                            "AnimationClipTargets",
-                            "CompositeAssetParts",
-                            "CompositeAssets",
-                            "MeshMaterialResolvedCache",
-                            "MaterialCache",
-                            "MaterialTextures",
-                            "MeshMaterials",
-                            "MeshRenderers",
-                            "ModelGroupMeshes",
-                            "ModelGroups",
-                            "AssetEdges"
-                        };
-                        foreach (var table in semanticTables)
+                            RecreateSemanticTablesInTransaction(conn, transaction, dropExistingFirst: true, createSecondaryIndexes: true);
+                        }
+                        else
                         {
-                            using var clearSemCmd = conn.CreateCommand();
-                            clearSemCmd.Transaction = transaction;
-                            clearSemCmd.CommandText = $"DELETE FROM {table} WHERE ProjectId = @projectId;";
-                            clearSemCmd.Parameters.AddWithValue("@projectId", projectId);
-                            clearSemCmd.ExecuteNonQuery();
+                            var semanticTables = new[]
+                            {
+                                "AnimationClipTargets",
+                                "CompositeAssetParts",
+                                "CompositeAssets",
+                                "MeshMaterialResolvedCache",
+                                "MaterialCache",
+                                "MaterialTextures",
+                                "MeshMaterials",
+                                "MeshRenderers",
+                                "ModelGroupMeshes",
+                                "ModelGroups",
+                                "AssetEdges"
+                            };
+                            foreach (var table in semanticTables)
+                            {
+                                using var clearSemCmd = conn.CreateCommand();
+                                clearSemCmd.Transaction = transaction;
+                                clearSemCmd.CommandText = $"DELETE FROM {table} WHERE ProjectId = @projectId;";
+                                clearSemCmd.Parameters.AddWithValue("@projectId", projectId);
+                                clearSemCmd.ExecuteNonQuery();
+                            }
                         }
                     }
-                    else if (dirtySourceIds.Count > 0)
+                    else if (needsTargetedSemanticCleanup)
                     {
+                        reportStage?.Invoke("Pruning affected semantic relations");
                         using var delSemCmd = conn.CreateCommand();
                         delSemCmd.Transaction = transaction;
                         delSemCmd.CommandText = @"
@@ -1715,8 +2080,9 @@ namespace AssetStudio.Avalonia
                 }
 
                 // 4. Delete dirty Assets and dirty SourceFiles
-                if (dirtySourceIds.Count > 0)
+                if (!skipAssetsAndSourceFilesDelete && dirtySourceIds.Count > 0)
                 {
+                    reportStage?.Invoke("Removing replaced index rows");
                     using var delAssetsCmd = conn.CreateCommand();
                     delAssetsCmd.Transaction = transaction;
                     delAssetsCmd.CommandText = @"

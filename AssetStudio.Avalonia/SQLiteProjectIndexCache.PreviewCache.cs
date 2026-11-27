@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
+using AssetStudio.Avalonia.Services;
 using K4os.Compression.LZ4;
 using Microsoft.Data.Sqlite;
 
@@ -205,6 +206,38 @@ namespace AssetStudio.Avalonia
             return entry != null;
         }
 
+        private static bool TryVerifyProjectSignatureAndIndexingReady(
+            SqliteConnection conn,
+            long projectId,
+            string expectedSignature,
+            out bool signatureMatches,
+            out bool isIncompleteIndexing)
+        {
+            signatureMatches = false;
+            isIncompleteIndexing = false;
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                SELECT p.SignatureHash, COALESCE(s.Status, '')
+                FROM Projects p
+                LEFT JOIN ProjectIndexingState s ON s.ProjectId = p.Id
+                WHERE p.Id = @projectId
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read())
+            {
+                return false;
+            }
+
+            var storedSignature = reader.IsDBNull(0) ? string.Empty : reader.GetString(0);
+            var status = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+            signatureMatches = string.Equals(storedSignature, expectedSignature, StringComparison.Ordinal);
+            isIncompleteIndexing = IsIncompleteIndexCacheStatus(status);
+            return true;
+        }
+
         internal PreviewCacheEntry? LoadPreviewCacheEntry(
             string folderPath,
             string signature,
@@ -213,7 +246,10 @@ namespace AssetStudio.Avalonia
             int algorithmVersion,
             string parameters)
         {
-            if (string.IsNullOrWhiteSpace(assetUniqueId) || string.IsNullOrWhiteSpace(previewKind))
+            if (string.IsNullOrWhiteSpace(folderPath)
+                || string.IsNullOrWhiteSpace(signature)
+                || string.IsNullOrWhiteSpace(assetUniqueId)
+                || string.IsNullOrWhiteSpace(previewKind))
             {
                 return null;
             }
@@ -236,11 +272,39 @@ namespace AssetStudio.Avalonia
                             return null;
                         }
 
+                        if (!TryVerifyProjectSignatureAndIndexingReady(conn, projectId.Value, signature, out var sigMatches, out var isIncomplete)
+                            || !sigMatches)
+                        {
+                            if (!fromCache)
+                            {
+                                return null;
+                            }
+
+                            var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                            if (verifiedProjectId == null
+                                || !TryVerifyProjectSignatureAndIndexingReady(conn, verifiedProjectId.Value, signature, out sigMatches, out isIncomplete)
+                                || !sigMatches)
+                            {
+                                return null;
+                            }
+
+                            projectId = verifiedProjectId;
+                        }
+
+                        if (isIncomplete)
+                        {
+                            return null;
+                        }
+
                         entry = QueryPreviewCacheEntry(conn, dbPath, projectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
                         if (entry == null && fromCache)
                         {
                             var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
-                            if (verifiedProjectId.HasValue && verifiedProjectId.Value != projectId.Value)
+                            if (verifiedProjectId.HasValue
+                                && verifiedProjectId.Value != projectId.Value
+                                && TryVerifyProjectSignatureAndIndexingReady(conn, verifiedProjectId.Value, signature, out sigMatches, out isIncomplete)
+                                && sigMatches
+                                && !isIncomplete)
                             {
                                 entry = QueryPreviewCacheEntry(conn, dbPath, verifiedProjectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
                             }
@@ -260,9 +324,17 @@ namespace AssetStudio.Avalonia
 
                 return entry;
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while loading preview cache entry: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return null;
+            }
             catch (Exception ex)
             {
                 EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                RecordClassifiedException("PreviewCache", dbPath, ex);
                 Logger.Warning($"Failed to load preview cache entry from SQLite: {ex.Message}");
                 return null;
             }
@@ -340,6 +412,7 @@ namespace AssetStudio.Avalonia
             }
             catch (Exception ex)
             {
+                RecordClassifiedException("PreviewCache", entry.PayloadPath, ex);
                 Logger.Warning($"Failed to decode preview cache payload bytes: {ex.Message}");
                 payloadBytes = null;
             }
@@ -359,7 +432,10 @@ namespace AssetStudio.Avalonia
         {
             payloadBytes = null;
             entry = null;
-            if (string.IsNullOrWhiteSpace(assetUniqueId) || string.IsNullOrWhiteSpace(previewKind))
+            if (string.IsNullOrWhiteSpace(folderPath)
+                || string.IsNullOrWhiteSpace(signature)
+                || string.IsNullOrWhiteSpace(assetUniqueId)
+                || string.IsNullOrWhiteSpace(previewKind))
             {
                 return false;
             }
@@ -380,6 +456,30 @@ namespace AssetStudio.Avalonia
                             return false;
                         }
 
+                        if (!TryVerifyProjectSignatureAndIndexingReady(conn, projectId.Value, signature, out var sigMatches, out var isIncomplete)
+                            || !sigMatches)
+                        {
+                            if (!fromCache)
+                            {
+                                return false;
+                            }
+
+                            var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                            if (verifiedProjectId == null
+                                || !TryVerifyProjectSignatureAndIndexingReady(conn, verifiedProjectId.Value, signature, out sigMatches, out isIncomplete)
+                                || !sigMatches)
+                            {
+                                return false;
+                            }
+
+                            projectId = verifiedProjectId;
+                        }
+
+                        if (isIncomplete)
+                        {
+                            return false;
+                        }
+
                         entry = QueryLatestPreviewCacheEntryByPrefix(
                             conn,
                             projectId.Value,
@@ -391,7 +491,11 @@ namespace AssetStudio.Avalonia
                         if (entry == null && fromCache)
                         {
                             var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
-                            if (verifiedProjectId.HasValue && verifiedProjectId.Value != projectId.Value)
+                            if (verifiedProjectId.HasValue
+                                && verifiedProjectId.Value != projectId.Value
+                                && TryVerifyProjectSignatureAndIndexingReady(conn, verifiedProjectId.Value, signature, out sigMatches, out isIncomplete)
+                                && sigMatches
+                                && !isIncomplete)
                             {
                                 entry = QueryLatestPreviewCacheEntryByPrefix(
                                     conn,
@@ -445,8 +549,16 @@ namespace AssetStudio.Avalonia
                     return true;
                 }
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while loading latest preview cache entry: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                payloadBytes = null;
+            }
             catch (Exception ex)
             {
+                RecordClassifiedException("PreviewCache", dbPath, ex);
                 Logger.Warning($"Failed to load latest preview cache entry by asset ID from SQLite: {ex.Message}");
                 payloadBytes = null;
             }
@@ -1124,8 +1236,15 @@ namespace AssetStudio.Avalonia
 
                 return true;
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while saving preview cache entry: {ex.Message}", ex);
+                EnsureInitializedByDbPath(dbPath);
+                return true;
+            }
             catch (Exception ex)
             {
+                RecordClassifiedException("PreviewCache", dbPath, ex);
                 Logger.Warning($"Failed to save preview cache entry to SQLite: {ex.Message}");
                 return true;
             }
@@ -1291,8 +1410,14 @@ namespace AssetStudio.Avalonia
                     transaction.Commit();
                 }
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while evicting preview cache entries: {ex.Message}", ex);
+                return new PreviewCacheEvictionResult(0, 0, 0, 0, 0, 0);
+            }
             catch (Exception ex)
             {
+                RecordClassifiedException("PreviewCache", dbPath, ex);
                 Logger.Warning($"Failed to evict preview cache entries for '{dbPath}': {ex.Message}");
                 return new PreviewCacheEvictionResult(0, 0, 0, 0, 0, 0);
             }
@@ -1355,8 +1480,13 @@ namespace AssetStudio.Avalonia
                     throw;
                 }
             }
+            catch (SqliteException ex) when (IsSqliteCorruptionException(ex))
+            {
+                TryRecoverCorruptDatabase(dbPath, $"SQLite corruption while reading preview cache stats: {ex.Message}", ex);
+            }
             catch (Exception ex)
             {
+                RecordClassifiedException("PreviewCache", dbPath, ex);
                 Logger.Warning($"Failed to read preview cache stats for '{dbPath}': {ex.Message}");
             }
 
