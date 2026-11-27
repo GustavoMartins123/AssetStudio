@@ -22,7 +22,17 @@ namespace AssetStudio.Avalonia.Services
         int BatchCount,
         IReadOnlyList<string> Errors,
         bool WasCancelled = false,
-        string? ErrorReportPath = null);
+        string? ErrorReportPath = null)
+    {
+        public ExportOutcomeStatus OutcomeStatus =>
+            ExportReport.ComputeOutcomeStatus(
+                Exported,
+                Skipped,
+                partialCount: 0,
+                Failed,
+                cancelledCount: WasCancelled ? 1 : 0,
+                wasCancelled: WasCancelled);
+    }
 
     public readonly record struct SplitObjectsExportSummary(
         int Exported,
@@ -1323,7 +1333,13 @@ namespace AssetStudio.Avalonia.Services
                 var errorReportPath = Path.Combine(savePath, "errors.txt");
                 using (var writer = new StreamWriter(errorReportPath, false, Encoding.UTF8))
                 {
+                    var identity = ExportBuildIdentity.Resolve(typeof(AssetExportService).Assembly);
                     writer.WriteLine("AssetStudio error report");
+                    writer.WriteLine($"Version: {identity.DisplayVersion}");
+                    if (!string.IsNullOrEmpty(identity.CommitHash))
+                    {
+                        writer.WriteLine($"Commit: {identity.CommitHash}");
+                    }
                     writer.WriteLine($"Created at: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                     writer.WriteLine();
 
@@ -1357,6 +1373,59 @@ namespace AssetStudio.Avalonia.Services
             {
                 return null;
             }
+        }
+
+        public static ExportReport BuildBulkExportReport(
+            BulkExportSummary summary,
+            string outputDirectory,
+            ExportOptionsState? exportOptions = null,
+            long elapsedMs = 0)
+        {
+            var identity = ExportBuildIdentity.Resolve(typeof(AssetExportService).Assembly);
+            var diagnostics = new List<ExportDiagnostic>();
+            if (summary.Errors != null)
+            {
+                for (int i = 0; i < summary.Errors.Count; i++)
+                {
+                    var msg = summary.Errors[i];
+                    if (string.IsNullOrWhiteSpace(msg)) continue;
+                    diagnostics.Add(new ExportDiagnostic
+                    {
+                        Severity = ExportDiagnosticSeverity.Error,
+                        Outcome = ExportItemOutcome.Failed,
+                        Code = "ExportError",
+                        Message = msg
+                    });
+                }
+            }
+
+            var optionsDict = new SortedDictionary<string, string>(StringComparer.Ordinal);
+            if (exportOptions != null)
+            {
+                optionsDict["convertTexture"] = exportOptions.ConvertTexture.ToString(CultureInfo.InvariantCulture);
+                optionsDict["convertAudio"] = exportOptions.ConvertAudio.ToString(CultureInfo.InvariantCulture);
+                optionsDict["imageFormat"] = exportOptions.ConvertTextureFormat.ToString();
+                optionsDict["modelFormat"] = exportOptions.ModelFormat.ToString();
+                optionsDict["exportAnimations"] = exportOptions.ExportAnimations.ToString(CultureInfo.InvariantCulture);
+            }
+
+            return new ExportReport
+            {
+                Operation = "BatchAssetExport",
+                Status = summary.OutcomeStatus,
+                ExporterVersion = identity.DisplayVersion,
+                CommitHash = identity.CommitHash,
+                BuildChannel = identity.BuildChannel,
+                ElapsedMs = elapsedMs,
+                OutputDirectory = outputDirectory ?? string.Empty,
+                Options = optionsDict,
+                ExportedCount = summary.Exported,
+                SkippedCount = summary.Skipped,
+                PartialCount = 0,
+                FailedCount = summary.Failed,
+                CancelledCount = summary.WasCancelled ? 1 : 0,
+                Diagnostics = diagnostics
+            };
         }
 
         public static string FormatBulkExportStatusSummary(BulkExportSummary summary, string? errorReportPath = null)

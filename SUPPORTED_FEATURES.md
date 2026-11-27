@@ -43,13 +43,13 @@ For per-version evidence see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md). F
 ### Exporting
 - **3D Models & Animations** (v0.20.0): Export to **glTF Binary (`.glb`, default)**, **glTF Separate (`.gltf`)**, **FBX (`.fbx`)**, **OBJ (`.obj`)**, and Unity `.anim` files, including direct export from the 3D preview and **Batch Export Animations**.
 - **Full Scene Export to `.glb`** (main): Export an entire Unity scene (`levelN` or scene bundle) or a selected GameObject subtree as one `.glb` / `.gltf` file. The full Transform hierarchy is kept, and repeated meshes are reused through glTF instancing.
-- **Unity Project, Prefab & `.unitypackage` Export** (main, experimental): Rebuild scenes and prefabs as Unity project files with `.meta` GUIDs, including terrain, colliders and LOD groups. Not yet validated by importing into the Unity Editor.
+- **Unity Project, Prefab & `.unitypackage` Export** (main): Rebuild scenes and prefabs as Unity YAML files with deterministic `.meta` GUIDs, exporting all scene/prefab/terrain meshes as binary `.fbx` via the shared `ModelConverter` pipeline (preserving multi-submeshes, UVs, blend shapes, and 1:1 `SkinnedMeshRenderer` bone/bindpose alignment), colliders (with optional auxiliary `.obj` meshes), LOD groups, script-spawn attachments, and full streaming `MonoBehaviour` YAML without silent truncation. Validated by automated roundtrip import tests in Unity Editor `6000.3.18f1` (`UnityEditorRoundtripTests`).
 - **C# Project Export** (main): Export scripts as a `.sln` / `.csproj` project. Mono builds give decompiled code; IL2CPP builds give stubs with fields, offsets and method addresses.
 - **Images & Sprites** (v0.20.0; `webp` and `Texture2DArray` slices on main): Export to `png`, `tga`, `jpeg`, `bmp`, and `webp`. Main also exports HDR textures to OpenEXR / TIFF, all mipmap levels, and sprite atlas metadata.
 - **Audio & Video** (v0.20.0): Export audio to `wav`, `ogg`, or the original format (`mp3`, `m4a`, `fsb`, ...), including FSB5 Vorbis decoding, and export video clips directly.
 - **Other Assets** (v0.20.0): Export fonts (`ttf`/`otf`), shaders, text files, MonoBehaviour JSON, raw binary data, text dumps, and XML.
 - **Bundle Extraction** (v0.20.0): Decompress and extract files from AssetBundles to disk.
-- **Command-line tool** (main): `AssetStudio.CLI` scans, lists, inspects and exports without the GUI: textures, texture arrays, sprites, text, meshes, Animator models (GLB/glTF/FBX), animation clips, audio, fonts, shaders, MonoBehaviour JSON and video. See [`docs/CLI.md`](docs/CLI.md).
+- **Command-line tool** (main): `AssetStudio.CLI` scans, lists, inspects, identifies its build revision (`--version`), and exports without the GUI: textures, texture arrays, sprites, text, meshes, Animator models (GLB/glTF/FBX), animation clips, audio, fonts, shaders, MonoBehaviour JSON and video, with structured JSON export reports (`--report <path>`). See [`docs/CLI.md`](docs/CLI.md).
 
 ---
 
@@ -59,7 +59,7 @@ For per-version evidence see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md). F
 - **Missing External Files**: When a model, texture, or scene depends on optional or missing bundles that are not in the folder, only the files actually on disk can be previewed or exported.
 - **Protected or Third-Party Formats**: Files using undocumented encryption without a user profile are not opened. Audio/video stored in external middleware banks (FMOD `.bank`, Wwise, CRIWARE) is not extracted.
 - **Stripped Script Metadata**: Viewing fields inside custom `MonoBehaviour` assets works automatically when TypeTrees are present. When they are stripped, the game's assemblies (or dummy assemblies for IL2CPP projects) are still required.
-- **Unity Project Export** (main): Large `MonoBehaviour` values can be cut in the generated YAML (being fixed). The output has not been validated in the Unity Editor.
+- **Unity Project Export** (main): Custom/URP/HDRP shaders fall back to Built-in `Standard` with albedo/normal texture aliasing (custom HLSL/ShaderGraph logic is not translated), and `Terrain` is converted to a mesh `.fbx` + baked splatmap rather than a native `.asset` heightmap. If optional safety limits are configured on `MonoBehaviour` YAML serialization, `ExportManifest.json` marks `status: "Partial"` and lists every truncated field in `truncationDiagnostics`.
 - **Platforms**: Windows x64 and Linux x64 are released. Windows x86, macOS and ARM64 are not released or verified (see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md#where-assetstudio-runs)).
 
 ---

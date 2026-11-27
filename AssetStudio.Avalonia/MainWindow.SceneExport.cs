@@ -525,6 +525,7 @@ public partial class MainWindow
             result = new UnityProjectExportResult
             {
                 Success = false,
+                Status = ExportOutcomeStatus.Cancelled,
                 OutputDirectory = projectOutputDir,
                 SceneName = outputSceneName,
                 ErrorMessage = packageOnlyMode ? "Unity package export cancelled." : "Unity project export cancelled."
@@ -723,6 +724,7 @@ public partial class MainWindow
             result = new UnityProjectExportResult
             {
                 Success = false,
+                Status = ExportOutcomeStatus.Cancelled,
                 OutputDirectory = projectOutputDir,
                 SceneName = safePrefabName,
                 ErrorMessage = "Unity prefab export cancelled."
@@ -1130,9 +1132,19 @@ public partial class MainWindow
     private async Task CompleteUnityProjectExportUiAsync(UnityProjectExportResult? result, string? exportFolder, string label = "Unity Project")
     {
         ViewModel.LoadingProgress = 100;
+        if (result != null && result.Status == ExportOutcomeStatus.Cancelled)
+        {
+            var cancelMsg = result.ErrorMessage ?? $"{label} export cancelled.";
+            ExportState.Complete(0, statusText: cancelMsg, wasCancelled: true);
+            StatusStripUpdate(cancelMsg);
+            return;
+        }
+
         if (result != null && result.Success)
         {
-            ExportState.Complete(1, statusText: result.SummaryMessage, errorLogPath: null);
+            var isPartial = result.Status == ExportOutcomeStatus.Partial || result.IsPartial;
+            var title = isPartial ? $"{label} Export Complete (Partial)" : $"{label} Export Complete";
+            ExportState.Complete(1, statusText: result.SummaryMessage, errorLogPath: result.ManifestPath);
             StatusStripUpdate(result.SummaryMessage);
 
             if (exportOptions.OpenAfterExport && !string.IsNullOrEmpty(exportFolder))
@@ -1141,7 +1153,7 @@ public partial class MainWindow
             }
             else
             {
-                await ViewModel.DialogService.ShowMessageAsync($"{label} Export Complete", result.SummaryMessage);
+                await ViewModel.DialogService.ShowMessageAsync(title, result.SummaryMessage);
             }
         }
         else

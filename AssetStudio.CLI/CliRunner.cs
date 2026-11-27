@@ -15,13 +15,13 @@ namespace AssetStudio.CLI
         public const int ExitRuntimeError = 1;
         public const int ExitInvalidArguments = 2;
 
-        private static readonly JsonSerializerOptions JsonIndentedOptions = new JsonSerializerOptions
+        internal static readonly JsonSerializerOptions JsonIndentedOptions = new JsonSerializerOptions
         {
             WriteIndented = true,
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase
         };
 
-        private static readonly JsonSerializerOptions JsonCompactOptions = new JsonSerializerOptions
+        internal static readonly JsonSerializerOptions JsonCompactOptions = new JsonSerializerOptions
         {
             WriteIndented = false,
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase
@@ -74,6 +74,13 @@ namespace AssetStudio.CLI
             if (IsHelpToken(command) || string.Equals(command, "help", StringComparison.OrdinalIgnoreCase))
             {
                 PrintUsage(stdout);
+                return ExitSuccess;
+            }
+
+            if (string.Equals(command, "--version", StringComparison.Ordinal) || string.Equals(command, "-v", StringComparison.Ordinal))
+            {
+                var identity = ExportBuildIdentity.Resolve(typeof(CliRunner).Assembly);
+                stdout.WriteLine($"AssetStudio.CLI v{identity.DisplayVersion}");
                 return ExitSuccess;
             }
 
@@ -561,6 +568,7 @@ namespace AssetStudio.CLI
             bool dryRun = false;
             ModelExportFormat modelFormat = ModelExportFormat.Glb;
             string? assembliesDir = null;
+            string? reportPath = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -626,6 +634,13 @@ namespace AssetStudio.CLI
                         return ExitInvalidArguments;
                     }
                 }
+                else if (string.Equals(arg, "--report", StringComparison.Ordinal))
+                {
+                    if (!TryReadOptionValue(args, ref i, "--report", stderr, out reportPath))
+                    {
+                        return ExitInvalidArguments;
+                    }
+                }
                 else if (string.Equals(arg, "--dry-run", StringComparison.Ordinal))
                 {
                     dryRun = true;
@@ -670,6 +685,7 @@ namespace AssetStudio.CLI
 
             try
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 string fullOutputRoot = Path.GetFullPath(outputDir);
                 using var assetsManager = CreateHeadlessAssetsManager(useDecompressionCache, targetPath, stderr);
                 LoadPath(assetsManager, targetPath);
@@ -682,11 +698,15 @@ namespace AssetStudio.CLI
 
                 var pathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
                 var reservedPaths = new HashSet<string>(pathComparer);
+                var diagnostics = new List<ExportDiagnostic>();
+                var missingDependencies = new HashSet<string>(StringComparer.Ordinal);
                 var extraExporter = new CliAssetExporter(
                     assetsManager,
                     new CliExportSettings { ImageFormat = imageFormat, ModelFormat = modelFormat, AssembliesDirectory = assembliesDir, DryRun = dryRun },
                     stdout,
-                    stderr);
+                    stderr,
+                    diagnostics,
+                    missingDependencies);
 
                 int exportedCount = 0;
                 int skippedCount = 0;
@@ -694,144 +714,224 @@ namespace AssetStudio.CLI
 
                 foreach (var handle in handles)
                 {
-                    var obj = assetsManager.ResolveHandle(handle);
-                    if (obj == null)
+                    string baseName = !string.IsNullOrWhiteSpace(handle.Name)
+                        ? handle.Name
+                        : $"{handle.TypeString}_{handle.PathID.ToString(CultureInfo.InvariantCulture)}";
+
+                    try
                     {
-                        skippedCount++;
-                        continue;
-                    }
-
-                    string baseName = GetExportBaseName(handle, obj);
-                    string typeFolder = handle.Type.ToString();
-
-                    switch (handle.Type)
-                    {
-                        case ClassIDType.Texture2D when obj is Texture2D tex2d:
+                        var obj = assetsManager.ResolveHandle(handle);
+                        if (obj == null)
                         {
-                            string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, imageFormat.GetFileExtension(), reservedPaths);
-                            if (dryRun)
+                            skippedCount++;
+                            diagnostics.Add(new ExportDiagnostic
                             {
-                                stdout.WriteLine($"[dry-run] Texture2D {handle.PathID} -> {outPath}");
-                                exportedCount++;
-                            }
-                            else
-                            {
-                                using var bmp = tex2d.ConvertToImage(flip: true);
-                                if (bmp == null)
-                                {
-                                    skippedCount++;
-                                    break;
-                                }
-                                EnsureParentDirectory(outPath);
-                                using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None);
-                                bmp.WriteToStream(fs, imageFormat);
-                                stdout.WriteLine($"Exported: {outPath}");
-                                exportedCount++;
-                            }
-                            break;
+                                Severity = ExportDiagnosticSeverity.Warning,
+                                Outcome = ExportItemOutcome.Skipped,
+                                Code = "ResolveFailed",
+                                AssetName = baseName,
+                                AssetType = handle.Type.ToString(),
+                                SourceFile = handle.SerializedFileName ?? string.Empty,
+                                PathId = handle.PathID,
+                                Message = "Asset handle could not be resolved from its serialized file."
+                            });
+                            continue;
                         }
-                        case ClassIDType.Texture2DArray when obj is Texture2DArray texArr:
-                        {
-                            int depth = Math.Max(0, texArr.m_Depth);
-                            if (depth <= 0 || texArr.IsTruncated || !texArr.IsFormatSupported)
-                            {
-                                skippedCount++;
-                                break;
-                            }
 
-                            if (dryRun)
-                            {
-                                for (int slice = 0; slice < depth; slice++)
-                                {
-                                    string sliceName = $"{baseName}_slice{slice.ToString("D3", CultureInfo.InvariantCulture)}";
-                                    string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, sliceName, imageFormat.GetFileExtension(), reservedPaths);
-                                    stdout.WriteLine($"[dry-run] Texture2DArray {handle.PathID}[{slice}] -> {outPath}");
-                                    exportedCount++;
-                                }
-                            }
-                            else
-                            {
-                                var converter = new Texture2DArrayConverter(texArr);
-                                var slices = converter.ConvertAllSlicesToImages(flip: true);
-                                try
-                                {
-                                    if (slices.Count == 0)
-                                    {
-                                        skippedCount++;
-                                        break;
-                                    }
+                        baseName = GetExportBaseName(handle, obj);
+                        string typeFolder = handle.Type.ToString();
 
-                                    for (int slice = 0; slice < slices.Count; slice++)
-                                    {
-                                        string sliceName = $"{baseName}_slice{slice.ToString("D3", CultureInfo.InvariantCulture)}";
-                                        string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, sliceName, imageFormat.GetFileExtension(), reservedPaths);
-                                        EnsureParentDirectory(outPath);
-                                        using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None);
-                                        slices[slice].WriteToStream(fs, imageFormat);
-                                        stdout.WriteLine($"Exported: {outPath}");
-                                        exportedCount++;
-                                    }
-                                }
-                                finally
-                                {
-                                    foreach (var bmp in slices)
-                                    {
-                                        bmp.Dispose();
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        case ClassIDType.TextAsset when obj is TextAsset textAsset:
+                        switch (handle.Type)
                         {
-                            string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, ".txt", reservedPaths);
-                            if (dryRun)
+                            case ClassIDType.Texture2D when obj is Texture2D tex2d:
                             {
-                                stdout.WriteLine($"[dry-run] TextAsset {handle.PathID} -> {outPath}");
-                                exportedCount++;
-                            }
-                            else
-                            {
-                                EnsureParentDirectory(outPath);
-                                File.WriteAllBytes(outPath, textAsset.m_Script ?? Array.Empty<byte>());
-                                stdout.WriteLine($"Exported: {outPath}");
-                                exportedCount++;
-                            }
-                            break;
-                        }
-                        case ClassIDType.Mesh when obj is Mesh mesh:
-                        {
-                            mesh.EnsureProcessed();
-                            if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
-                            {
-                                skippedCount++;
-                                break;
-                            }
-
-                            string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, ".obj", reservedPaths);
-                            if (dryRun)
-                            {
-                                stdout.WriteLine($"[dry-run] Mesh {handle.PathID} -> {outPath}");
-                                exportedCount++;
-                            }
-                            else
-                            {
-                                EnsureParentDirectory(outPath);
-                                if (WriteMeshToObj(mesh, outPath))
+                                string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, imageFormat.GetFileExtension(), reservedPaths);
+                                if (dryRun)
                                 {
-                                    stdout.WriteLine($"Exported: {outPath}");
+                                    stdout.WriteLine($"[dry-run] Texture2D {handle.PathID} -> {outPath}");
                                     exportedCount++;
                                 }
                                 else
                                 {
-                                    skippedCount++;
+                                    using var bmp = tex2d.ConvertToImage(flip: true);
+                                    if (bmp == null)
+                                    {
+                                        skippedCount++;
+                                        var streamPath = tex2d.m_StreamData?.path ?? string.Empty;
+                                        if (!string.IsNullOrEmpty(streamPath))
+                                        {
+                                            missingDependencies.Add(streamPath);
+                                        }
+                                        diagnostics.Add(new ExportDiagnostic
+                                        {
+                                            Severity = ExportDiagnosticSeverity.Warning,
+                                            Outcome = ExportItemOutcome.Skipped,
+                                            Code = string.IsNullOrEmpty(streamPath) ? "DecodeFailed" : "MissingStreamedResource",
+                                            AssetName = baseName,
+                                            AssetType = handle.Type.ToString(),
+                                            SourceFile = handle.SerializedFileName ?? string.Empty,
+                                            PathId = handle.PathID,
+                                            FieldOrResource = streamPath,
+                                            Message = string.IsNullOrEmpty(streamPath)
+                                                ? $"Texture2D '{baseName}' ({tex2d.m_TextureFormat}) could not be decoded."
+                                                : $"Texture2D '{baseName}' could not be decoded (streamed resource: {streamPath})."
+                                        });
+                                        break;
+                                    }
+                                    EnsureParentDirectory(outPath);
+                                    using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                                    bmp.WriteToStream(fs, imageFormat);
+                                    stdout.WriteLine($"Exported: {outPath}");
+                                    exportedCount++;
                                 }
+                                break;
                             }
-                            break;
-                        }
-                        default:
-                        {
-                            try
+                            case ClassIDType.Texture2DArray when obj is Texture2DArray texArr:
+                            {
+                                int depth = Math.Max(0, texArr.m_Depth);
+                                if (depth <= 0 || texArr.IsTruncated || !texArr.IsFormatSupported)
+                                {
+                                    skippedCount++;
+                                    diagnostics.Add(new ExportDiagnostic
+                                    {
+                                        Severity = ExportDiagnosticSeverity.Warning,
+                                        Outcome = ExportItemOutcome.Skipped,
+                                        Code = !texArr.IsFormatSupported ? "UnsupportedFormat" : "EmptyOrTruncatedAsset",
+                                        AssetName = baseName,
+                                        AssetType = handle.Type.ToString(),
+                                        SourceFile = handle.SerializedFileName ?? string.Empty,
+                                        PathId = handle.PathID,
+                                        Message = !texArr.IsFormatSupported
+                                            ? $"Texture2DArray format '{texArr.m_Format}' is not supported."
+                                            : $"Texture2DArray '{baseName}' is empty or truncated (depth={depth})."
+                                    });
+                                    break;
+                                }
+
+                                if (dryRun)
+                                {
+                                    for (int slice = 0; slice < depth; slice++)
+                                    {
+                                        string sliceName = $"{baseName}_slice{slice.ToString("D3", CultureInfo.InvariantCulture)}";
+                                        string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, sliceName, imageFormat.GetFileExtension(), reservedPaths);
+                                        stdout.WriteLine($"[dry-run] Texture2DArray {handle.PathID}[{slice}] -> {outPath}");
+                                        exportedCount++;
+                                    }
+                                }
+                                else
+                                {
+                                    var converter = new Texture2DArrayConverter(texArr);
+                                    var slices = converter.ConvertAllSlicesToImages(flip: true);
+                                    try
+                                    {
+                                        if (slices.Count == 0)
+                                        {
+                                            skippedCount++;
+                                            diagnostics.Add(new ExportDiagnostic
+                                            {
+                                                Severity = ExportDiagnosticSeverity.Warning,
+                                                Outcome = ExportItemOutcome.Skipped,
+                                                Code = "DecodeFailed",
+                                                AssetName = baseName,
+                                                AssetType = handle.Type.ToString(),
+                                                SourceFile = handle.SerializedFileName ?? string.Empty,
+                                                PathId = handle.PathID,
+                                                Message = $"Texture2DArray '{baseName}' produced no decodable slices."
+                                            });
+                                            break;
+                                        }
+
+                                        for (int slice = 0; slice < slices.Count; slice++)
+                                        {
+                                            string sliceName = $"{baseName}_slice{slice.ToString("D3", CultureInfo.InvariantCulture)}";
+                                            string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, sliceName, imageFormat.GetFileExtension(), reservedPaths);
+                                            EnsureParentDirectory(outPath);
+                                            using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                                            slices[slice].WriteToStream(fs, imageFormat);
+                                            stdout.WriteLine($"Exported: {outPath}");
+                                            exportedCount++;
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        foreach (var bmp in slices)
+                                        {
+                                            bmp.Dispose();
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            case ClassIDType.TextAsset when obj is TextAsset textAsset:
+                            {
+                                string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, ".txt", reservedPaths);
+                                if (dryRun)
+                                {
+                                    stdout.WriteLine($"[dry-run] TextAsset {handle.PathID} -> {outPath}");
+                                    exportedCount++;
+                                }
+                                else
+                                {
+                                    EnsureParentDirectory(outPath);
+                                    File.WriteAllBytes(outPath, textAsset.m_Script ?? Array.Empty<byte>());
+                                    stdout.WriteLine($"Exported: {outPath}");
+                                    exportedCount++;
+                                }
+                                break;
+                            }
+                            case ClassIDType.Mesh when obj is Mesh mesh:
+                            {
+                                mesh.EnsureProcessed();
+                                if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
+                                {
+                                    skippedCount++;
+                                    diagnostics.Add(new ExportDiagnostic
+                                    {
+                                        Severity = ExportDiagnosticSeverity.Warning,
+                                        Outcome = ExportItemOutcome.Skipped,
+                                        Code = "EmptyGeometry",
+                                        AssetName = baseName,
+                                        AssetType = handle.Type.ToString(),
+                                        SourceFile = handle.SerializedFileName ?? string.Empty,
+                                        PathId = handle.PathID,
+                                        Message = $"Mesh '{baseName}' has no vertex data."
+                                    });
+                                    break;
+                                }
+
+                                string outPath = ResolveSafeOutputPath(fullOutputRoot, typeFolder, baseName, ".obj", reservedPaths);
+                                if (dryRun)
+                                {
+                                    stdout.WriteLine($"[dry-run] Mesh {handle.PathID} -> {outPath}");
+                                    exportedCount++;
+                                }
+                                else
+                                {
+                                    EnsureParentDirectory(outPath);
+                                    if (WriteMeshToObj(mesh, outPath))
+                                    {
+                                        stdout.WriteLine($"Exported: {outPath}");
+                                        exportedCount++;
+                                    }
+                                    else
+                                    {
+                                        skippedCount++;
+                                        diagnostics.Add(new ExportDiagnostic
+                                        {
+                                            Severity = ExportDiagnosticSeverity.Warning,
+                                            Outcome = ExportItemOutcome.Skipped,
+                                            Code = "EmptyGeometry",
+                                            AssetName = baseName,
+                                            AssetType = handle.Type.ToString(),
+                                            SourceFile = handle.SerializedFileName ?? string.Empty,
+                                            PathId = handle.PathID,
+                                            Message = $"Mesh '{baseName}' produced no writable OBJ geometry."
+                                        });
+                                    }
+                                }
+                                break;
+                            }
+                            default:
                             {
                                 int written = extraExporter.Export(handle, obj, fullOutputRoot, baseName, reservedPaths);
                                 if (written > 0)
@@ -842,15 +942,60 @@ namespace AssetStudio.CLI
                                 {
                                     skippedCount++;
                                 }
+                                break;
                             }
-                            catch (Exception ex)
-                            {
-                                failedCount++;
-                                stderr.WriteLine($"Failed: {handle.Type} {handle.PathID} ({baseName}): {ex.Message}");
-                            }
-                            break;
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        failedCount++;
+                        stderr.WriteLine($"Failed: {handle.Type} {handle.PathID} ({baseName}): {ex.Message}");
+                        diagnostics.Add(new ExportDiagnostic
+                        {
+                            Severity = ExportDiagnosticSeverity.Error,
+                            Outcome = ExportItemOutcome.Failed,
+                            Code = "ExportError",
+                            AssetName = baseName,
+                            AssetType = handle.Type.ToString(),
+                            SourceFile = handle.SerializedFileName ?? string.Empty,
+                            PathId = handle.PathID,
+                            Message = ex.Message
+                        });
+                    }
+                }
+
+                sw.Stop();
+                if (!string.IsNullOrWhiteSpace(reportPath))
+                {
+                    var identity = ExportBuildIdentity.Resolve(typeof(CliRunner).Assembly);
+                    var report = new ExportReport
+                    {
+                        Operation = "CliExport",
+                        Status = ExportReport.ComputeOutcomeStatus(exportedCount, skippedCount, partialCount: 0, failedCount),
+                        ExporterVersion = identity.DisplayVersion,
+                        CommitHash = identity.CommitHash,
+                        BuildChannel = identity.BuildChannel,
+                        ElapsedMs = sw.ElapsedMilliseconds,
+                        InputPath = Path.GetFullPath(targetPath),
+                        OutputDirectory = fullOutputRoot,
+                        DryRun = dryRun,
+                        Options = new SortedDictionary<string, string>(StringComparer.Ordinal)
+                        {
+                            ["types"] = string.Join(",", requestedTypes.Select(t => t.ToString()).OrderBy(s => s, StringComparer.Ordinal)),
+                            ["imageFormat"] = imageFormat.ToString().ToLowerInvariant(),
+                            ["modelFormat"] = modelFormat.ToString().ToLowerInvariant(),
+                            ["assemblies"] = assembliesDir ?? string.Empty,
+                            ["dryRun"] = dryRun.ToString(CultureInfo.InvariantCulture)
+                        },
+                        ExportedCount = exportedCount,
+                        SkippedCount = skippedCount,
+                        PartialCount = 0,
+                        FailedCount = failedCount,
+                        CancelledCount = 0,
+                        MissingDependencies = missingDependencies.OrderBy(s => s, StringComparer.Ordinal).ToList(),
+                        Diagnostics = diagnostics
+                    };
+                    report.WriteJson(reportPath);
                 }
 
                 string failedSuffix = failedCount > 0 ? $", {failedCount} failed" : string.Empty;
@@ -1124,13 +1269,13 @@ namespace AssetStudio.CLI
             || string.Equals(arg, "-h", StringComparison.Ordinal)
             || string.Equals(arg, "-?", StringComparison.Ordinal);
 
-        private static int InvalidArg(TextWriter stderr, string message)
+        internal static int InvalidArg(TextWriter stderr, string message)
         {
             stderr.WriteLine($"Error: {message}");
             return ExitInvalidArguments;
         }
 
-        private static bool TryReadOptionValue(string[] args, ref int index, string optionName, TextWriter stderr, out string? value)
+        internal static bool TryReadOptionValue(string[] args, ref int index, string optionName, TextWriter stderr, out string? value)
         {
             if (index + 1 >= args.Length)
             {
@@ -1250,11 +1395,11 @@ namespace AssetStudio.CLI
         {
             writer.WriteLine("AssetStudio.CLI - Headless Unity asset inspection & export tool");
             writer.WriteLine("Usage:");
-            writer.WriteLine("  AssetStudio.CLI --help | -h");
+            writer.WriteLine("  AssetStudio.CLI --help | -h | --version");
             writer.WriteLine("  AssetStudio.CLI scan <path> [--format text|json|jsonl|csv]");
             writer.WriteLine("  AssetStudio.CLI list <path> [--type <ClassID>] [--filter <substring>] [--format text|json|jsonl|csv]");
             writer.WriteLine("  AssetStudio.CLI inspect <path> --path-id <id> [--file <name>] [--format text|json]");
-            writer.WriteLine("  AssetStudio.CLI export <path> --output <dir> [--type <type>[,<type>...]|all] [--image-format png|webp|tga|jpeg|bmp] [--model-format glb|gltf|fbx] [--assemblies <Managed folder>] [--dry-run]");
+            writer.WriteLine("  AssetStudio.CLI export <path> --output <dir> [--type <type>[,<type>...]|all] [--image-format png|webp|tga|jpeg|bmp] [--model-format glb|gltf|fbx] [--assemblies <Managed folder>] [--report <json file>] [--dry-run]");
             writer.WriteLine($"      export types: {CliAssetExporter.SupportedTypeList} (default: Texture2D, Texture2DArray, TextAsset, Mesh)");
             writer.WriteLine("  AssetStudio.CLI capture-keys <path> [--exe <game executable>] [--timeout <seconds>] [--format text|json]");
             writer.WriteLine();

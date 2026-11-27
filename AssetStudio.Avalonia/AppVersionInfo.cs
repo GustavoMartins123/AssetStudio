@@ -16,6 +16,10 @@ internal static class AppVersionInfo
 
     public static string PrefixedDisplayVersion => $"v{Version}";
 
+    public static ExportBuildIdentity BuildIdentity => ExportBuildIdentity.Resolve(typeof(AppVersionInfo).Assembly);
+
+    public static string FullBuildVersion => BuildIdentity.DisplayVersion;
+
     public static string GetVersion(Assembly? assembly)
     {
         if (assembly == null)

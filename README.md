@@ -16,7 +16,7 @@ More details:
 
 * [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md): which Unity versions, build types and platforms are verified, and how.
 * [`docs/EXPORT_FORMATS.md`](docs/EXPORT_FORMATS.md): what each export format keeps and what it loses.
-* [`docs/CLI.md`](docs/CLI.md): the command-line tool.
+* [`docs/CLI.md`](docs/CLI.md): the command-line tool (including `AssetStudio.CLI --version` to identify dev builds vs. releases).
 
 ## Features
 

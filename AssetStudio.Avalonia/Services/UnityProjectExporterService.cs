@@ -144,6 +144,10 @@ public sealed class UnityProjectExportStatistics
 
 public sealed class UnityProjectExportManifest
 {
+    public ExportOutcomeStatus Status { get; init; } = ExportOutcomeStatus.Completed;
+    public string ExporterVersion { get; init; } = string.Empty;
+    public string CommitHash { get; init; } = string.Empty;
+    public string BuildChannel { get; init; } = string.Empty;
     public string SceneName { get; init; } = string.Empty;
     public string ScenePath { get; init; } = string.Empty;
     public string UnityVersion { get; init; } = string.Empty;
@@ -153,6 +157,7 @@ public sealed class UnityProjectExportManifest
     public string SceneFilePath { get; init; } = string.Empty;
     public string? PrefabFilePath { get; init; }
     public string? UnityPackagePath { get; init; }
+    public SortedDictionary<string, string> Options { get; init; } = new(StringComparer.Ordinal);
     public List<string> AdditionalScenes { get; init; } = new();
     public UnityProjectExportStatistics Statistics { get; init; } = new();
     public SortedDictionary<int, string> LayersUsed { get; init; } = new();
@@ -163,12 +168,14 @@ public sealed class UnityProjectExportManifest
     public List<SceneExportMissingAsset> MissingAssets { get; init; } = new();
     public bool IsPartial { get; init; }
     public List<UnityProjectTruncationDiagnostic> TruncationDiagnostics { get; init; } = new();
+    public List<ExportDiagnostic> Diagnostics { get; init; } = new();
     public UnityProjectScriptExportSummary? ScriptExportSummary { get; init; }
 }
 
 public sealed class UnityProjectExportResult
 {
     public bool Success { get; init; }
+    public ExportOutcomeStatus Status { get; init; } = ExportOutcomeStatus.Completed;
     public bool IsPartial { get; init; }
     public string OutputDirectory { get; init; } = string.Empty;
     public string SceneFilePath { get; init; } = string.Empty;
@@ -176,6 +183,7 @@ public sealed class UnityProjectExportResult
     public string? UnityPackagePath { get; init; }
     public string? ManifestPath { get; init; }
     public UnityProjectExportManifest? Manifest { get; init; }
+    public ExportReport? Report { get; init; }
     public List<UnityProjectTruncationDiagnostic> TruncationDiagnostics { get; init; } = new();
     public string SceneName { get; init; } = string.Empty;
     public string SummaryMessage { get; init; } = string.Empty;
@@ -614,6 +622,11 @@ public sealed class UnityProjectExporterService
                 ? $"{rootDirFull} (package: {unityPackagePath})"
                 : rootDirFull;
             var isPartial = state.TruncationDiagnostics.Count > 0;
+            var outcomeStatus = ExportReport.ComputeOutcomeStatus(
+                exportedCount: Math.Max(1, stats.GameObjects),
+                skippedCount: stats.RenderersSkippedByLodFilter,
+                partialCount: state.TruncationDiagnostics.Count + state.MissingAssets.Count,
+                failedCount: 0);
             var truncationNote = isPartial
                 ? string.Create(
                     CultureInfo.InvariantCulture,
@@ -623,9 +636,33 @@ public sealed class UnityProjectExporterService
                 CultureInfo.InvariantCulture,
                 $"Exported {exportKindLabel} '{safePrimaryName}' ({sw.ElapsedMilliseconds:N0} ms): {stats.GameObjects:N0} GameObjects ({stats.InactiveGameObjects:N0} inactive), {stats.UniqueMeshes:N0} meshes, {stats.UniqueMaterials:N0} materials, {stats.UniqueTextures:N0} textures, {stats.Terrains:N0} terrains, {stats.MonoBehaviours:N0} scripts{truncationNote} -> {destinationLabel}");
 
+            var buildIdentity = ExportBuildIdentity.Resolve(typeof(UnityProjectExporterService).Assembly);
+            var report = new ExportReport
+            {
+                Operation = isPrefabExport ? "UnityPrefabExport" : "UnityProjectExport",
+                Status = outcomeStatus,
+                ExporterVersion = buildIdentity.DisplayVersion,
+                CommitHash = buildIdentity.CommitHash,
+                BuildChannel = buildIdentity.BuildChannel,
+                ElapsedMs = sw.ElapsedMilliseconds,
+                InputPath = options.ScenePath ?? string.Empty,
+                OutputDirectory = rootDirFull,
+                Options = BuildExportOptionsDictionary(options),
+                ExportedCount = stats.UniqueMeshes + stats.UniqueMaterials + stats.UniqueTextures + stats.Terrains + stats.ColliderMeshesExported + 1,
+                SkippedCount = stats.RenderersSkippedByLodFilter,
+                PartialCount = state.TruncationDiagnostics.Count + state.MissingAssets.Count,
+                FailedCount = 0,
+                CancelledCount = 0,
+                MissingDependencies = manifest?.MissingDependencies ?? (options.MissingDependencies != null
+                    ? options.MissingDependencies.Where(static d => !string.IsNullOrWhiteSpace(d)).OrderBy(static d => d, StringComparer.Ordinal).ToList()
+                    : new List<string>()),
+                Diagnostics = manifest?.Diagnostics ?? BuildUnifiedDiagnostics(state, options)
+            };
+
             return new UnityProjectExportResult
             {
                 Success = true,
+                Status = outcomeStatus,
                 IsPartial = isPartial,
                 OutputDirectory = rootDirFull,
                 SceneFilePath = sceneFilePath,
@@ -633,6 +670,7 @@ public sealed class UnityProjectExporterService
                 UnityPackagePath = unityPackagePath,
                 ManifestPath = manifestPath,
                 Manifest = manifest,
+                Report = report,
                 TruncationDiagnostics = new List<UnityProjectTruncationDiagnostic>(state.TruncationDiagnostics),
                 SceneName = safePrimaryName,
                 SummaryMessage = summary
@@ -647,6 +685,7 @@ public sealed class UnityProjectExporterService
             return new UnityProjectExportResult
             {
                 Success = false,
+                Status = ExportOutcomeStatus.Failed,
                 OutputDirectory = rootDirFull,
                 SceneName = safePrimaryName,
                 ErrorMessage = ex.Message
@@ -4264,8 +4303,21 @@ public sealed class UnityProjectExporterService
             .ThenBy(static m => m.PathId)
             .ToList();
 
+        var identity = ExportBuildIdentity.Resolve(typeof(UnityProjectExporterService).Assembly);
+        var stats = BuildStatistics(state);
+        var unifiedDiagnostics = BuildUnifiedDiagnostics(state, options);
+        var status = ExportReport.ComputeOutcomeStatus(
+            exportedCount: Math.Max(1, stats.GameObjects),
+            skippedCount: stats.RenderersSkippedByLodFilter,
+            partialCount: state.TruncationDiagnostics.Count + missingAssetsSorted.Count,
+            failedCount: 0);
+
         return new UnityProjectExportManifest
         {
+            Status = status,
+            ExporterVersion = identity.DisplayVersion,
+            CommitHash = identity.CommitHash,
+            BuildChannel = identity.BuildChannel,
             SceneName = safeSceneName,
             ScenePath = options.ScenePath ?? string.Empty,
             UnityVersion = unityVersion,
@@ -4275,10 +4327,11 @@ public sealed class UnityProjectExporterService
             SceneFilePath = sceneFilePath,
             PrefabFilePath = prefabFilePath,
             UnityPackagePath = unityPackagePath,
+            Options = BuildExportOptionsDictionary(options),
             AdditionalScenes = options.AdditionalSceneNames != null
                 ? options.AdditionalSceneNames.Where(static n => !string.IsNullOrWhiteSpace(n)).ToList()
                 : new List<string>(),
-            Statistics = BuildStatistics(state),
+            Statistics = stats,
             LayersUsed = layersUsed,
             ShadersReferenced = shadersReferenced,
             ScriptsReferenced = scriptsReferenced,
@@ -4291,8 +4344,85 @@ public sealed class UnityProjectExporterService
             MissingAssets = missingAssetsSorted,
             IsPartial = state.TruncationDiagnostics.Count > 0,
             TruncationDiagnostics = new List<UnityProjectTruncationDiagnostic>(state.TruncationDiagnostics),
+            Diagnostics = unifiedDiagnostics,
             ScriptExportSummary = scriptSummary
         };
+    }
+
+    private static SortedDictionary<string, string> BuildExportOptionsDictionary(UnityProjectExportOptions options)
+    {
+        return new SortedDictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["includeInactive"] = options.IncludeInactive.ToString(CultureInfo.InvariantCulture),
+            ["targetLodLevel"] = options.TargetLodLevel?.ToString(CultureInfo.InvariantCulture) ?? "all",
+            ["exportMeshes"] = options.ExportMeshes.ToString(CultureInfo.InvariantCulture),
+            ["exportMaterials"] = options.ExportMaterials.ToString(CultureInfo.InvariantCulture),
+            ["exportTextures"] = options.ExportTextures.ToString(CultureInfo.InvariantCulture),
+            ["exportMonoBehaviours"] = options.ExportMonoBehaviours.ToString(CultureInfo.InvariantCulture),
+            ["exportTerrains"] = options.ExportTerrains.ToString(CultureInfo.InvariantCulture),
+            ["exportColliders"] = options.ExportColliders.ToString(CultureInfo.InvariantCulture),
+            ["exportColliderAuxiliaryMeshes"] = options.ExportColliderAuxiliaryMeshes.ToString(CultureInfo.InvariantCulture),
+            ["alsoBuildUnityPackage"] = options.AlsoBuildUnityPackage.ToString(CultureInfo.InvariantCulture),
+            ["maxYamlDepth"] = options.MaxYamlSerializationDepth.ToString(CultureInfo.InvariantCulture),
+            ["maxYamlCollectionElements"] = options.MaxYamlCollectionElements.ToString(CultureInfo.InvariantCulture),
+            ["maxYamlByteArrayLength"] = options.MaxYamlByteArrayLength.ToString(CultureInfo.InvariantCulture)
+        };
+    }
+
+    private static List<ExportDiagnostic> BuildUnifiedDiagnostics(ExportState state, UnityProjectExportOptions options)
+    {
+        var list = new List<ExportDiagnostic>();
+        foreach (var trunc in state.TruncationDiagnostics)
+        {
+            list.Add(new ExportDiagnostic
+            {
+                Severity = ExportDiagnosticSeverity.Warning,
+                Outcome = ExportItemOutcome.Partial,
+                Code = "Truncation",
+                AssetName = trunc.AssetName,
+                AssetType = trunc.AssetType,
+                SourceFile = trunc.SourceFile,
+                PathId = trunc.PathId,
+                FieldOrResource = trunc.FieldPath,
+                Message = $"Field '{trunc.FieldPath}' truncated at {trunc.LimitKind}={trunc.LimitValue} ({trunc.OmittedCount} of {trunc.TotalCount} omitted).",
+                LimitKind = trunc.LimitKind,
+                LimitValue = trunc.LimitValue,
+                TotalCount = trunc.TotalCount,
+                OmittedCount = trunc.OmittedCount
+            });
+        }
+
+        foreach (var missing in state.MissingAssets)
+        {
+            list.Add(new ExportDiagnostic
+            {
+                Severity = ExportDiagnosticSeverity.Warning,
+                Outcome = ExportItemOutcome.Partial,
+                Code = "MissingAsset",
+                AssetName = missing.OwnerGameObject,
+                AssetType = missing.AssetType,
+                SourceFile = missing.SourceFile,
+                PathId = missing.PathId,
+                Message = $"Referenced {missing.AssetType} (PathID {missing.PathId}) could not be resolved."
+            });
+        }
+
+        if (options.MissingDependencies != null)
+        {
+            foreach (var dep in options.MissingDependencies.Where(static d => !string.IsNullOrWhiteSpace(d)).OrderBy(static d => d, StringComparer.Ordinal))
+            {
+                list.Add(new ExportDiagnostic
+                {
+                    Severity = ExportDiagnosticSeverity.Warning,
+                    Outcome = ExportItemOutcome.Partial,
+                    Code = "MissingDependency",
+                    FieldOrResource = dep,
+                    Message = $"External dependency could not be resolved: {dep}"
+                });
+            }
+        }
+
+        return list;
     }
 
     // =========================================================================

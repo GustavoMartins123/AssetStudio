@@ -13,14 +13,28 @@ The table describes the `main` branch. Release `v0.20.0` reads Unity up to 6000.
 
 ## Unity versions
 
-| Unity | Detect | Read | Export | Evidence |
-| --- | --- | --- | --- | --- |
-| 6000.5 (SerializedFile format 23) | yes | yes, every object byte-exact | yes: textures (uncompressed formats pixel-exact), PCM audio and text/fonts byte-exact, meshes, MonoBehaviour including `[SerializeReference]`, shaders, animation, GLB | CI (synthetic) for the format 23 layout; real files (local) from the 6000.5.10f1 editor: Windows and Android, LZ4, LZMA, uncompressed, no TypeTrees, extracted TypeTrees, Mono and IL2CPP players |
-| 6000.3 | yes | yes, every object byte-exact | same checks as 6000.5 on one LZ4 bundle | real files (local) from 6000.3.18f1 |
-| 6000.4 | yes | expected (same layout as 6000.3 for the known classes) | not verified | not verified with generated files; the 6000.5 class changes are only applied from 6000.5 on |
-| 5.3 – 6000.2 | yes | yes on the games checked | partly | real games (local), checked on 14 installed games during earlier work; the `RealGame…` tests skip when the game is not installed |
-| 3.4 – 5.2 | yes | inherited from Perfare/AssetStudio | not verified | not verified in this fork |
-| < 3.4, 7000.x, Tuanjie | no | no | no | not supported |
+| Unity | Detect | Read | Preview | Export | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| 6000.5 (SerializedFile format 23) | validated | validated (byte-exact objects) | partial (real local GUI checks) | validated: textures (uncompressed pixel-exact), PCM audio & text/fonts byte-exact, meshes, MonoBehaviour incl. `[SerializeReference]`, shaders, animation, GLB | CI (synthetic) for format 23 layout; real files (local) from `6000.5.10f1` editor: Windows & Android, LZ4, LZMA, uncompressed, stripped TypeTrees, extracted TypeTrees, Mono & IL2CPP players |
+| 6000.3 | validated | validated (byte-exact objects) | partial (real local GUI checks) | validated: same bundle checks + automated Unity Editor `6000.3.18f1` scene/prefab `.unitypackage` roundtrip (`UnityEditorRoundtripTests`) | real files (local) from `6000.3.18f1` + real Editor import verification |
+| 6000.4 | validated | expected (same layout as 6000.3 for known classes) | partial (real games local) | partial (scene `.unitypackage` imported in `6000.3.18f1`) | real games (local); 6000.5 class changes apply only from `6000.5` onward |
+| 5.3 – 6000.2 | validated | validated on checked games | partial | partial | real games (local) across 14+ installed games (`RealGame…` tests skip when absent) |
+| 3.4 – 5.2 | validated | inherited from Perfare/AssetStudio | not verified | not verified | not verified in this fork |
+| < 3.4, 7000.x, Tuanjie | not supported | not supported | not supported | not supported | not supported |
+
+## Asset families
+
+| Asset family | Detect | Read | Preview | Export | Evidence & limits |
+| --- | --- | --- | --- | --- | --- |
+| `Texture2D`, `Texture2DArray`, `Sprite`, `SpriteAtlas` | validated | validated | validated (channels, mipmaps, 9-slice/pivot) | validated (`png`/`tga`/`jpg`/`bmp`/`webp`, EXR/TIFF for HDR, atlas JSON) | CI (synthetic) + real files (local). Compressed formats need the native decoder in `x64/`. Switch swizzles not supported. |
+| `Mesh`, `SkinnedMeshRenderer`, `Avatar`, `Animator` | validated | validated | validated (OpenGL 3D, skeleton, wireframe) | validated (`glb`/`gltf`, binary `fbx`, `obj`, Unity `.unitypackage`) | CI (synthetic) + Blender roundtrip (local) + Unity `6000.3.18f1` FBX/rig import (local). |
+| `AnimationClip`, `AnimatorController` | validated | validated | validated (3D playback scrubber + Animator Graph) | validated (`.anim`, `.controller`, clip JSON metadata, Graphviz `.dot`) | CI (synthetic) + real files (local). Humanoid muscle/retargeting edge cases remain partial. |
+| `AudioClip`, `VideoClip`, `MovieTexture` | validated | validated | validated (FFmpeg playback) | validated (`wav`/`ogg`/native audio, embedded video bytes) | CI (synthetic) + real files (local). External FMOD `.bank`, Wwise, CRIWARE not supported. |
+| `Material`, `Shader` | validated | validated | partial (D3D11 Built-in on Windows; basic fallback URP/HDRP/Linux) | partial (ShaderLab disassembly; PBR approximation in glTF; Standard fallback in Unity `.mat`) | CI (synthetic) + real files (local). Compiled shader bytecode is not decompiled to original HLSL. |
+| `MonoBehaviour`, `ScriptableObject`, `MonoScript` | validated | validated (with TypeTrees or Managed/dummy DLLs) | validated (tree/JSON viewer + Script viewer) | validated (JSON, full streaming Unity YAML, C# `.sln`/`.csproj`, Ghidra scripts) | CI (synthetic) + Unity `6000.3.18f1` roundtrip (local). IL2CPP outputs stubs (no native body decompilation). |
+| `Terrain`, `TerrainData`, `TerrainLayer` | validated | validated (incl. stripped 5.3–6000.4) | partial (heightmap/mesh via export) | partial (converted mesh `.fbx`/`.glb` + baked splatmap) | CI (synthetic) + real games (local) + Unity `6000.3.18f1` roundtrip (local). Not exported as native `.asset` terrain. |
+| `GameObject`, `Transform`, `LODGroup`, Colliders, Scenes & Prefabs | validated | validated | validated (Scene Hierarchy + component inspector) | validated (`.glb` instanced scene, `.unity`, `.prefab`, `.unitypackage`, collider `.obj`) | CI (synthetic) + Unity `6000.3.18f1` roundtrip (`UnityEditorRoundtripTests`). |
+| `Font`, `TMP_FontAsset`, `TextAsset` | validated | validated | validated (text, embedded media, font/TMP atlas) | validated (`.ttf`/`.otf`, raw bytes/detected media) | CI (synthetic) + real files (local). |
 
 ## How the build was made
 
@@ -63,7 +77,11 @@ The table describes the `main` branch. Release `v0.20.0` reads Unity up to 6000.
 | 3D model preview (OpenGL) | yes | yes | not verified | – |
 | Shader and material visual preview | Direct3D 11, many Built-in shaders | falls back to basic shading or text | not verified | – |
 | Audio and video preview | yes | yes (FFmpeg libraries bundled in the package) | not verified | – |
-| Texture conversion | needs `x64/Texture2DDecoderNative.dll` | needs `x64/libTexture2DDecoderNative.so` | `x86/` decoder | – |
+| Texture conversion & image export (`png`/`tga`/`jpg`/`bmp`/`webp`/EXR/TIFF) | yes (needs `x64/Texture2DDecoderNative.dll` for compressed formats) | yes (needs `x64/libTexture2DDecoderNative.so` for compressed formats) | `x86/` decoder, not verified | – |
+| 3D model & animation export (`glb`/`gltf`/`fbx`/`obj`/`.anim`) | yes (GUI + CLI) | yes (GUI + CLI) | not verified | – |
+| Unity Project, Prefab & `.unitypackage` export | yes (GUI; validated in Unity `6000.3.18f1`) | yes (GUI; POSIX USTAR `.unitypackage`, Editor import not verified on Linux) | not verified | – |
+| Audio export (`wav`/`ogg`/native) | yes (GUI + CLI; GUI adds FFmpeg transcode) | yes (GUI + CLI; GUI adds FFmpeg transcode) | not verified | – |
+| C# script project export (`.sln`/`.csproj`) & Ghidra export | yes (GUI) | yes (GUI) | not verified | – |
 
 "Not released" means no package is published. "Not verified" means nobody has run it. Neither one means it can't work.
 

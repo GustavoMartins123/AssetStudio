@@ -1171,9 +1171,9 @@ namespace AssetStudio.Tests
         }
 
         [Fact]
-        public void UnityProjectExporter_COR01_MonoBehaviourYaml_ExportsFullCollectionsAndDeepTreesAndDiagnosesConfiguredGuardrails()
+        public void UnityProjectExporter_MonoBehaviourYaml_ExportsFullCollectionsAndDeepTreesAndDiagnosesConfiguredGuardrails()
         {
-            var tempRoot = CreateTempDirectory("unity_proj_cor01");
+            var tempRoot = CreateTempDirectory("unity_proj_monobehaviour_yaml");
             try
             {
                 using var am = new AssetsManager();

@@ -121,4 +121,55 @@
       <FileVersion Condition="'$(_UseGitReleaseVersion)' == 'true' And '$(_GitNumericVersion)' != ''">$(_GitNumericVersion)</FileVersion>
     </PropertyGroup>
   </Target>
+
+  <!--
+    Stamp git commit hash and build channel (release vs dev) as AssemblyMetadata so
+    development builds and export reports identify their exact revision without altering
+    InformationalVersion / AssemblyVersion / NuGet lockfiles.
+  -->
+  <Target Name="_StampBuildRevisionMetadata"
+          BeforeTargets="GetAssemblyAttributes"
+          DependsOnTargets="_ResolveAutoReleaseVersion"
+          Condition="'$(DisableGitReleaseVersionSync)' != 'true'">
+    <PropertyGroup>
+      <_GitMetaNullDevice Condition="'$(OS)' == 'Windows_NT'">nul</_GitMetaNullDevice>
+      <_GitMetaNullDevice Condition="'$(OS)' != 'Windows_NT'">/dev/null</_GitMetaNullDevice>
+    </PropertyGroup>
+
+    <Exec Command="git rev-parse --short=7 HEAD 2&gt;$(_GitMetaNullDevice)"
+          WorkingDirectory="$(MSBuildThisFileDirectory)"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          IgnoreStandardErrorWarningFormat="true"
+          StandardOutputImportance="Low"
+          StandardErrorImportance="Low">
+      <Output TaskParameter="ExitCode" PropertyName="_GitShaExitCode" />
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitShortSha" />
+    </Exec>
+
+    <Exec Command="git rev-list --count $(_GitCandidateTag)..HEAD 2&gt;$(_GitMetaNullDevice)"
+          WorkingDirectory="$(MSBuildThisFileDirectory)"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          IgnoreStandardErrorWarningFormat="true"
+          StandardOutputImportance="Low"
+          StandardErrorImportance="Low"
+          Condition="'$(_GitShaExitCode)' == '0' And '$(_GitHasExactTag)' != 'true' And '$(_HasExplicitReleaseVersion)' != 'true' And '$(_GitCandidateTag)' != ''">
+      <Output TaskParameter="ExitCode" PropertyName="_GitAheadExitCode" />
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitCommitsAhead" />
+    </Exec>
+
+    <PropertyGroup>
+      <_CleanGitSha Condition="'$(_GitShaExitCode)' == '0'">$([System.Text.RegularExpressions.Regex]::Replace('$(_GitShortSha)', '[^0-9A-Za-z]', ''))</_CleanGitSha>
+      <_CleanCommitsAhead Condition="'$(_GitAheadExitCode)' == '0'">$([System.Text.RegularExpressions.Regex]::Replace('$(_GitCommitsAhead)', '[^0-9]', ''))</_CleanCommitsAhead>
+      <_AssetStudioBuildChannel Condition="'$(_HasExplicitReleaseVersion)' == 'true' Or '$(_GitHasExactTag)' == 'true'">release</_AssetStudioBuildChannel>
+      <_AssetStudioBuildChannel Condition="'$(_AssetStudioBuildChannel)' == ''">dev</_AssetStudioBuildChannel>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <AssemblyMetadata Include="AssetStudioBuildChannel" Value="$(_AssetStudioBuildChannel)" />
+      <AssemblyMetadata Include="AssetStudioCommit" Value="$(_CleanGitSha)" Condition="'$(_CleanGitSha)' != ''" />
+      <AssemblyMetadata Include="AssetStudioCommitsAhead" Value="$(_CleanCommitsAhead)" Condition="'$(_CleanCommitsAhead)' != '' And '$(_CleanCommitsAhead)' != '0'" />
+    </ItemGroup>
+  </Target>
 </Project>

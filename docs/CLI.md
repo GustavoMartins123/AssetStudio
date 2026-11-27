@@ -35,6 +35,7 @@ Every command takes a file or a folder. Put paths with spaces or accents in quot
 | `list <path> [--type <ClassID>] [--filter <text>] [--format text\|json\|jsonl\|csv]` | Lists the assets inside the files. `--type` takes a class name or number (`Texture2D`, `28`). `--filter` matches part of the asset name, container path or serialized file name, ignoring case. |
 | `inspect <path> --path-id <id> [--file <serialized file name>] [--format text\|json]` | Shows one asset: source file, container path, byte range, Unity version and its TypeTree dump. |
 | `export <path> --output <dir> [options]` | Converts and writes assets (see below). |
+| `--version` | Prints the CLI version and build revision (`release` or `dev+<commit>`). |
 | `--help` | Prints the usage. |
 
 ### Examples
@@ -72,6 +73,7 @@ AssetStudio.CLI export <path> --output <dir>
     [--image-format png|webp|tga|jpeg|bmp]
     [--model-format glb|gltf|fbx]
     [--assemblies <Managed folder>]
+    [--report <json file>]
     [--dry-run]
 ```
 
@@ -99,6 +101,36 @@ These exporters are the same code the GUI export uses (`AssetStudioUtility`): im
 Files go to `<output>/<Type>/<name>.<ext>`. Names are cleaned for the file system. A second asset with the same name gets `_1`, `_2`, ... The CLI never writes outside `--output`, even when an asset name contains `..` or path separators. Assets without a name are named after their GameObject, script class or shader. They get a generic `<Type>_<PathID>` style name only when nothing else is known.
 
 `--dry-run` prints the planned paths (`[dry-run] Texture2D 123 -> ...`) and writes nothing.
+
+`--report <json file>` writes a structured `ExportReport` JSON file sharing the same schema as GUI exports:
+
+```json
+{
+  "schemaVersion": 1,
+  "operation": "CliExport",
+  "status": "Partial",
+  "exporterVersion": "0.20.0-dev+4e0dcad",
+  "commitHash": "4e0dcad",
+  "buildChannel": "dev",
+  "exportedCount": 12,
+  "skippedCount": 2,
+  "failedCount": 1,
+  "missingDependencies": [
+    "Managed assemblies (--assemblies <Managed folder>)"
+  ],
+  "diagnostics": [
+    {
+      "severity": "Warning",
+      "outcome": "Skipped",
+      "code": "MissingAssembly",
+      "assetName": "PlayerConfig",
+      "assetType": "MonoBehaviour",
+      "pathId": 1024,
+      "message": "Skipped MonoBehaviour 1024: no TypeTree in the file (pass --assemblies <Managed folder>)."
+    }
+  ]
+}
+```
 
 ### What the CLI does not do (GUI only)
 

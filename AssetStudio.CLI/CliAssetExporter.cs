@@ -36,16 +36,47 @@ namespace AssetStudio.CLI
         private readonly CliExportSettings _settings;
         private readonly TextWriter _stdout;
         private readonly TextWriter _stderr;
+        private readonly IList<ExportDiagnostic>? _diagnostics;
+        private readonly ISet<string>? _missingDependencies;
         private AssemblyLoader? _assemblyLoader;
         private Dictionary<uint, string>? _bonePathHash;
         private Dictionary<uint, string>? _morphChannelNames;
 
-        public CliAssetExporter(AssetsManager assetsManager, CliExportSettings settings, TextWriter stdout, TextWriter stderr)
+        public CliAssetExporter(
+            AssetsManager assetsManager,
+            CliExportSettings settings,
+            TextWriter stdout,
+            TextWriter stderr,
+            IList<ExportDiagnostic>? diagnostics = null,
+            ISet<string>? missingDependencies = null)
         {
             _assetsManager = assetsManager;
             _settings = settings;
             _stdout = stdout;
             _stderr = stderr;
+            _diagnostics = diagnostics;
+            _missingDependencies = missingDependencies;
+        }
+
+        private void RecordSkip(AssetHandle handle, string baseName, string code, string message, string fieldOrResource = "", string? missingDependency = null)
+        {
+            if (!string.IsNullOrWhiteSpace(missingDependency))
+            {
+                _missingDependencies?.Add(missingDependency);
+            }
+
+            _diagnostics?.Add(new ExportDiagnostic
+            {
+                Severity = ExportDiagnosticSeverity.Warning,
+                Outcome = ExportItemOutcome.Skipped,
+                Code = code,
+                AssetName = baseName,
+                AssetType = handle.Type.ToString(),
+                SourceFile = handle.SerializedFileName ?? string.Empty,
+                PathId = handle.PathID,
+                FieldOrResource = fieldOrResource,
+                Message = message
+            });
         }
 
         public static bool TryParseType(string raw, out ClassIDType type)
@@ -102,16 +133,24 @@ namespace AssetStudio.CLI
                     var path = Reserve(_settings.ImageFormat.GetFileExtension());
                     if (_settings.DryRun) return Planned(handle, path);
                     using var image = sprite.GetImage();
-                    if (image == null) return 0;
+                    if (image == null)
+                    {
+                        RecordSkip(handle, baseName, "UnreadableSprite", "Sprite texture could not be decoded or resolved.");
+                        return 0;
+                    }
                     return Write(path, stream => image.WriteToStream(stream, _settings.ImageFormat));
                 }
 
                 case AudioClip clip:
-                    return ExportAudio(handle, clip, Reserve);
+                    return ExportAudio(handle, clip, baseName, Reserve);
 
                 case Font font:
                 {
-                    if (font.m_FontData == null || font.m_FontData.Length == 0) return 0;
+                    if (font.m_FontData == null || font.m_FontData.Length == 0)
+                    {
+                        RecordSkip(handle, baseName, "EmptyAsset", "Font has no embedded font data.");
+                        return 0;
+                    }
                     bool isOpenType = font.m_FontData.Length >= 4 && font.m_FontData.AsSpan(0, 4).SequenceEqual("OTTO"u8);
                     var path = Reserve(isOpenType ? ".otf" : ".ttf");
                     return _settings.DryRun ? Planned(handle, path) : WriteBytes(path, font.m_FontData);
@@ -124,11 +163,24 @@ namespace AssetStudio.CLI
                 }
 
                 case MonoBehaviour behaviour:
-                    return ExportMonoBehaviour(handle, behaviour, Reserve);
+                    return ExportMonoBehaviour(handle, behaviour, baseName, Reserve);
 
                 case VideoClip video:
                 {
-                    if (video.m_ExternalResources.m_Size <= 0) return 0;
+                    if (video.m_ExternalResources.m_Size <= 0)
+                    {
+                        var extSrc = video.m_ExternalResources?.m_Source ?? string.Empty;
+                        RecordSkip(
+                            handle,
+                            baseName,
+                            "MissingStreamedResource",
+                            string.IsNullOrEmpty(extSrc)
+                                ? "VideoClip has no embedded or streamed media data."
+                                : $"VideoClip external resource is empty or missing: {extSrc}",
+                            fieldOrResource: extSrc,
+                            missingDependency: string.IsNullOrEmpty(extSrc) ? null : extSrc);
+                        return 0;
+                    }
                     var path = Reserve(SafeExtension(Path.GetExtension(video.m_OriginalPath), ".mp4"));
                     if (_settings.DryRun) return Planned(handle, path);
                     return Write(path, _ => { }, () => video.m_VideoData.WriteData(path));
@@ -182,7 +234,7 @@ namespace AssetStudio.CLI
             }
         }
 
-        private int ExportAudio(AssetHandle handle, AudioClip clip, Func<string, string> reserve)
+        private int ExportAudio(AssetHandle handle, AudioClip clip, string baseName, Func<string, string> reserve)
         {
             if (_settings.DryRun)
             {
@@ -190,7 +242,20 @@ namespace AssetStudio.CLI
             }
 
             var data = clip.m_AudioData.GetData();
-            if (data == null || data.Length == 0) return 0;
+            if (data == null || data.Length == 0)
+            {
+                var resSrc = clip.m_Source ?? string.Empty;
+                RecordSkip(
+                    handle,
+                    baseName,
+                    string.IsNullOrEmpty(resSrc) ? "EmptyAsset" : "MissingStreamedResource",
+                    string.IsNullOrEmpty(resSrc)
+                        ? "AudioClip contains no audio payload."
+                        : $"AudioClip external resource could not be loaded: {resSrc}",
+                    fieldOrResource: resSrc,
+                    missingDependency: string.IsNullOrEmpty(resSrc) ? null : resSrc);
+                return 0;
+            }
 
             var converter = new AudioClipConverter(clip);
             bool isFsb5 = data.Length >= 4 && data.AsSpan(0, 4).SequenceEqual("FSB5"u8);
@@ -209,7 +274,7 @@ namespace AssetStudio.CLI
             return WriteBytes(reserve(converter.GetExtensionName()), data);
         }
 
-        private int ExportMonoBehaviour(AssetHandle handle, MonoBehaviour behaviour, Func<string, string> reserve)
+        private int ExportMonoBehaviour(AssetHandle handle, MonoBehaviour behaviour, string baseName, Func<string, string> reserve)
         {
             if (_settings.DryRun)
             {
@@ -244,7 +309,22 @@ namespace AssetStudio.CLI
                 return WriteText(reserve(".txt"), dump);
             }
 
-            _stderr.WriteLine($"Skipped MonoBehaviour {handle.PathID}: no TypeTree in the file{(loader == null ? " (pass --assemblies <Managed folder>)" : " and its script was not found in the assemblies")}.");
+            string reason = $"no TypeTree in the file{(loader == null ? " (pass --assemblies <Managed folder>)" : " and its script was not found in the assemblies")}";
+            string scriptLabel = behaviour.m_Script.TryGet(out var script) && !string.IsNullOrWhiteSpace(script.m_ClassName)
+                ? (string.IsNullOrWhiteSpace(script.m_AssemblyName) ? script.m_ClassName : $"{script.m_AssemblyName}:{script.m_ClassName}")
+                : string.Empty;
+            string missingDep = loader == null
+                ? "Managed assemblies (--assemblies <Managed folder>)"
+                : (!string.IsNullOrEmpty(scriptLabel) ? scriptLabel : $"MonoScript for PathID {handle.PathID}");
+
+            RecordSkip(
+                handle,
+                baseName,
+                loader == null ? "MissingAssembly" : "MissingTypeTree",
+                $"Skipped MonoBehaviour {handle.PathID}: {reason}.",
+                fieldOrResource: scriptLabel,
+                missingDependency: missingDep);
+            _stderr.WriteLine($"Skipped MonoBehaviour {handle.PathID}: {reason}.");
             return 0;
         }
 
