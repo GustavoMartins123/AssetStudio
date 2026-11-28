@@ -2,7 +2,7 @@
 
 `AssetStudio.CLI` reads the same Unity files as the GUI, without a window. Use it to inventory a game folder, look at one asset, or export many assets from a script.
 
-> **Availability:** the CLI is in the `main` branch only. Release `v0.20.0` does not include it. The release workflow publishes it as `AssetStudio.CLI-win-x64-<version>.zip` and `AssetStudio.CLI-linux-x64-<version>.tar.gz`, starting with the next release. Until then, build it from source (see below).
+> **Availability:** `AssetStudio.CLI` is packaged in GitHub Releases starting with `v0.20.1` as `AssetStudio.CLI-win-x64-<version>.zip` and `AssetStudio.CLI-linux-x64-<version>.tar.gz`. You can also build it from source (see below).
 
 ## Getting the CLI
 

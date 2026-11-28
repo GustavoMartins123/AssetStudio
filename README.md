@@ -2,8 +2,8 @@
 
 AssetStudio is a cross-platform (Windows x64 and Linux x64) desktop and command-line tool for exploring, inspecting, and exporting Unity assets and AssetBundles — featuring a persistent SQLite project index, lazy/low-memory loading, semantic asset references and global search, integrated 3D/shader/media previews, glTF/GLB/FBX/Unity export, and a headless CLI for batch automation.
 
-- **Downloads:** prebuilt self-contained packages are published on [GitHub Releases](https://github.com/GustavoMartins123/AssetStudio/releases) (Windows x64 `.zip`; Linux x64 `.AppImage`, `.deb`, `.tar.gz`; plus `AssetStudio.CLI` archives and `SHA256SUMS.txt` starting with the next release).
-- **Availability:** see [`SUPPORTED_FEATURES.md`](SUPPORTED_FEATURES.md) for a plain-language list separating features in the latest release (`v0.20.0`) from features currently on `main` or under study.
+- **Downloads:** prebuilt self-contained packages are published on [GitHub Releases](https://github.com/GustavoMartins123/AssetStudio/releases) (Windows x64 `.zip`; Linux x64 `.AppImage`, `.deb`, `.tar.gz`; plus `AssetStudio.CLI` archives and `SHA256SUMS.txt`).
+- **Availability:** see [`SUPPORTED_FEATURES.md`](SUPPORTED_FEATURES.md) for a plain-language list separating features in the latest release (`v0.20.1`) from features currently on `main` or under study.
 
 ### Documentation
 
@@ -27,7 +27,7 @@ This fork is an independent community maintenance effort. It is not an official 
 ## Features
 
 * Supported Unity versions:
-  * 3.4 – 6000.5 (Mono and IL2CPP) on `main`; release `v0.20.0` reads up to 6000.4. See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for what is verified per version.
+  * 3.4 – 6000.5 (Mono and IL2CPP) in release `v0.20.1`. See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for what is verified per version.
 * Supported asset types:
   * **Texture2D**: convert to `png`, `tga`, `jpeg`, `bmp`, with preview and color channel toggles.
   * **Sprite**: crop `Texture2D` / `SpriteAtlas` to `png`, `tga`, `jpeg`, `bmp`.
@@ -149,7 +149,7 @@ Generate dummy DLLs with [Il2CppDumper by Perfare](https://github.com/Perfare/Il
 
 ### Command line
 
-`AssetStudio.CLI` (in `main`, packaged from the next release) scans, lists, inspects and exports assets without the GUI:
+`AssetStudio.CLI` (included in releases from `v0.20.1` onward) scans, lists, inspects, captures keys, and exports assets without the GUI:
 
 ```bash
 AssetStudio.CLI list "path/to/My Project/App_Data" --type Texture2D --format csv

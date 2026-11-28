@@ -1,17 +1,17 @@
 # Export formats: what is kept and what is lost
 
-No export format holds everything a Unity asset had. This page lists, per format, what comes out, what is approximated and what is dropped, so you can pick the right one. Items marked **main** were added after release `v0.20.0`.
+No export format holds everything a Unity asset had. This page lists, per format, what comes out, what is approximated and what is dropped, so you can pick the right one. All formats and options below are included in release `v0.20.1`.
 
 ## Images
 
 | Source | Output | Notes |
 | --- | --- | --- |
 | `Texture2D`, `Sprite`, `Texture2DArray` slices | `png`, `tga`, `jpeg`, `bmp`, `webp` (8 bits per channel) | Flipped to the usual top-left origin. Normal maps stored as DXT5nm/BC5 are unpacked to a regular blue tangent-space map. HDR and float formats are clamped to 0–1 in these formats. `jpeg` and lossy `webp` lose detail. |
-| HDR textures (`RGBAHalf`, `RGBAFloat`, BC6H, ...) | OpenEXR or 32-bit float TIFF (**main**, from the texture preview) | Keeps values above 1. |
+| HDR textures (`RGBAHalf`, `RGBAFloat`, BC6H, ...) | OpenEXR or 32-bit float TIFF (from the texture preview) | Keeps values above 1. |
 | Any texture, "convert" off | raw `.tex` data | Exactly the bytes Unity stored. |
 | Sprites | image cut from the texture or atlas, plus a Unity `.meta` file | |
 
-Mipmaps: only the top level is exported, except with the mipmap export of the texture preview (**main**).
+Mipmaps: only the top level is exported, except with the mipmap export of the texture preview.
 
 ## Audio
 
@@ -48,7 +48,7 @@ Unity shaders are not converted. A custom or URP/HDRP shader becomes the closest
 | `TextAsset`, `Font`, `VideoClip`, `MovieTexture` | original bytes | Not converted. |
 | `Shader` | ShaderLab text (`.shader`) | Rebuilt from the compiled shader. Compiled programs stay compiled (disassembly where available). This is not the original source. |
 
-## Unity project, prefab and `.unitypackage` (main)
+## Unity project, prefab and `.unitypackage`
 
 Rebuilds scenes and prefabs as Unity YAML 1.1 files with deterministic `.meta` GUIDs (compatible with both Unity 2019–2022 and Unity 6 `internalIDToNameTable`):
 
@@ -67,7 +67,7 @@ Exact vs. approximate conversions:
 - **Approximate / not reconstructed 1:1:** Custom/URP/HDRP shaders fall back to Built-in `Standard` (custom HLSL/ShaderGraph math is not converted); `Terrain` exports as a converted `.fbx` mesh + baked splatmap texture rather than a native `.asset` terrain; IL2CPP scripts export as stubs without native method bodies.
 - **Validation:** Verified via the automated Unity Editor roundtrip test suite (`UnityEditorRoundtripTests`) on Unity `6000.3.18f1` and manual batch imports of populated multi-submesh/rigged scenes.
 
-## C# scripts (main)
+## C# scripts
 
 | Source | Output | What you get |
 | --- | --- | --- |
